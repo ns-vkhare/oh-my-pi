@@ -122,12 +122,18 @@ export class HubView implements Component, Focusable {
 	}
 
 	/** Enter handler: dispatch a new session when the draft has text or images, else open the
-	 *  selected session. Editor text arrives with paste markers expanded; strip the image markers
-	 *  since the paths ride along out-of-band as `@file` args. */
+	 *  selected session. Editor text arrives with paste markers expanded but `[Image #N]` markers
+	 *  intact. Markers are positional (`[Image #N]` ↔ `#imagePaths[N-1]`), so dispatch only the
+	 *  images whose marker still survives in the draft — deleting a marker drops its image — then
+	 *  strip the markers since the paths ride along out-of-band as `@file` args. */
 	#submit(text: string): void {
-		const prompt = text.replace(PLACEHOLDER_REGEX, "").replace(/\s+/g, " ").trim();
-		const images = this.#imagePaths;
+		const surviving = new Set<number>();
+		for (const match of text.matchAll(PLACEHOLDER_REGEX)) {
+			if (match[1] === "Image") surviving.add(Number(match[2]));
+		}
+		const images = this.#imagePaths.filter((_, i) => surviving.has(i + 1));
 		this.#imagePaths = [];
+		const prompt = text.replace(PLACEHOLDER_REGEX, "").replace(/\s+/g, " ").trim();
 		if (prompt.length > 0 || images.length > 0) {
 			this.callbacks.onDispatch(prompt, images);
 			return;

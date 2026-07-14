@@ -5,7 +5,7 @@
 ### Added
 
 - Styled the `omp hub` session view to match the welcome pane: a two-column box with the OMP logo and active model on the left, prompt tips and the recent-sessions list on the right, and an editor box below that dispatches a new session by default.
-- Gave the `omp hub` composer the full interactive editor: a visible cursor, and drag-and-dropped image files attach and ride along to the new session as `@file` arguments.
+- Gave the `omp hub` composer the full interactive editor: a visible cursor, and drag-and-dropped image files attach and ride along to the new session as `@file` arguments. Deleting an image's `[Image #N]` marker from the draft now drops that image from the dispatched session.
 
 ## [16.5.0] - 2026-07-13
 
