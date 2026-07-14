@@ -1,11 +1,10 @@
 /**
  * Hub view — the fullscreen TUI shown in the hub's tmux window.
  *
- * Rendered to match the welcome pane: a rounded two-column box with the OMP
- * logo, active model, and greeting on the left; prompt tips and the recent
- * sessions list on the right (no LSP servers — the hub isn't tied to a project
- * language server). Beneath the box sits an editor line that, by default,
- * dispatches a brand-new session on Enter.
+ * Rendered to match the welcome pane (shared {@link ./box-layout}): a rounded
+ * two-column box with the OMP logo and a session count on the left, and the
+ * selectable session list on the right. Beneath the box sits an editor line
+ * that dispatches a brand-new session on Enter.
  *
  * Arrow keys move the session selection, Enter or → foregrounds the selected
  * session (Enter dispatches a new one instead when the editor has text), and
@@ -17,18 +16,14 @@ import {
 	extractPrintableText,
 	type Focusable,
 	getKeybindings,
+	matchesKey,
 	padding,
 	truncateToWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
-import { APP_NAME } from "@oh-my-pi/pi-utils";
-import {
-	assembleTwoColumnBox,
-	centerText,
-	computeTwoColumnLayout,
-	fitToWidth,
-	REST_FRAME,
-} from "../modes/components/welcome";
+import { VERSION } from "@oh-my-pi/pi-utils/dirs";
+import { assembleTwoColumnBox, centerText, computeTwoColumnLayout, fitToWidth } from "../modes/components/box-layout";
+import { REST_FRAME } from "../modes/components/welcome";
 import { theme } from "../modes/theme/theme";
 
 /** One session row in the hub. */
@@ -60,6 +55,8 @@ export interface HubViewCallbacks {
 const ROW_PREFIX_WIDTH = 5;
 /** Cap on session rows so the box never outgrows a typical terminal height. */
 const MAX_SESSION_ROWS = 12;
+/** Narrowest left column that still shows the logo (its glyph width). */
+const LOGO_WIDTH = 12;
 
 export class HubView implements Component, Focusable {
 	focused = false;
@@ -70,9 +67,6 @@ export class HubView implements Component, Focusable {
 	constructor(
 		private readonly callbacks: HubViewCallbacks,
 		private readonly getRows: () => HubRow[],
-		private readonly version: string,
-		private readonly modelName: string,
-		private readonly providerName: string,
 	) {
 		this.#rows = getRows();
 	}
@@ -135,52 +129,43 @@ export class HubView implements Component, Focusable {
 	}
 
 	render(termWidth: number): readonly string[] {
-		const leftMinContentWidth = Math.max(
-			12, // logo width
-			visibleWidth("Welcome back!"),
-			visibleWidth(this.modelName),
-			visibleWidth(this.providerName),
-		);
+		const count = this.#rows.length;
+		const countLabel = `${count} session${count === 1 ? "" : "s"}`;
+		const leftMinContentWidth = Math.max(LOGO_WIDTH, visibleWidth("Session Hub"), visibleWidth(countLabel));
 		const layout = computeTwoColumnLayout(termWidth, leftMinContentWidth);
 		if (layout.boxWidth < 4) return [];
-		const { boxWidth, leftCol, rightCol } = layout;
+		const { boxWidth, leftCol, rightCol, showRightColumn } = layout;
+		// Single column mode: rows share the left column; else they own the right.
+		const listCol = showRightColumn ? rightCol : leftCol;
 
-		// Left column — greeting, logo, active model (mirrors the welcome pane).
+		// Left column — logo + title + session count (mirrors the welcome pane).
 		const leftLines = [
 			"",
-			centerText(theme.bold("Welcome back!"), leftCol),
+			centerText(theme.bold(theme.fg("accent", "Session Hub")), leftCol),
 			"",
-			...REST_FRAME.map(l => centerText(l, leftCol)),
+			...REST_FRAME.map((l: string) => centerText(l, leftCol)),
 			"",
-			centerText(theme.fg("muted", this.modelName), leftCol),
-			centerText(theme.fg("borderMuted", this.providerName), leftCol),
+			centerText(theme.fg("muted", countLabel), leftCol),
+			centerText(theme.fg("borderMuted", "tmux-supervised"), leftCol),
 		];
 
-		// Right column — prompt tips, then the selectable recent-sessions list.
-		const separatorWidth = Math.max(0, rightCol - 2);
-		const separator = ` ${theme.fg("dim", theme.boxRound.horizontal.repeat(separatorWidth))}`;
+		// Session list.
 		const sessionLines: string[] = [];
-		if (this.#rows.length === 0) {
+		if (count === 0) {
 			sessionLines.push(` ${theme.fg("dim", "No sessions yet — type below and press enter.")}`);
 		} else {
-			for (let i = 0; i < this.#rows.length && i < MAX_SESSION_ROWS; i++) {
+			for (let i = 0; i < count && i < MAX_SESSION_ROWS; i++) {
 				const row = this.#rows[i];
-				if (row) sessionLines.push(this.#rowLine(row, i === this.#selectedIndex, rightCol));
+				if (row) sessionLines.push(this.#rowLine(row, i === this.#selectedIndex, listCol));
 			}
 		}
-		const rightLines = [
-			` ${theme.bold(theme.fg("accent", "Tips"))}`,
-			` ${theme.fg("dim", "#")}${theme.fg("muted", " for prompt actions")}`,
-			` ${theme.fg("dim", "/")}${theme.fg("muted", " for commands")}`,
-			` ${theme.fg("dim", "!")}${theme.fg("muted", " to run bash")}`,
-			` ${theme.fg("dim", "$")}${theme.fg("muted", " to run python")}`,
-			separator,
-			` ${theme.bold(theme.fg("accent", "Recent sessions"))}`,
-			...sessionLines,
-			"",
-		];
+		const rightLines = [` ${theme.bold(theme.fg("accent", "Sessions"))}`, ...sessionLines, ""];
 
-		const lines = assembleTwoColumnBox(layout, `${APP_NAME} v${this.version}`, leftLines, rightLines);
+		// In single-column mode the list has no right column; append it under the
+		// left content so the sessions are always visible on a narrow terminal.
+		const lines = showRightColumn
+			? assembleTwoColumnBox(layout, `omp hub v${VERSION}`, leftLines, rightLines)
+			: assembleTwoColumnBox(layout, `omp hub v${VERSION}`, [...leftLines, "", ...rightLines], []);
 		lines.push(...this.#renderEditor(boxWidth));
 		lines.push(` ${theme.fg("dim", "↑/↓ select · enter/→ open · type + enter new session · esc detach")}`);
 		return lines;
@@ -188,7 +173,7 @@ export class HubView implements Component, Focusable {
 
 	/**
 	 * Editor box beneath the main pane: a rounded single-line input that, on
-	 * Enter with text, dispatches a new session. Empty on start so the default
+	 * Enter with text, dispatches a new session. Empty by default so the implied
 	 * action is "start a new session".
 	 */
 	#renderEditor(boxWidth: number): string[] {
@@ -201,9 +186,8 @@ export class HubView implements Component, Focusable {
 		const br = theme.fg("dim", theme.boxRound.bottomRight);
 
 		const title = " New session ";
-		const titleStyled = theme.fg("muted", title);
 		const afterTitle = Math.max(0, innerWidth - visibleWidth(title));
-		const top = tl + titleStyled + theme.fg("dim", theme.boxRound.horizontal.repeat(afterTitle)) + tr;
+		const top = tl + theme.fg("muted", title) + theme.fg("dim", theme.boxRound.horizontal.repeat(afterTitle)) + tr;
 
 		// CURSOR_MARKER positions the hardware cursor at the caret; the trailing
 		// block is the visible caret when focused.
