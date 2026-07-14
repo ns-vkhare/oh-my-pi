@@ -8,6 +8,8 @@
 - Gave the `omp hub` composer the full interactive editor: a visible cursor, and drag-and-dropped image files attach and ride along to the new session as `@file` arguments. Deleting an image's `[Image #N]` marker from the draft now drops that image from the dispatched session.
 - Added `omp hub list` to show every active hub across projects — session name, supervised project directory, live-session count, attach state, and last activity — with the current project's hub marked.
 - Sessions dispatched fresh from `omp hub` now instruct the agent to create a new git worktree for the task by default (unless the prompt explicitly names a worktree/branch/tree), so parallel hub sessions don't collide in the same working tree. Resumed sessions are unaffected.
+- Added session deletion to `omp hub`: press Ctrl+X to arm the selected row (it turns red with a confirm hint) and Ctrl+X again to delete it — killing its live window and removing the session file and artifacts. When the deleted session has an associated git worktree (recovered from its recorded cwd or the `git worktree add` the agent ran, and verified against `git worktree list` so the primary checkout is never offered), the hub then prompts to delete that worktree too.
+- The status line now reflects a hub session's own git worktree: since the omp process stays in the project root while the agent works in a sibling worktree, the path and git (branch/status/PR) segments resolve the session's worktree — recovered from the session file and verified against `git worktree list` — and fall back to the project root's branch when the session has no worktree.
 
 ### Fixed
 
