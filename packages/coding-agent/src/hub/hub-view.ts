@@ -1,24 +1,37 @@
 /**
  * Hub view — the fullscreen TUI shown in the hub's tmux window.
  *
- * Lists every session as a row: live sessions (an omp process running in a tmux
- * window) and idle recent sessions (a `.jsonl` on disk with no live window).
- * Arrow keys move the selection, Enter foregrounds the selected session (or
- * dispatches a new one when the input line has text), and Esc exits the hub.
- * This is the Claude-Code "agent view" surface, with tmux as the supervisor.
+ * Rendered to match the welcome pane: a rounded two-column box with the OMP
+ * logo, active model, and greeting on the left; prompt tips and the recent
+ * sessions list on the right (no LSP servers — the hub isn't tied to a project
+ * language server). Beneath the box sits an editor line that, by default,
+ * dispatches a brand-new session on Enter.
+ *
+ * Arrow keys move the session selection, Enter or → foregrounds the selected
+ * session (Enter dispatches a new one instead when the editor has text), and
+ * Esc clears the editor or, when empty, detaches the hub.
  */
 import {
-	CURSOR_MARKER,
 	type Component,
-	type Focusable,
+	CURSOR_MARKER,
 	extractPrintableText,
+	type Focusable,
 	getKeybindings,
 	padding,
 	truncateToWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
-import { theme as tuiTheme } from "../modes/theme/theme";
+import { APP_NAME } from "@oh-my-pi/pi-utils";
+import {
+	assembleTwoColumnBox,
+	centerText,
+	computeTwoColumnLayout,
+	fitToWidth,
+	REST_FRAME,
+} from "../modes/components/welcome";
+import { theme } from "../modes/theme/theme";
 
+/** One session row in the hub. */
 export interface HubRow {
 	/** Stable identity: the session `.jsonl` path, or the tmux window id for a live-but-unsaved session. */
 	key: string;
@@ -43,7 +56,10 @@ export interface HubViewCallbacks {
 	onExit: () => void;
 }
 
-const CURSOR = ">";
+/** Visible width of a row's ` > ● ` prefix (space, cursor, space, dot, space). */
+const ROW_PREFIX_WIDTH = 5;
+/** Cap on session rows so the box never outgrows a typical terminal height. */
+const MAX_SESSION_ROWS = 12;
 
 export class HubView implements Component, Focusable {
 	focused = false;
@@ -54,6 +70,9 @@ export class HubView implements Component, Focusable {
 	constructor(
 		private readonly callbacks: HubViewCallbacks,
 		private readonly getRows: () => HubRow[],
+		private readonly version: string,
+		private readonly modelName: string,
+		private readonly providerName: string,
 	) {
 		this.#rows = getRows();
 	}
@@ -69,7 +88,7 @@ export class HubView implements Component, Focusable {
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
 		if (kb.matches(keyData, "tui.select.cancel")) {
-			// Esc / Ctrl+C: with text in the input, clear it; otherwise leave the hub.
+			// Esc / Ctrl+C: with text in the editor, clear it; otherwise leave the hub.
 			if (this.#input.length > 0) {
 				this.#input = "";
 				return;
@@ -87,6 +106,13 @@ export class HubView implements Component, Focusable {
 			if (this.#rows.length > 0) {
 				this.#selectedIndex = this.#selectedIndex === this.#rows.length - 1 ? 0 : this.#selectedIndex + 1;
 			}
+			return;
+		}
+		// → foregrounds the selected session (the editor line has no cursor movement,
+		// so → has no competing meaning here).
+		if (matchesKey(keyData, "right")) {
+			const row = this.#rows[this.#selectedIndex];
+			if (row) this.callbacks.onForeground(row);
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
@@ -108,44 +134,97 @@ export class HubView implements Component, Focusable {
 		if (printable) this.#input += printable;
 	}
 
-	render(width: number): readonly string[] {
-		const lines: string[] = [];
-		const accent = (s: string) => tuiTheme.fg("accent", s);
-		const dim = (s: string) => tuiTheme.fg("dim", s);
-		const muted = (s: string) => tuiTheme.fg("muted", s);
+	render(termWidth: number): readonly string[] {
+		const leftMinContentWidth = Math.max(
+			12, // logo width
+			visibleWidth("Welcome back!"),
+			visibleWidth(this.modelName),
+			visibleWidth(this.providerName),
+		);
+		const layout = computeTwoColumnLayout(termWidth, leftMinContentWidth);
+		if (layout.boxWidth < 4) return [];
+		const { boxWidth, leftCol, rightCol } = layout;
 
-		lines.push(accent(tuiTheme.bold("  omp session hub")));
-		lines.push(dim(`  ${this.#rows.length} session${this.#rows.length === 1 ? "" : "s"} · tmux-supervised`));
-		lines.push("");
+		// Left column — greeting, logo, active model (mirrors the welcome pane).
+		const leftLines = [
+			"",
+			centerText(theme.bold("Welcome back!"), leftCol),
+			"",
+			...REST_FRAME.map(l => centerText(l, leftCol)),
+			"",
+			centerText(theme.fg("muted", this.modelName), leftCol),
+			centerText(theme.fg("borderMuted", this.providerName), leftCol),
+		];
 
+		// Right column — prompt tips, then the selectable recent-sessions list.
+		const separatorWidth = Math.max(0, rightCol - 2);
+		const separator = ` ${theme.fg("dim", theme.boxRound.horizontal.repeat(separatorWidth))}`;
+		const sessionLines: string[] = [];
 		if (this.#rows.length === 0) {
-			lines.push(dim("  No sessions yet. Type a prompt below and press Enter to dispatch one."));
+			sessionLines.push(` ${theme.fg("dim", "No sessions yet — type below and press enter.")}`);
 		} else {
-			for (let i = 0; i < this.#rows.length; i++) {
+			for (let i = 0; i < this.#rows.length && i < MAX_SESSION_ROWS; i++) {
 				const row = this.#rows[i];
-				if (!row) continue;
-				const selected = i === this.#selectedIndex;
-				// Live = running process (bright dot); idle = on-disk only (dim dot).
-				const dot = row.live ? tuiTheme.fg("success", "●") : dim("○");
-				const cursor = selected ? accent(CURSOR) : " ";
-				const metaWidth = visibleWidth(row.meta);
-				const nameBudget = Math.max(1, width - 6 - metaWidth);
-				const name = visibleWidth(row.title) > nameBudget ? truncateToWidth(row.title, nameBudget) : row.title;
-				const namePainted = selected ? accent(name) : muted(name);
-				const gap = Math.max(1, width - 4 - visibleWidth(name) - metaWidth);
-				lines.push(` ${cursor} ${dot} ${namePainted}${padding(gap)}${dim(row.meta)}`);
+				if (row) sessionLines.push(this.#rowLine(row, i === this.#selectedIndex, rightCol));
 			}
 		}
+		const rightLines = [
+			` ${theme.bold(theme.fg("accent", "Tips"))}`,
+			` ${theme.fg("dim", "#")}${theme.fg("muted", " for prompt actions")}`,
+			` ${theme.fg("dim", "/")}${theme.fg("muted", " for commands")}`,
+			` ${theme.fg("dim", "!")}${theme.fg("muted", " to run bash")}`,
+			` ${theme.fg("dim", "$")}${theme.fg("muted", " to run python")}`,
+			separator,
+			` ${theme.bold(theme.fg("accent", "Recent sessions"))}`,
+			...sessionLines,
+			"",
+		];
 
-		lines.push("");
-		lines.push(dim("  ─────────────────────────────────────────────"));
-		// Dispatch input. Emit CURSOR_MARKER at the caret so the hardware cursor
-		// (when enabled) tracks the input; the visible caret is the trailing space.
-		const promptLabel = accent("  dispatch ");
-		const caret = this.focused ? CURSOR_MARKER : "";
-		lines.push(`${promptLabel}${this.#input}${caret}`);
-		lines.push("");
-		lines.push(dim("  ↑/↓ select · enter foreground/dispatch · esc detach"));
+		const lines = assembleTwoColumnBox(layout, `${APP_NAME} v${this.version}`, leftLines, rightLines);
+		lines.push(...this.#renderEditor(boxWidth));
+		lines.push(` ${theme.fg("dim", "↑/↓ select · enter/→ open · type + enter new session · esc detach")}`);
 		return lines;
+	}
+
+	/**
+	 * Editor box beneath the main pane: a rounded single-line input that, on
+	 * Enter with text, dispatches a new session. Empty on start so the default
+	 * action is "start a new session".
+	 */
+	#renderEditor(boxWidth: number): string[] {
+		const innerWidth = boxWidth - 2;
+		const h = theme.fg("dim", theme.boxRound.horizontal);
+		const v = theme.fg("dim", theme.boxRound.vertical);
+		const tl = theme.fg("dim", theme.boxRound.topLeft);
+		const tr = theme.fg("dim", theme.boxRound.topRight);
+		const bl = theme.fg("dim", theme.boxRound.bottomLeft);
+		const br = theme.fg("dim", theme.boxRound.bottomRight);
+
+		const title = " New session ";
+		const titleStyled = theme.fg("muted", title);
+		const afterTitle = Math.max(0, innerWidth - visibleWidth(title));
+		const top = tl + titleStyled + theme.fg("dim", theme.boxRound.horizontal.repeat(afterTitle)) + tr;
+
+		// CURSOR_MARKER positions the hardware cursor at the caret; the trailing
+		// block is the visible caret when focused.
+		const caret = this.focused ? CURSOR_MARKER : "";
+		const body =
+			this.#input.length > 0
+				? `${theme.fg("dim", theme.md.bullet)} ${this.#input}${caret}`
+				: `${theme.fg("dim", theme.md.bullet)} ${theme.fg("dim", "Describe a new session…")}${caret}`;
+		return ["", top, v + fitToWidth(` ${body}`, innerWidth) + v, bl + h.repeat(innerWidth) + br];
+	}
+
+	/** Compose one session row to the exact column width: ` > ● name … meta`. */
+	#rowLine(row: HubRow, selected: boolean, colWidth: number): string {
+		const cursor = selected ? theme.fg("accent", ">") : " ";
+		const dot = row.live ? theme.fg("success", "●") : theme.fg("dim", "○");
+		const metaVis = visibleWidth(row.meta);
+		const nameBudget = Math.max(1, colWidth - ROW_PREFIX_WIDTH - metaVis - 1);
+		const nameVis = visibleWidth(row.title);
+		const name = nameVis > nameBudget ? truncateToWidth(row.title, nameBudget) : row.title;
+		const namePainted = selected ? theme.fg("accent", name) : theme.fg("muted", name);
+		const gap = Math.max(1, colWidth - ROW_PREFIX_WIDTH - Math.min(nameVis, nameBudget) - metaVis);
+		return ` ${cursor} ${dot} ${namePainted}${padding(gap)}${theme.fg("dim", row.meta)}`;
 	}
 }

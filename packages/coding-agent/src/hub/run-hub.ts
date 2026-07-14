@@ -8,11 +8,15 @@
  */
 import { statSync } from "node:fs";
 import { ProcessTerminal, TUI } from "@oh-my-pi/pi-tui";
-import { getProjectDir } from "@oh-my-pi/pi-utils";
+import { getProjectDir, VERSION } from "@oh-my-pi/pi-utils";
+import { ModelRegistry } from "../config/model-registry";
+import { getModelMatchPreferences, resolveAllowedModels, resolveModelRoleValue } from "../config/model-resolver";
+import { Settings } from "../config/settings";
 import { initTheme } from "../modes/theme/theme";
+import { discoverAuthStorage } from "../sdk";
 import { getRecentSessions } from "../session/session-listing";
 import { SessionManager } from "../session/session-manager";
-import { HubView, type HubRow } from "./hub-view";
+import { type HubRow, HubView } from "./hub-view";
 import {
 	currentTmuxSession,
 	currentTmuxWindow,
@@ -129,6 +133,32 @@ function isHubWindowProcess(): boolean {
 }
 
 /**
+ * Resolve the display name/provider of the default model for the welcome pane,
+ * mirroring the SDK's default-role resolution. Bundled models load synchronously
+ * in the {@link ModelRegistry} constructor, so this stays offline and cheap.
+ * Returns blanks on any failure — the hub still renders, just without the model
+ * subtitle.
+ */
+async function resolveDefaultModelDisplay(): Promise<{ name: string; provider: string }> {
+	try {
+		const settings = Settings.instance;
+		const authStorage = await discoverAuthStorage();
+		const modelRegistry = new ModelRegistry(authStorage);
+		const preferences = getModelMatchPreferences(settings);
+		const allowed = await resolveAllowedModels(modelRegistry, settings, preferences);
+		const resolved = resolveModelRoleValue(settings.getModelRole("default"), allowed, {
+			settings,
+			matchPreferences: preferences,
+		});
+		const model = resolved.model ?? allowed[0];
+		if (model) return { name: model.name || model.id, provider: model.provider };
+	} catch {
+		// Fall through to blanks.
+	}
+	return { name: "", provider: "" };
+}
+
+/**
  * Render the hub TUI in the current (hub) window. The hub is the tmux-resident
  * supervisor: Esc *detaches* the client (returns the terminal to the shell) but
  * the hub process keeps running in its window, so its refresh loop — which
@@ -137,7 +167,9 @@ function isHubWindowProcess(): boolean {
  * killed), keeping the process alive meanwhile.
  */
 async function renderHub(): Promise<void> {
+	await Settings.init({ cwd: getProjectDir() });
 	await initTheme();
+	const model = await resolveDefaultModelDisplay();
 	const ui = new TUI(new ProcessTerminal());
 	// Never resolves: the hub lives until tmux kills its window (SIGHUP ends the
 	// process). Detach (Esc) leaves it running as the background supervisor.
@@ -158,6 +190,9 @@ async function renderHub(): Promise<void> {
 			onExit: () => detachClient(),
 		},
 		() => latestRows,
+		VERSION,
+		model.name,
+		model.provider,
 	);
 
 	const refresh = async () => {

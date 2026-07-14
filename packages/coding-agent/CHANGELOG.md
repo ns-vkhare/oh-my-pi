@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Styled the `omp hub` session view to match the welcome pane: a two-column box with the OMP logo and active model on the left, prompt tips and the recent-sessions list on the right, and an editor box below that dispatches a new session by default.
+
 ## [16.5.0] - 2026-07-13
 
 ### Breaking Changes
