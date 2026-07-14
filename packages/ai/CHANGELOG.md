@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added silent AWS SSO token refresh for the Bedrock provider: an expired `~/.aws/sso/cache` token is now automatically renewed via the SSO-OIDC CreateToken API using the cached refresh token and client registration (and written back to the cache for other AWS tools), matching the AWS SDK/CLI, instead of failing with "Run 'aws sso login' to refresh." The error is only surfaced when the refresh token or client registration is missing/expired.
+
 ## [16.5.0] - 2026-07-13
 
 ### Added

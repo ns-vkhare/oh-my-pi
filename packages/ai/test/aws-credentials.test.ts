@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -175,5 +175,138 @@ describe("resolveAwsCredentials credential_process", () => {
 		const promise = resolveAwsCredentials({ profile: "hangs", signal: ctrl.signal });
 		setTimeout(() => ctrl.abort(new Error("test abort")), 50);
 		await expect(promise).rejects.toBeDefined();
+	});
+});
+
+describe("resolveAwsCredentials SSO silent refresh", () => {
+	let tmp: string;
+	const saved = new Map<string, string | undefined>();
+
+	beforeEach(async () => {
+		for (const k of ENV_KEYS) {
+			saved.set(k, Bun.env[k]);
+			delete Bun.env[k];
+		}
+		Bun.env.AWS_EC2_METADATA_DISABLED = "true";
+		tmp = await fs.mkdtemp(path.join(os.tmpdir(), "aws-sso-"));
+		// The SSO cache dir is rooted at os.homedir() (getpwuid, not $HOME), so
+		// spy it onto the sandbox to keep the test hermetic.
+		spyOn(os, "homedir").mockReturnValue(tmp);
+		clearAwsCredentialCache();
+	});
+
+	afterEach(async () => {
+		for (const [k, v] of saved) {
+			if (v === undefined) delete Bun.env[k];
+			else Bun.env[k] = v;
+		}
+		saved.clear();
+		await removeWithRetries(tmp);
+		clearAwsCredentialCache();
+		mock.restore();
+	});
+
+	const START_URL = "https://d-test.awsapps.com/start";
+	const SSO_REGION = "us-west-2";
+
+	async function writeSsoProfile(profile: string): Promise<void> {
+		const cfg = path.join(tmp, "config");
+		await Bun.write(
+			cfg,
+			`[profile ${profile}]\nsso_start_url = ${START_URL}\nsso_region = ${SSO_REGION}\n` +
+				`sso_account_id = 111122223333\nsso_role_name = TestRole\nregion = us-east-1\n`,
+		);
+		Bun.env.AWS_CONFIG_FILE = cfg;
+		const shared = path.join(tmp, "credentials");
+		await Bun.write(shared, "");
+		Bun.env.AWS_SHARED_CREDENTIALS_FILE = shared;
+	}
+
+	async function writeCachedToken(token: Record<string, unknown>): Promise<string> {
+		const dir = path.join(tmp, ".aws", "sso", "cache");
+		await fs.mkdir(dir, { recursive: true });
+		const file = path.join(dir, "token.json");
+		await Bun.write(file, JSON.stringify(token));
+		return file;
+	}
+
+	test("silently refreshes an expired token via OIDC CreateToken and rewrites the cache", async () => {
+		await writeSsoProfile("sso");
+		const tokenFile = await writeCachedToken({
+			startUrl: START_URL,
+			region: SSO_REGION,
+			accessToken: "stale-access",
+			expiresAt: new Date(Date.now() - 60_000).toISOString(),
+			refreshToken: "refresh-abc",
+			clientId: "client-id",
+			clientSecret: "client-secret",
+			registrationExpiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+		});
+
+		let oidcCalls = 0;
+		let bearerSeenByFederation: string | undefined;
+		const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+			const u = String(url);
+			if (u.startsWith(`https://oidc.${SSO_REGION}.amazonaws.com/token`)) {
+				oidcCalls++;
+				const body = JSON.parse(String(init?.body)) as Record<string, string>;
+				expect(body.grantType).toBe("refresh_token");
+				expect(body.refreshToken).toBe("refresh-abc");
+				expect(body.clientId).toBe("client-id");
+				expect(body.clientSecret).toBe("client-secret");
+				return new Response(
+					JSON.stringify({ accessToken: "fresh-access", expiresIn: 3600, refreshToken: "refresh-next" }),
+					{ status: 200 },
+				);
+			}
+			if (u.includes("/federation/credentials")) {
+				const headers = (init?.headers ?? {}) as Record<string, string>;
+				bearerSeenByFederation = headers["x-amz-sso_bearer_token"];
+				return new Response(
+					JSON.stringify({
+						roleCredentials: {
+							accessKeyId: "AKIAROLE",
+							secretAccessKey: "role-secret",
+							sessionToken: "role-token",
+							expiration: Date.now() + 3_600_000,
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			throw new Error(`unexpected fetch: ${u}`);
+		}) as unknown as typeof fetch;
+
+		const creds = await resolveAwsCredentials({ profile: "sso", region: "us-east-1", fetch: fetchImpl });
+
+		// Fresh role credentials returned, minted from the refreshed bearer token.
+		expect(creds.accessKeyId).toBe("AKIAROLE");
+		expect(creds.sessionToken).toBe("role-token");
+		expect(oidcCalls).toBe(1);
+		expect(bearerSeenByFederation).toBe("fresh-access");
+
+		// Cache file rewritten so other AWS tools reuse the refreshed token.
+		const persisted = await Bun.file(tokenFile).json();
+		expect(persisted.accessToken).toBe("fresh-access");
+		expect(persisted.refreshToken).toBe("refresh-next");
+		expect(Date.parse(persisted.expiresAt)).toBeGreaterThan(Date.now());
+		// Unmodelled fields survive the round-trip.
+		expect(persisted.clientId).toBe("client-id");
+	});
+
+	test("throws sso-token-expired when an expired token has no refresh token", async () => {
+		await writeSsoProfile("sso2");
+		await writeCachedToken({
+			startUrl: START_URL,
+			region: SSO_REGION,
+			accessToken: "stale-access",
+			expiresAt: new Date(Date.now() - 60_000).toISOString(),
+		});
+		const fetchImpl = (async () => {
+			throw new Error("should not be called");
+		}) as unknown as typeof fetch;
+		await expect(resolveAwsCredentials({ profile: "sso2", region: "us-east-1", fetch: fetchImpl })).rejects.toThrow(
+			/has expired and automatic refresh failed/,
+		);
 	});
 });
