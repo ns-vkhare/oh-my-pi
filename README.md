@@ -20,9 +20,9 @@
 
 A tmux-supervised session multiplexer (Claude-Code "agent view" model). One background tmux session per project supervises the hub; window 0 hosts the hub TUI and every `omp` conversation runs in its own window. Unselected sessions **keep running in the background** — select one to foreground it, tap `←` on an empty editor to send it back to the hub.
 
-<video src="https://github.com/ns-vkhare/oh-my-pi/raw/develop/assets/agent-hub.mp4" controls muted width="100%"></video>
+![omp hub — the tmux-supervised session hub: a two-column box with the OMP logo and session list, foregrounding a session, and returning to the hub.](https://github.com/ns-vkhare/oh-my-pi/raw/develop/assets/agent-hub.webp)
 
-> If the player above doesn't load, [watch the recording ↗](https://github.com/ns-vkhare/oh-my-pi/raw/develop/assets/agent-hub.mp4).
+> Inline preview loops above. [Watch the full-resolution recording ↗](https://github.com/ns-vkhare/oh-my-pi/raw/develop/assets/agent-hub.mp4)
 
 - **Styled like the welcome pane** — a two-column rounded box: OMP logo + active model + session count on the left, the selectable session list on the right, and a live composer (visible cursor, drag-and-drop image attach) below that dispatches a new session by default.
 - **Navigation** — `↑`/`↓` select, `Enter`/`→` foreground the selected session (or dispatch when the editor has text), `Esc` detaches the hub.
