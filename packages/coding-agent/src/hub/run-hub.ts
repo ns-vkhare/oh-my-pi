@@ -12,7 +12,10 @@ import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { initTheme } from "../modes/theme/theme";
 import { getRecentSessions } from "../session/session-listing";
 import { SessionManager } from "../session/session-manager";
+import { FileSessionStorage } from "../session/session-storage";
+import { resolveSessionWorktree } from "../session/session-worktree";
 import { shortenPath } from "../tools/render-utils";
+import * as git from "../utils/git";
 import { type HubRow, HubView } from "./hub-view";
 import {
 	currentTmuxSession,
@@ -157,6 +160,23 @@ async function renderHub(): Promise<void> {
 				}
 			},
 			onDispatch: (prompt, imagePaths) => dispatchSession(prompt, imagePaths),
+			// Delete a session: kill its live window (if any), recover its worktree
+			// BEFORE unlinking the file (resolution reads the .jsonl), then remove the
+			// session + artifacts. Returns the worktree path when one is safely removable.
+			onDelete: async row => {
+				if (row.live && row.windowId) killWindow(row.windowId);
+				let worktree: string | null = null;
+				if (row.sessionPath) {
+					worktree = await resolveSessionWorktree(row.sessionPath);
+					await new FileSessionStorage().deleteSessionWithArtifacts(row.sessionPath);
+				}
+				latestRows = await buildRows();
+				return worktree;
+			},
+			onDeleteWorktree: async worktreePath => {
+				await git.worktree.remove(getProjectDir(), worktreePath, { force: true });
+				latestRows = await buildRows();
+			},
 			// Detach only: the hub keeps running so background reaping continues.
 			onExit: () => detachClient(),
 			requestRender: () => ui.requestRender(),

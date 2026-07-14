@@ -20,6 +20,7 @@ import {
 	getKeybindings,
 	matchesKey,
 	padding,
+	replaceTabs,
 	truncateToWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
@@ -29,6 +30,7 @@ import { CustomEditor } from "../modes/components/custom-editor";
 import { REST_FRAME } from "../modes/components/welcome";
 import { PLACEHOLDER_REGEX } from "../modes/image-references";
 import { getEditorTheme, theme } from "../modes/theme/theme";
+import { shortenPath } from "../tools/render-utils";
 
 /** One session row in the hub. */
 export interface HubRow {
@@ -51,6 +53,14 @@ export interface HubViewCallbacks {
 	onForeground: (row: HubRow) => void;
 	/** Dispatch a brand-new session seeded with `prompt` and any attached image paths. */
 	onDispatch: (prompt: string, imagePaths: readonly string[]) => void;
+	/**
+	 * Delete the row's session (kill its live window, remove the `.jsonl` + artifacts).
+	 * Resolves to the absolute path of the session's git worktree when one can be
+	 * safely removed, else `null`. Rejects on failure.
+	 */
+	onDelete: (row: HubRow) => Promise<string | null>;
+	/** Remove the git worktree at `worktreePath` (git worktree remove, forced). Rejects on failure. */
+	onDeleteWorktree: (worktreePath: string) => Promise<void>;
 	/** Leave the hub (detach). */
 	onExit: () => void;
 	/** Ask the host to repaint (async image attach, editor animation). */
@@ -85,6 +95,19 @@ export class HubView implements Component, Focusable {
 	#editor: CustomEditor;
 	/** Paths of images dropped into the composer, dispatched as `@file` args on submit. */
 	#imagePaths: string[] = [];
+	/**
+	 * The row key armed for deletion by a first Ctrl+X. A second Ctrl+X on the
+	 * same row confirms; any other input (selection move, typing, other keys)
+	 * disarms it. Keyed by {@link HubRow.key} so a background row refresh can't
+	 * silently retarget the armed row.
+	 */
+	#armedDeleteKey: string | undefined;
+	/** When set, a worktree-delete y/n prompt is open for a just-deleted session. */
+	#worktreePrompt: { path: string; title: string } | undefined;
+	/** True while an async delete/worktree action is in flight; input is ignored meanwhile. */
+	#busy = false;
+	/** Transient one-line status shown under the pane (delete outcome / error). */
+	#status: string | undefined;
 
 	constructor(
 		private readonly callbacks: HubViewCallbacks,
@@ -111,6 +134,10 @@ export class HubView implements Component, Focusable {
 		this.#rows = this.getRows();
 		if (this.#selectedIndex >= this.#rows.length) {
 			this.#selectedIndex = Math.max(0, this.#rows.length - 1);
+		}
+		// Drop a disarm target that no longer exists (deleted elsewhere / reaped).
+		if (this.#armedDeleteKey && !this.#rows.some(r => r.key === this.#armedDeleteKey)) {
+			this.#armedDeleteKey = undefined;
 		}
 	}
 
@@ -144,6 +171,42 @@ export class HubView implements Component, Focusable {
 
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
+		// Ignore input while an async delete/worktree removal is running.
+		if (this.#busy) return;
+
+		// Worktree-delete prompt is modal: y removes it, n/Esc keeps it, everything else is swallowed.
+		if (this.#worktreePrompt) {
+			if (matchesKey(keyData, "y") || matchesKey(keyData, "shift+y")) {
+				void this.#confirmWorktreeDelete();
+			} else if (
+				matchesKey(keyData, "n") ||
+				matchesKey(keyData, "shift+n") ||
+				kb.matches(keyData, "tui.select.cancel")
+			) {
+				this.#worktreePrompt = undefined;
+				this.#status = "Worktree kept.";
+			}
+			return;
+		}
+
+		// Ctrl+X: first press arms the selected row (rendered red), second press on the
+		// same row confirms deletion. Guarded so it can't fire from an empty list.
+		if (matchesKey(keyData, "ctrl+x")) {
+			const row = this.#rows[this.#selectedIndex];
+			if (!row) return;
+			if (this.#armedDeleteKey === row.key) {
+				void this.#confirmDelete(row);
+			} else {
+				this.#armedDeleteKey = row.key;
+				this.#status = undefined;
+			}
+			return;
+		}
+
+		// Any other key disarms a pending delete and clears the transient status.
+		this.#armedDeleteKey = undefined;
+		this.#status = undefined;
+
 		if (kb.matches(keyData, "tui.select.cancel")) {
 			// Esc / Ctrl+C: with a draft, clear it; otherwise leave the hub.
 			if (this.#editor.getText().length > 0 || this.#imagePaths.length > 0) {
@@ -177,6 +240,44 @@ export class HubView implements Component, Focusable {
 		this.#editor.handleInput(keyData);
 	}
 
+	/** Delete `row`'s session, then open the worktree-delete prompt when one is safely removable. */
+	async #confirmDelete(row: HubRow): Promise<void> {
+		this.#armedDeleteKey = undefined;
+		this.#busy = true;
+		this.#status = `Deleting ${row.title}…`;
+		this.callbacks.requestRender();
+		try {
+			const worktree = await this.callbacks.onDelete(row);
+			this.refresh();
+			this.#status = "Session deleted.";
+			if (worktree) this.#worktreePrompt = { path: worktree, title: row.title };
+		} catch (err) {
+			this.#status = `Delete failed: ${err instanceof Error ? err.message : String(err)}`;
+		} finally {
+			this.#busy = false;
+			this.callbacks.requestRender();
+		}
+	}
+
+	/** Remove the worktree named by the open prompt. */
+	async #confirmWorktreeDelete(): Promise<void> {
+		const prompt = this.#worktreePrompt;
+		if (!prompt) return;
+		this.#worktreePrompt = undefined;
+		this.#busy = true;
+		this.#status = "Removing worktree…";
+		this.callbacks.requestRender();
+		try {
+			await this.callbacks.onDeleteWorktree(prompt.path);
+			this.#status = `Worktree removed: ${shortenPath(prompt.path)}`;
+		} catch (err) {
+			this.#status = `Worktree removal failed: ${err instanceof Error ? err.message : String(err)}`;
+		} finally {
+			this.#busy = false;
+			this.callbacks.requestRender();
+		}
+	}
+
 	render(termWidth: number): readonly string[] {
 		const count = this.#rows.length;
 		const countLabel = `${count} session${count === 1 ? "" : "s"}`;
@@ -205,7 +306,11 @@ export class HubView implements Component, Focusable {
 		} else {
 			for (let i = 0; i < count && i < MAX_SESSION_ROWS; i++) {
 				const row = this.#rows[i];
-				if (row) sessionLines.push(this.#rowLine(row, i === this.#selectedIndex, listCol));
+				if (row) {
+					sessionLines.push(
+						this.#rowLine(row, i === this.#selectedIndex, row.key === this.#armedDeleteKey, listCol),
+					);
+				}
 			}
 		}
 		const rightLines = [` ${theme.bold(theme.fg("accent", "Sessions"))}`, ...sessionLines, ""];
@@ -222,21 +327,36 @@ export class HubView implements Component, Focusable {
 		this.#editor.setTopBorder({ content: theme.fg("muted", " New session "), width: visibleWidth(" New session ") });
 		lines.push("");
 		lines.push(...this.#editor.render(boxWidth));
-		lines.push(` ${theme.fg("dim", "↑/↓ select · enter/→ open · type + enter new session · esc detach")}`);
+		if (this.#worktreePrompt) {
+			const wt = shortenPath(this.#worktreePrompt.path);
+			lines.push(` ${theme.fg("warning", `Also delete worktree ${replaceTabs(wt)}?`)} ${theme.fg("dim", "(y/n)")}`);
+		} else if (this.#status) {
+			lines.push(` ${theme.fg("muted", replaceTabs(this.#status))}`);
+		}
+		lines.push(
+			` ${theme.fg("dim", "↑/↓ select · enter/→ open · ctrl+x×2 delete · type + enter new session · esc detach")}`,
+		);
 		return lines;
 	}
 
 	/** Compose one session row to the column width, leaving a right margin: ` > ● name … meta  `. */
-	#rowLine(row: HubRow, selected: boolean, colWidth: number): string {
+	#rowLine(row: HubRow, selected: boolean, armed: boolean, colWidth: number): string {
 		const usable = Math.max(1, colWidth - ROW_RIGHT_MARGIN);
-		const cursor = selected ? theme.fg("accent", ">") : " ";
+		// An armed row overrides its meta with the confirm hint and paints red.
+		const metaText = armed ? "ctrl+x again ✗" : row.meta;
+		const cursor = armed ? theme.fg("error", "✗") : selected ? theme.fg("accent", ">") : " ";
 		const dot = row.live ? theme.fg("success", "●") : theme.fg("dim", "○");
-		const metaVis = visibleWidth(row.meta);
+		const metaVis = visibleWidth(metaText);
 		const nameBudget = Math.max(1, usable - ROW_PREFIX_WIDTH - metaVis - 1);
 		const nameVis = visibleWidth(row.title);
 		const name = nameVis > nameBudget ? truncateToWidth(row.title, nameBudget) : row.title;
-		const namePainted = selected ? theme.fg("accent", name) : theme.fg("muted", name);
+		const namePainted = armed
+			? theme.fg("error", name)
+			: selected
+				? theme.fg("accent", name)
+				: theme.fg("muted", name);
 		const gap = Math.max(1, usable - ROW_PREFIX_WIDTH - Math.min(nameVis, nameBudget) - metaVis);
-		return ` ${cursor} ${dot} ${namePainted}${padding(gap)}${theme.fg("dim", row.meta)}`;
+		const metaPainted = armed ? theme.fg("error", metaText) : theme.fg("dim", metaText);
+		return ` ${cursor} ${dot} ${namePainted}${padding(gap)}${metaPainted}`;
 	}
 }
