@@ -21,7 +21,7 @@ const TIPS: readonly string[] = tipsText
  * Fixed number of session rows in the welcome box so its height stays stable
  * across recent-session updates.
  */
-export const WELCOME_SESSION_SLOTS = 4;
+export const WELCOME_SESSION_SLOTS = 8;
 
 /**
  * Fixed number of LSP-server rows, for the same reason. Overflow is sliced so

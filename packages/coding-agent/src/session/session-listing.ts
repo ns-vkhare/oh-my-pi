@@ -579,7 +579,7 @@ export async function findMostRecentSession(
 /** Get recent sessions for display in the welcome screen. */
 export async function getRecentSessions(
 	sessionDir: string,
-	limit = 4,
+	limit = 8,
 	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<RecentSessionInfo[]> {
 	const sessions = await scanSessionDir(sessionDir, storage, false);
