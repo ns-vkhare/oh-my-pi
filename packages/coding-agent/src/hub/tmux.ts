@@ -1,8 +1,8 @@
 /**
  * tmux orchestration for the session hub.
  *
- * The hub uses tmux as a session supervisor: a single tmux session
- * (`HUB_TMUX_SESSION`) holds the hub TUI in window 0 and every live omp
+ * The hub uses tmux as a session supervisor: a per-project tmux session
+ * (see {@link hubTmuxSession}) holds the hub TUI in window 0 and every live omp
  * conversation as its own window. tmux keeps unselected windows running, so a
  * session the user switched away from keeps generating in the background and
  * resumes to the foreground when its window is re-selected — the Claude-Code
@@ -14,9 +14,40 @@
  * in-session left-arrow gesture can switch back to the hub window.
  */
 import { spawnSync } from "node:child_process";
+import * as path from "node:path";
+import { getProjectDir } from "@oh-my-pi/pi-utils";
 
-/** Name of the tmux session that hosts the hub and all per-session windows. */
-export const HUB_TMUX_SESSION = "omp-hub";
+/** Prefix for every hub tmux session name. */
+const HUB_SESSION_PREFIX = "omp-hub";
+
+/**
+ * tmux session name for the hub, scoped to the current project directory.
+ *
+ * A single shared name made two concurrent `omp hub` runs attach to the same
+ * tmux session, and tmux mirrors the current window across every client on one
+ * session — so the two hubs reflected each other and parallel workflows across
+ * projects were impossible. Keying the name on the project dir gives each
+ * project its own hub while still letting a re-run in the same project reattach
+ * to its existing background hub (the data listing is already project-scoped via
+ * `getProjectDir()`, so this aligns the tmux scope with it).
+ *
+ * The name is the human-readable project basename (so `tmux ls` is legible),
+ * with a short hash of the full path appended to disambiguate distinct projects
+ * that share a basename. Computed lazily rather than as a module const because
+ * the project dir is resolved during CLI startup (`setProjectDir`, e.g. to a
+ * git root) after this module loads; the hub window re-derives the same name
+ * from the same cwd it is spawned in.
+ */
+export function hubTmuxSession(): string {
+	const dir = getProjectDir();
+	const slug = path
+		.basename(dir)
+		.replace(/[^A-Za-z0-9_-]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 32);
+	const hash = Bun.hash(dir).toString(16).slice(-6);
+	return slug ? `${HUB_SESSION_PREFIX}-${slug}-${hash}` : `${HUB_SESSION_PREFIX}-${hash}`;
+}
 /** tmux user option (per window) recording which session `.jsonl` a window hosts. */
 const SESSION_PATH_OPT = "@omp_session_path";
 /** tmux user option (per window) recording the hub's chosen display title (omp's OSC title otherwise renames the window). */
@@ -27,6 +58,12 @@ const HUB_WINDOW_OPT = "@omp_hub_window";
 export const HUB_ENV = "OMP_HUB";
 /** Env var carrying the hub window id so the in-session gesture can switch back. */
 export const HUB_WINDOW_ENV = "OMP_HUB_WINDOW";
+/**
+ * Env var set only on freshly *dispatched* hub session windows (not resumed
+ * ones). Signals the new omp process that this session was started blank from
+ * the hub, so the agent can prefer an isolated worktree by default.
+ */
+export const HUB_NEW_SESSION_ENV = "OMP_HUB_NEW_SESSION";
 
 /** A live per-session window in the hub tmux session. */
 export interface HubWindow {
@@ -38,6 +75,22 @@ export interface HubWindow {
 	/** Absolute path to the session `.jsonl` this window hosts, when tagged. */
 	sessionPath: string | undefined;
 	active: boolean;
+}
+
+/** A hub tmux session on the local tmux server (one per project). */
+export interface HubSummary {
+	/** tmux session name (e.g. `omp-hub-my-project-e49ce6`). */
+	session: string;
+	/** Project directory the hub supervises (the hub window's cwd), or "" if unknown. */
+	project: string;
+	/** Number of live omp session windows (excludes the hub window itself). */
+	sessions: number;
+	/** Whether a tmux client is currently attached to this hub. */
+	attached: boolean;
+	/** tmux session activity time (epoch seconds), or 0 if unknown. */
+	activityEpoch: number;
+	/** True when this hub is the one for the current project directory. */
+	current: boolean;
 }
 
 /** True when the current process is running inside any tmux client. */
@@ -54,7 +107,7 @@ function tmux(args: string[]): string | null {
 
 /** True when the hub tmux session already exists. */
 export function hubSessionExists(): boolean {
-	const result = spawnSync("tmux", ["has-session", "-t", HUB_TMUX_SESSION], { stdio: "ignore" });
+	const result = spawnSync("tmux", ["has-session", "-t", hubTmuxSession()], { stdio: "ignore" });
 	return result.status === 0;
 }
 
@@ -85,10 +138,11 @@ function shellCommand(argv: string[]): string {
  */
 export function ensureHubSession(): void {
 	if (hubSessionExists()) return;
+	const session = hubTmuxSession();
 	const hubCmd = shellCommand([...selfInvocation(), "hub"]);
 	// `new-session -d` creates the session detached with one window running the
 	// hub. `-n hub` names it; the shell command keeps the window alive as the hub.
-	tmux(["new-session", "-d", "-s", HUB_TMUX_SESSION, "-n", "hub", hubCmd]);
+	tmux(["new-session", "-d", "-s", session, "-n", "hub", hubCmd]);
 	// The tmux status bar's folder + branch segments duplicate omp's own
 	// statusline (every session window is an omp process, cwd/branch and all).
 	// Strip just those modules from status-left for this session, keeping the
@@ -105,18 +159,19 @@ export function ensureHubSession(): void {
 		];
 		let hubStatusLeft = globalStatusLeft;
 		for (const re of redundant) hubStatusLeft = hubStatusLeft.replace(re, "");
-		tmux(["set-option", "-t", HUB_TMUX_SESSION, "status-left", hubStatusLeft]);
+		tmux(["set-option", "-t", session, "status-left", hubStatusLeft]);
 	}
-	const hubWindowId = tmux(["display-message", "-p", "-t", `${HUB_TMUX_SESSION}:hub`, "#{window_id}"]);
+	const hubWindowId = tmux(["display-message", "-p", "-t", `${session}:hub`, "#{window_id}"]);
 	if (hubWindowId) {
-		tmux(["set-option", "-t", HUB_TMUX_SESSION, HUB_WINDOW_OPT, hubWindowId]);
+		tmux(["set-option", "-t", session, HUB_WINDOW_OPT, hubWindowId]);
 	}
 }
 
 /** The hub window id recorded on the hub session, or the conventional target. */
 export function hubWindowTarget(): string {
-	const id = tmux(["show-option", "-v", "-t", HUB_TMUX_SESSION, HUB_WINDOW_OPT]);
-	return id && id.length > 0 ? id : `${HUB_TMUX_SESSION}:hub`;
+	const session = hubTmuxSession();
+	const id = tmux(["show-option", "-v", "-t", session, HUB_WINDOW_OPT]);
+	return id && id.length > 0 ? id : `${session}:hub`;
 }
 
 /**
@@ -125,12 +180,13 @@ export function hubWindowTarget(): string {
  * the client detaches; switching returns immediately.
  */
 export function enterHubSession(): void {
+	const session = hubTmuxSession();
 	if (insideTmux()) {
-		tmux(["switch-client", "-t", HUB_TMUX_SESSION]);
+		tmux(["switch-client", "-t", session]);
 		return;
 	}
 	// attach-session must inherit the real terminal; run it as a foreground child.
-	spawnSync("tmux", ["attach-session", "-t", HUB_TMUX_SESSION], { stdio: "inherit" });
+	spawnSync("tmux", ["attach-session", "-t", session], { stdio: "inherit" });
 }
 
 /** List the per-session windows in the hub (excludes the hub window itself). */
@@ -143,7 +199,7 @@ export function listSessionWindows(): HubWindow[] {
 		`#{${SESSION_PATH_OPT}}`,
 		"#{window_active}",
 	].join("\t");
-	const out = tmux(["list-windows", "-t", HUB_TMUX_SESSION, "-F", fmt]);
+	const out = tmux(["list-windows", "-t", hubTmuxSession(), "-F", fmt]);
 	if (!out) return [];
 	const hubTarget = hubWindowTarget();
 	const windows: HubWindow[] = [];
@@ -170,9 +226,74 @@ export function findWindowForSession(sessionPath: string): HubWindow | undefined
 	return listSessionWindows().find(w => w.sessionPath === sessionPath);
 }
 
-/** Environment assignments (as `-e KEY=VALUE` args) for a spawned session window. */
-function sessionWindowEnv(): string[] {
-	return ["-e", `${HUB_ENV}=${HUB_TMUX_SESSION}`, "-e", `${HUB_WINDOW_ENV}=${hubWindowTarget()}`];
+/**
+ * Enumerate every hub tmux session on the local tmux server (one per project).
+ *
+ * A single `list-panes -a` call yields all panes across all sessions; sessions
+ * whose name carries the {@link HUB_SESSION_PREFIX} are hubs. Per hub the
+ * project dir is the cwd of its lowest-indexed window (the hub window, created
+ * first), the live-session count excludes that hub window, and attach state /
+ * activity come from the session-level fields tmux exposes in the pane context.
+ * Returns [] when no tmux server is running.
+ */
+export function listHubs(): HubSummary[] {
+	const fmt = [
+		"#{session_name}",
+		"#{session_windows}",
+		"#{session_attached}",
+		"#{session_activity}",
+		"#{window_index}",
+		"#{pane_current_path}",
+	].join("\t");
+	const out = tmux(["list-panes", "-a", "-F", fmt]);
+	if (!out) return [];
+	return parseHubPanes(out, hubTmuxSession());
+}
+
+/**
+ * Parse the tab-separated `list-panes -a` output into per-hub summaries. Pure
+ * (no tmux) so it is unit-testable. Rows are grouped by session; only sessions
+ * carrying the {@link HUB_SESSION_PREFIX} count, the project dir is taken from
+ * the lowest-indexed window (the hub window), the live-session count excludes
+ * that hub window, and hubs are sorted most-recently-active first. `currentSession`
+ * is flagged so callers can mark the current project's hub.
+ */
+export function parseHubPanes(out: string, currentSession: string): HubSummary[] {
+	const prefix = `${HUB_SESSION_PREFIX}-`;
+	// Accumulate per session; keep the pane cwd from the lowest window index.
+	const bySession = new Map<string, { summary: HubSummary; hubWindowIndex: number }>();
+	for (const line of out.split("\n")) {
+		if (!line) continue;
+		const [name, windows, attached, activity, windowIndex, panePath] = line.split("\t");
+		if (!name?.startsWith(prefix)) continue;
+		const idx = Number(windowIndex);
+		const entry = bySession.get(name);
+		if (!entry) {
+			bySession.set(name, {
+				hubWindowIndex: Number.isFinite(idx) ? idx : 0,
+				summary: {
+					session: name,
+					project: panePath ?? "",
+					sessions: Math.max(0, (Number(windows) || 1) - 1),
+					attached: attached === "1",
+					activityEpoch: Number(activity) || 0,
+					current: name === currentSession,
+				},
+			});
+		} else if (Number.isFinite(idx) && idx < entry.hubWindowIndex) {
+			entry.hubWindowIndex = idx;
+			entry.summary.project = panePath ?? "";
+		}
+	}
+	return [...bySession.values()].map(e => e.summary).sort((a, b) => b.activityEpoch - a.activityEpoch);
+}
+
+/** Environment assignments (as `-e KEY=VALUE` args) for a spawned session window.
+ * `newSession` marks a freshly dispatched (blank) session vs. a resumed one. */
+function sessionWindowEnv(newSession = false): string[] {
+	const env = ["-e", `${HUB_ENV}=${hubTmuxSession()}`, "-e", `${HUB_WINDOW_ENV}=${hubWindowTarget()}`];
+	if (newSession) env.push("-e", `${HUB_NEW_SESSION_ENV}=1`);
+	return env;
 }
 
 /**
@@ -190,7 +311,7 @@ export function foregroundSession(sessionPath: string, name: string): string | n
 	const windowId = tmux([
 		"new-window",
 		"-t",
-		HUB_TMUX_SESSION,
+		hubTmuxSession(),
 		"-n",
 		tmuxSafeName(name),
 		"-P",
@@ -223,13 +344,13 @@ export function dispatchSession(prompt: string, imagePaths: readonly string[] = 
 	const windowId = tmux([
 		"new-window",
 		"-t",
-		HUB_TMUX_SESSION,
+		hubTmuxSession(),
 		"-n",
 		tmuxSafeName(prompt || "new session"),
 		"-P",
 		"-F",
 		"#{window_id}",
-		...sessionWindowEnv(),
+		...sessionWindowEnv(true),
 		shellCommand(argv),
 	]);
 	if (windowId) {

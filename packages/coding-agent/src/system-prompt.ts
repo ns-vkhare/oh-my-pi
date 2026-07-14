@@ -799,6 +799,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		hasObsidian: hasObsidian(),
 		includeWorkspaceTree,
 		renderMermaid,
+		hubNewSession: $env.OMP_HUB_NEW_SESSION === "1",
 	};
 	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
 	const systemPrompt = [rendered];

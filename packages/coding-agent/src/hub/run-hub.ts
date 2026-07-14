@@ -12,6 +12,7 @@ import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { initTheme } from "../modes/theme/theme";
 import { getRecentSessions } from "../session/session-listing";
 import { SessionManager } from "../session/session-manager";
+import { shortenPath } from "../tools/render-utils";
 import { type HubRow, HubView } from "./hub-view";
 import {
 	currentTmuxSession,
@@ -21,9 +22,11 @@ import {
 	ensureHubSession,
 	enterHubSession,
 	foregroundSession,
-	HUB_TMUX_SESSION,
+	type HubSummary,
+	hubTmuxSession,
 	hubWindowTarget,
 	killWindow,
+	listHubs,
 	listSessionWindows,
 	selectWindow,
 } from "./tmux";
@@ -123,7 +126,7 @@ async function buildRows(): Promise<HubRow[]> {
 
 /** True when this process is the hub window's own process (render the TUI here). */
 function isHubWindowProcess(): boolean {
-	if (currentTmuxSession() !== HUB_TMUX_SESSION) return false;
+	if (currentTmuxSession() !== hubTmuxSession()) return false;
 	const window = currentTmuxWindow();
 	return window !== null && window === hubWindowTarget();
 }
@@ -184,4 +187,54 @@ export async function runHub(): Promise<void> {
 	}
 	ensureHubSession();
 	enterHubSession();
+}
+
+/** Compact relative time for a hub's last-activity epoch (seconds). */
+function formatActivityAgo(epochSeconds: number): string {
+	if (!epochSeconds) return "-";
+	const diffMs = Date.now() - epochSeconds * 1000;
+	const mins = Math.floor(diffMs / 60_000);
+	if (mins < 1) return "just now";
+	if (mins < 60) return `${mins}m ago`;
+	const hours = Math.floor(diffMs / 3_600_000);
+	if (hours < 24) return `${hours}h ago`;
+	const days = Math.floor(diffMs / 86_400_000);
+	return `${days}d ago`;
+}
+
+/**
+ * `omp hub list` — print every active hub tmux session (one per project) to
+ * stdout: which project it supervises, how many live omp sessions it holds,
+ * whether a client is attached, and how recently it was active. The hub for the
+ * current project is marked with `*`.
+ */
+export async function runHubList(): Promise<void> {
+	const hubs = listHubs();
+	if (hubs.length === 0) {
+		process.stdout.write("No active omp hubs.\n");
+		return;
+	}
+	const rows = hubs.map((h: HubSummary) => ({
+		mark: h.current ? "*" : " ",
+		session: h.session,
+		project: h.project ? shortenPath(h.project) : "-",
+		sessions: String(h.sessions),
+		attached: h.attached ? "attached" : "detached",
+		activity: formatActivityAgo(h.activityEpoch),
+	}));
+	const headers = {
+		mark: " ",
+		session: "SESSION",
+		project: "PROJECT",
+		sessions: "SESSIONS",
+		attached: "STATE",
+		activity: "ACTIVITY",
+	};
+	const cols = ["session", "project", "sessions", "attached", "activity"] as const;
+	const width = (key: (typeof cols)[number]) => Math.max(headers[key].length, ...rows.map(r => r[key].length));
+	const widths = Object.fromEntries(cols.map(k => [k, width(k)])) as Record<(typeof cols)[number], number>;
+	const line = (r: { mark: string } & Record<(typeof cols)[number], string>) =>
+		`${r.mark} ${cols.map(k => r[k].padEnd(widths[k])).join("  ")}`.trimEnd();
+	process.stdout.write(`${line(headers)}\n`);
+	for (const r of rows) process.stdout.write(`${line(r)}\n`);
 }

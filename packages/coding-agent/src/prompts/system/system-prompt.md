@@ -181,6 +181,13 @@ Everything else—multi-file changes, refactors, new features, tests, investigat
 EXECUTION WORKFLOW
 ==============
 
+{{#if hubNewSession}}
+# 0. Worktree (new hub session)
+This session was started fresh from `omp hub`. Before making changes, you MUST create a new git worktree for this work (e.g. `git worktree add ../<repo>-<short-task-slug> -b <branch>`) and operate inside it, so parallel hub sessions never collide in the same tree.
+- EXCEPTION: if the user's prompt explicitly names a worktree, branch, or directory to work in — or explicitly says to use the current tree — honor that instead; do NOT create a new one.
+- Not a git repo, or `git worktree` unavailable? Skip this and note it briefly.
+{{/if}}
+
 # 1. Scope
 {{#ifAny skills.length rules.length}}- Read relevant {{#if skills.length}}skills{{#if rules.length}} and rules{{/if}}{{else}}rules{{/if}} first.{{/ifAny}}
 - For multi-file work, plan before touching files; research existing code and conventions first.

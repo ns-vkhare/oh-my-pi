@@ -6,6 +6,12 @@
 
 - Styled the `omp hub` session view to match the welcome pane: a two-column box with the OMP logo and active model on the left, prompt tips and the recent-sessions list on the right, and an editor box below that dispatches a new session by default.
 - Gave the `omp hub` composer the full interactive editor: a visible cursor, and drag-and-dropped image files attach and ride along to the new session as `@file` arguments. Deleting an image's `[Image #N]` marker from the draft now drops that image from the dispatched session.
+- Added `omp hub list` to show every active hub across projects — session name, supervised project directory, live-session count, attach state, and last activity — with the current project's hub marked.
+- Sessions dispatched fresh from `omp hub` now instruct the agent to create a new git worktree for the task by default (unless the prompt explicitly names a worktree/branch/tree), so parallel hub sessions don't collide in the same working tree. Resumed sessions are unaffected.
+
+### Fixed
+
+- Fixed concurrent `omp hub` sessions in different projects mirroring each other: the hub's tmux session name is now scoped per project directory (`omp-hub-<project>-<hash>`) instead of a single shared `omp-hub` session, so parallel hubs across projects run independently while a re-run within the same project still reattaches to its existing background hub.
 
 ## [16.5.0] - 2026-07-13
 
