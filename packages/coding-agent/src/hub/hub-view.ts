@@ -1,19 +1,21 @@
 /**
  * Hub view — the fullscreen TUI shown in the hub's tmux window.
  *
- * Rendered to match the welcome pane (shared {@link ./box-layout}): a rounded
- * two-column box with the OMP logo and a session count on the left, and the
- * selectable session list on the right. Beneath the box sits an editor line
- * that dispatches a brand-new session on Enter.
+ * Rendered to match the welcome pane (shared {@link ../modes/components/box-layout}):
+ * a rounded two-column box with the OMP logo and a session count on the left,
+ * and the selectable session list on the right. Beneath the box sits a real
+ * {@link CustomEditor} — the same composer the interactive CLI uses — so it
+ * gets a visible cursor, and drag-and-dropped image files attach exactly like
+ * the normal flow (dispatched to the new session as `@file` args).
  *
- * Arrow keys move the session selection, Enter or → foregrounds the selected
- * session (Enter dispatches a new one instead when the editor has text), and
- * Esc clears the editor or, when empty, detaches the hub.
+ * Arrow keys move the session selection, → foregrounds the selected session
+ * when the editor is empty, Enter dispatches a new session (or opens the
+ * selection when the editor is empty), and Esc clears the editor or, when
+ * empty, detaches the hub.
  */
 import {
+	type AutocompleteProvider,
 	type Component,
-	CURSOR_MARKER,
-	extractPrintableText,
 	type Focusable,
 	getKeybindings,
 	matchesKey,
@@ -22,9 +24,11 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import { VERSION } from "@oh-my-pi/pi-utils/dirs";
-import { assembleTwoColumnBox, centerText, computeTwoColumnLayout, fitToWidth } from "../modes/components/box-layout";
+import { assembleTwoColumnBox, centerText, computeTwoColumnLayout } from "../modes/components/box-layout";
+import { CustomEditor } from "../modes/components/custom-editor";
 import { REST_FRAME } from "../modes/components/welcome";
-import { theme } from "../modes/theme/theme";
+import { PLACEHOLDER_REGEX } from "../modes/image-references";
+import { getEditorTheme, theme } from "../modes/theme/theme";
 
 /** One session row in the hub. */
 export interface HubRow {
@@ -45,30 +49,61 @@ export interface HubRow {
 export interface HubViewCallbacks {
 	/** Foreground the row: select its live window, or open one resuming its session. */
 	onForeground: (row: HubRow) => void;
-	/** Dispatch a brand-new session seeded with `prompt`. */
-	onDispatch: (prompt: string) => void;
+	/** Dispatch a brand-new session seeded with `prompt` and any attached image paths. */
+	onDispatch: (prompt: string, imagePaths: readonly string[]) => void;
 	/** Leave the hub (detach). */
 	onExit: () => void;
+	/** Ask the host to repaint (async image attach, editor animation). */
+	requestRender: () => void;
 }
 
 /** Visible width of a row's ` > ● ` prefix (space, cursor, space, dot, space). */
 const ROW_PREFIX_WIDTH = 5;
+/** Blank cells kept between a row's meta and the box border so text never kisses the edge. */
+const ROW_RIGHT_MARGIN = 2;
 /** Cap on session rows so the box never outgrows a typical terminal height. */
 const MAX_SESSION_ROWS = 12;
 /** Narrowest left column that still shows the logo (its glyph width). */
 const LOGO_WIDTH = 12;
+/** Max visible rows the editor grows to before it scrolls internally. */
+const EDITOR_MAX_HEIGHT = 6;
+
+/** Placeholder ghost text shown while the composer is empty. */
+const EDITOR_PLACEHOLDER = "Describe a new session…";
+
+/** Minimal autocomplete provider: no completions, only the empty-buffer placeholder hint. */
+const placeholderProvider: AutocompleteProvider = {
+	getSuggestions: () => Promise.resolve(null),
+	applyCompletion: (lines, cursorLine, cursorCol) => ({ lines, cursorLine, cursorCol }),
+	getInlineHint: lines => (lines.length === 1 && lines[0] === "" ? EDITOR_PLACEHOLDER : null),
+};
 
 export class HubView implements Component, Focusable {
 	focused = false;
 	#rows: HubRow[] = [];
 	#selectedIndex = 0;
-	#input = "";
+	#editor: CustomEditor;
+	/** Paths of images dropped into the composer, dispatched as `@file` args on submit. */
+	#imagePaths: string[] = [];
 
 	constructor(
 		private readonly callbacks: HubViewCallbacks,
 		private readonly getRows: () => HubRow[],
 	) {
 		this.#rows = getRows();
+		const editor = new CustomEditor(getEditorTheme());
+		editor.setMaxHeight(EDITOR_MAX_HEIGHT);
+		editor.setAutocompleteProvider(placeholderProvider);
+		editor.setShimmerRepaintHandler(() => this.callbacks.requestRender());
+		editor.onSubmit = text => this.#submit(text);
+		editor.onPasteImagePath = path => this.#attachImage(path);
+		this.#editor = editor;
+	}
+
+	/** TUI forwards the hardware-cursor mode; the hub runs with it off, so the editor draws
+	 *  its own visible cursor glyph. */
+	setUseTerminalCursor(useTerminalCursor: boolean): void {
+		this.#editor.setUseTerminalCursor(useTerminalCursor);
 	}
 
 	/** Rebuild rows from the live source (called on a timer and after each action). */
@@ -79,12 +114,35 @@ export class HubView implements Component, Focusable {
 		}
 	}
 
+	/** Record a dropped/pasted image and insert a positional marker so it's visible in the draft. */
+	#attachImage(path: string): void {
+		this.#imagePaths.push(path);
+		this.#editor.insertText(`[Image #${this.#imagePaths.length}] `);
+		this.callbacks.requestRender();
+	}
+
+	/** Enter handler: dispatch a new session when the draft has text or images, else open the
+	 *  selected session. Editor text arrives with paste markers expanded; strip the image markers
+	 *  since the paths ride along out-of-band as `@file` args. */
+	#submit(text: string): void {
+		const prompt = text.replace(PLACEHOLDER_REGEX, "").replace(/\s+/g, " ").trim();
+		const images = this.#imagePaths;
+		this.#imagePaths = [];
+		if (prompt.length > 0 || images.length > 0) {
+			this.callbacks.onDispatch(prompt, images);
+			return;
+		}
+		const row = this.#rows[this.#selectedIndex];
+		if (row) this.callbacks.onForeground(row);
+	}
+
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
 		if (kb.matches(keyData, "tui.select.cancel")) {
-			// Esc / Ctrl+C: with text in the editor, clear it; otherwise leave the hub.
-			if (this.#input.length > 0) {
-				this.#input = "";
+			// Esc / Ctrl+C: with a draft, clear it; otherwise leave the hub.
+			if (this.#editor.getText().length > 0 || this.#imagePaths.length > 0) {
+				this.#editor.setText("");
+				this.#imagePaths = [];
 				return;
 			}
 			this.callbacks.onExit();
@@ -102,30 +160,15 @@ export class HubView implements Component, Focusable {
 			}
 			return;
 		}
-		// → foregrounds the selected session (the editor line has no cursor movement,
-		// so → has no competing meaning here).
-		if (matchesKey(keyData, "right")) {
+		// → opens the selected session only when the composer is empty; otherwise it moves the
+		// editor cursor like normal.
+		if (matchesKey(keyData, "right") && this.#editor.getText().length === 0) {
 			const row = this.#rows[this.#selectedIndex];
 			if (row) this.callbacks.onForeground(row);
 			return;
 		}
-		if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
-			const prompt = this.#input.trim();
-			if (prompt.length > 0) {
-				this.#input = "";
-				this.callbacks.onDispatch(prompt);
-				return;
-			}
-			const row = this.#rows[this.#selectedIndex];
-			if (row) this.callbacks.onForeground(row);
-			return;
-		}
-		if (kb.matches(keyData, "tui.editor.deleteCharBackward")) {
-			this.#input = this.#input.slice(0, -1);
-			return;
-		}
-		const printable = extractPrintableText(keyData);
-		if (printable) this.#input += printable;
+		// Everything else (text, Enter, backspace, paste, image drop) is the editor's.
+		this.#editor.handleInput(keyData);
 	}
 
 	render(termWidth: number): readonly string[] {
@@ -166,49 +209,28 @@ export class HubView implements Component, Focusable {
 		const lines = showRightColumn
 			? assembleTwoColumnBox(layout, `omp hub v${VERSION}`, leftLines, rightLines)
 			: assembleTwoColumnBox(layout, `omp hub v${VERSION}`, [...leftLines, "", ...rightLines], []);
-		lines.push(...this.#renderEditor(boxWidth));
+
+		// The composer renders its own rounded box beneath the pane. Keep its focus
+		// in sync so it emits the visible cursor, and label its top border.
+		this.#editor.focused = this.focused;
+		this.#editor.setTopBorder({ content: theme.fg("muted", " New session "), width: visibleWidth(" New session ") });
+		lines.push("");
+		lines.push(...this.#editor.render(boxWidth));
 		lines.push(` ${theme.fg("dim", "↑/↓ select · enter/→ open · type + enter new session · esc detach")}`);
 		return lines;
 	}
 
-	/**
-	 * Editor box beneath the main pane: a rounded single-line input that, on
-	 * Enter with text, dispatches a new session. Empty by default so the implied
-	 * action is "start a new session".
-	 */
-	#renderEditor(boxWidth: number): string[] {
-		const innerWidth = boxWidth - 2;
-		const h = theme.fg("dim", theme.boxRound.horizontal);
-		const v = theme.fg("dim", theme.boxRound.vertical);
-		const tl = theme.fg("dim", theme.boxRound.topLeft);
-		const tr = theme.fg("dim", theme.boxRound.topRight);
-		const bl = theme.fg("dim", theme.boxRound.bottomLeft);
-		const br = theme.fg("dim", theme.boxRound.bottomRight);
-
-		const title = " New session ";
-		const afterTitle = Math.max(0, innerWidth - visibleWidth(title));
-		const top = tl + theme.fg("muted", title) + theme.fg("dim", theme.boxRound.horizontal.repeat(afterTitle)) + tr;
-
-		// CURSOR_MARKER positions the hardware cursor at the caret; the trailing
-		// block is the visible caret when focused.
-		const caret = this.focused ? CURSOR_MARKER : "";
-		const body =
-			this.#input.length > 0
-				? `${theme.fg("dim", theme.md.bullet)} ${this.#input}${caret}`
-				: `${theme.fg("dim", theme.md.bullet)} ${theme.fg("dim", "Describe a new session…")}${caret}`;
-		return ["", top, v + fitToWidth(` ${body}`, innerWidth) + v, bl + h.repeat(innerWidth) + br];
-	}
-
-	/** Compose one session row to the exact column width: ` > ● name … meta`. */
+	/** Compose one session row to the column width, leaving a right margin: ` > ● name … meta  `. */
 	#rowLine(row: HubRow, selected: boolean, colWidth: number): string {
+		const usable = Math.max(1, colWidth - ROW_RIGHT_MARGIN);
 		const cursor = selected ? theme.fg("accent", ">") : " ";
 		const dot = row.live ? theme.fg("success", "●") : theme.fg("dim", "○");
 		const metaVis = visibleWidth(row.meta);
-		const nameBudget = Math.max(1, colWidth - ROW_PREFIX_WIDTH - metaVis - 1);
+		const nameBudget = Math.max(1, usable - ROW_PREFIX_WIDTH - metaVis - 1);
 		const nameVis = visibleWidth(row.title);
 		const name = nameVis > nameBudget ? truncateToWidth(row.title, nameBudget) : row.title;
 		const namePainted = selected ? theme.fg("accent", name) : theme.fg("muted", name);
-		const gap = Math.max(1, colWidth - ROW_PREFIX_WIDTH - Math.min(nameVis, nameBudget) - metaVis);
+		const gap = Math.max(1, usable - ROW_PREFIX_WIDTH - Math.min(nameVis, nameBudget) - metaVis);
 		return ` ${cursor} ${dot} ${namePainted}${padding(gap)}${theme.fg("dim", row.meta)}`;
 	}
 }

@@ -153,9 +153,10 @@ async function renderHub(): Promise<void> {
 					foregroundSession(row.sessionPath, row.title);
 				}
 			},
-			onDispatch: prompt => dispatchSession(prompt),
+			onDispatch: (prompt, imagePaths) => dispatchSession(prompt, imagePaths),
 			// Detach only: the hub keeps running so background reaping continues.
 			onExit: () => detachClient(),
+			requestRender: () => ui.requestRender(),
 		},
 		() => latestRows,
 	);

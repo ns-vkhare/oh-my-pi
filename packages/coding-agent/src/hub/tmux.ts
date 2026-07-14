@@ -210,12 +210,16 @@ export function foregroundSession(sessionPath: string, name: string): string | n
 
 /**
  * Dispatch a brand-new session: open a window running `omp` seeded with
- * `prompt`. The session `.jsonl` does not exist yet, so the window is tagged
- * only with a name; it is reconciled to a session path on a later hub refresh
- * (the window's own omp process owns the new session). Returns the window id.
+ * `prompt` and any `imagePaths` (passed as `@file` args so the new process
+ * attaches them exactly like `omp @img.png "prompt"`). The session `.jsonl`
+ * does not exist yet, so the window is tagged only with a name; it is
+ * reconciled to a session path on a later hub refresh (the window's own omp
+ * process owns the new session). Returns the window id.
  */
-export function dispatchSession(prompt: string): string | null {
-	const argv = prompt.trim().length > 0 ? [...selfInvocation(), prompt] : [...selfInvocation()];
+export function dispatchSession(prompt: string, imagePaths: readonly string[] = []): string | null {
+	const fileArgs = imagePaths.map(p => `@${p}`);
+	const trimmed = prompt.trim();
+	const argv = [...selfInvocation(), ...fileArgs, ...(trimmed.length > 0 ? [trimmed] : [])];
 	const windowId = tmux([
 		"new-window",
 		"-t",
@@ -263,7 +267,10 @@ export function currentTmuxWindow(): string | null {
 
 /** A short, tmux-safe window name (single line, capped, no separators). */
 function tmuxSafeName(raw: string): string {
-	const cleaned = raw.replace(/[\r\n\t]+/g, " ").replace(/[:.]/g, "-").trim();
+	const cleaned = raw
+		.replace(/[\r\n\t]+/g, " ")
+		.replace(/[:.]/g, "-")
+		.trim();
 	const capped = cleaned.length > 24 ? cleaned.slice(0, 24) : cleaned;
 	return capped.length > 0 ? capped : "session";
 }
