@@ -89,6 +89,24 @@ export function ensureHubSession(): void {
 	// `new-session -d` creates the session detached with one window running the
 	// hub. `-n hub` names it; the shell command keeps the window alive as the hub.
 	tmux(["new-session", "-d", "-s", HUB_TMUX_SESSION, "-n", "hub", hubCmd]);
+	// The tmux status bar's folder + branch segments duplicate omp's own
+	// statusline (every session window is an omp process, cwd/branch and all).
+	// Strip just those modules from status-left for this session, keeping the
+	// session label and every status-right metric (CPU / RAM / load / host).
+	// Only known folder/branch modules are removed; an unrecognized status-left
+	// is left untouched (set to itself), so no theme is broken.
+	const globalStatusLeft = tmux(["show-options", "-gv", "status-left"]);
+	if (globalStatusLeft) {
+		const redundant = [
+			/#\{E:@catppuccin_status_directory\}/g,
+			/#\{E:@catppuccin_status_gitmux\}/g,
+			/#\{E:@catppuccin_status_git\}/g,
+			/#\{E:@catppuccin_status_path\}/g,
+		];
+		let hubStatusLeft = globalStatusLeft;
+		for (const re of redundant) hubStatusLeft = hubStatusLeft.replace(re, "");
+		tmux(["set-option", "-t", HUB_TMUX_SESSION, "status-left", hubStatusLeft]);
+	}
 	const hubWindowId = tmux(["display-message", "-p", "-t", `${HUB_TMUX_SESSION}:hub`, "#{window_id}"]);
 	if (hubWindowId) {
 		tmux(["set-option", "-t", HUB_TMUX_SESSION, HUB_WINDOW_OPT, hubWindowId]);
