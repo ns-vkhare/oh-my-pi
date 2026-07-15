@@ -960,8 +960,13 @@ export class SessionManager {
 		if (this.#sessionFile) this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
 	}
 
-	/** Switch to a different session file (resume / branch). */
-	async setSessionFile(sessionFile: string): Promise<void> {
+	/** Switch to a different session file (resume / branch). ``parentSession`` is
+	 * recorded on the synthesized header only when the file is empty/new (a
+	 * subagent's own transcript), so a spawned child can advertise its parent
+	 * through the standard session surface (``getHeader().parentSession`` →
+	 * ``SessionInfo.parentSessionPath``); resuming a non-empty file keeps its
+	 * recorded header untouched. */
+	async setSessionFile(sessionFile: string, parentSession?: string): Promise<void> {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
@@ -975,7 +980,7 @@ export class SessionManager {
 		if (fileEntries.length === 0) {
 			// Explicit but empty/missing path (e.g. --session flag): start fresh but
 			// keep the requested path and materialize the header immediately.
-			this.#resetToNewSession(undefined, resolvedSessionFile);
+			this.#resetToNewSession(parentSession ? { parentSession } : undefined, resolvedSessionFile);
 			this.#forceFileCreation = true;
 			await this.#rewriteAtomically();
 			this.#fileIsCurrent = true;
@@ -1921,7 +1926,7 @@ export class SessionManager {
 		filePath: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { initialCwd?: string; suppressBreadcrumb?: boolean },
+		options?: { initialCwd?: string; suppressBreadcrumb?: boolean; parentSession?: string },
 	): Promise<SessionManager> {
 		const loaded = await loadEntriesFromFile(filePath, storage);
 		const header = loaded.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -1940,7 +1945,7 @@ export class SessionManager {
 				: path.dirname(path.resolve(filePath)));
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
-		await manager.setSessionFile(filePath);
+		await manager.setSessionFile(filePath, options?.parentSession);
 		return manager;
 	}
 

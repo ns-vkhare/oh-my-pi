@@ -1435,6 +1435,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				thinkingLevel: thinkingLevelOverride,
 				outputSchema: effectiveOutputSchema,
 				sessionFile,
+				parentSessionFile: sessionFile ?? undefined,
 				persistArtifacts: !!artifactsDir,
 				artifactsDir: effectiveArtifactsDir,
 				enableLsp: subagentLspEnabled,

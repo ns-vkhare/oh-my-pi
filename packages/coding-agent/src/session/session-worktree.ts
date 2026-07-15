@@ -5,10 +5,10 @@
  *
  * There is no stored session→worktree link: omp never `chdir`s, so a
  * hub-dispatched session's header `cwd` stays at the project root while the
- * agent creates a *sibling* worktree (see the "new hub session" system-prompt
- * nudge: `git worktree add ../<repo>-<slug> -b <branch>`). We therefore recover
- * the worktree from two signals and verify the winner against `git worktree
- * list` so we never propose the primary checkout or a stale path:
+ * agent creates a worktree nested under the repo (see the "new hub session"
+ * system-prompt nudge: `git worktree add .worktrees/<slug> -b <branch>`). We
+ * therefore recover the worktree from two signals and verify the winner against
+ * `git worktree list` so we never propose the primary checkout or a stale path:
  *
  *   1. the session header `cwd` (covers sessions started in, or `/move`d into, a
  *      linked worktree); and
