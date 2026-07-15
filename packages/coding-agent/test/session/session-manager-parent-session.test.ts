@@ -10,12 +10,14 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 // Contract behind nested subagent lineage: a spawned subagent opens its own
-// (new, empty) transcript with the parent's file path, and that path must land
-// on the synthesized session header as `parentSession` so a consumer reading
-// `getHeader().parentSession` can nest the child under its parent. Resuming an
-// existing transcript must NOT rewrite its recorded parentage.
-describe("SessionManager.open parentSession", () => {
-	it("records parentSession on a new/empty child transcript header", async () => {
+// (new, empty) transcript with the parent's file path AND its registry id, and
+// both must land on the synthesized session header — `parentSession` (so a
+// consumer can nest the child under its parent) and `agentId` (the spawn-vs-fork
+// discriminator a consumer keys on to distinguish a spawned sub-agent from a
+// `/fork` child, which carries parentSession but no agentId). Resuming an
+// existing transcript must NOT rewrite its recorded header.
+describe("SessionManager.open parentSession + agentId", () => {
+	it("records parentSession and agentId on a new/empty child transcript header", async () => {
 		using tempDir = TempDir.createSync("@omp-parent-session-");
 		const sessionDir = path.join(tempDir.path(), "sessions");
 		await fs.mkdir(sessionDir, { recursive: true });
@@ -26,15 +28,37 @@ describe("SessionManager.open parentSession", () => {
 			initialCwd: tempDir.path(),
 			suppressBreadcrumb: true,
 			parentSession: parentFile,
+			agentId: "ProbeAgent",
 		});
 
-		// In-memory view exposes it immediately (what a live session_start reads).
+		// In-memory view exposes both immediately (what a live session_start reads).
 		expect(manager.getHeader()?.parentSession).toBe(parentFile);
+		expect(manager.getHeader()?.agentId).toBe("ProbeAgent");
 
-		// And it is persisted to the header line on disk.
+		// And both are persisted to the header line on disk.
 		const entries = await loadEntriesFromFile(childFile);
 		const header = entries.find((e): e is SessionHeader => e.type === "session");
 		expect(header?.parentSession).toBe(parentFile);
+		expect(header?.agentId).toBe("ProbeAgent");
+	});
+
+	it("leaves agentId undefined for a fork-shape open (parentSession, no agentId)", async () => {
+		using tempDir = TempDir.createSync("@omp-fork-shape-");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		await fs.mkdir(sessionDir, { recursive: true });
+		const parentFile = path.join(sessionDir, "parent.jsonl");
+		const childFile = path.join(sessionDir, "fork-child.jsonl");
+
+		// A fork writes parentSession but no agentId — must stay agentId-less so a
+		// consumer treats it as an independent session, not a nested sub-agent.
+		const manager = await SessionManager.open(childFile, undefined, undefined, {
+			initialCwd: tempDir.path(),
+			suppressBreadcrumb: true,
+			parentSession: parentFile,
+		});
+
+		expect(manager.getHeader()?.parentSession).toBe(parentFile);
+		expect(manager.getHeader()?.agentId).toBeUndefined();
 	});
 
 	it("does not clobber the recorded header when resuming an existing transcript", async () => {

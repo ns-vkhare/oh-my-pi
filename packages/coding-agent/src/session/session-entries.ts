@@ -32,12 +32,22 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	/**
+	 * Registry id of the spawned sub-agent this session runs (task/eval). Set
+	 * only on a spawned child's own header — the spawn-vs-fork discriminator a
+	 * consumer needs alongside `parentSession` to nest the child under its parent
+	 * (a `/fork` writes `parentSession` but no `agentId`). Absent for top-level
+	 * and forked sessions.
+	 */
+	agentId?: string;
 	/** Provider prompt-cache identity inherited by exact-route full forks. */
 	providerPromptCacheKey?: string;
 }
 
 export interface NewSessionOptions {
 	parentSession?: string;
+	/** Registry id of a spawned sub-agent; stamped onto the new session header. */
+	agentId?: string;
 	/** Provider prompt-cache identity to seed on the new session header. */
 	providerPromptCacheKey?: string;
 	/** Skip flushing the current session and delete it instead of saving. */
