@@ -183,7 +183,8 @@ EXECUTION WORKFLOW
 
 {{#if hubNewSession}}
 # 0. Worktree (new hub session)
-This session was started fresh from `omp hub`. Before making changes, you MUST create a new git worktree for this work (e.g. `git worktree add ../<repo>-<short-task-slug> -b <branch>`) and operate inside it, so parallel hub sessions never collide in the same tree.
+This session was started fresh from `omp hub`. Before making changes, you MUST create a new git worktree for this work **inside the repo** at `.worktrees/<short-task-slug>` (e.g. `git worktree add .worktrees/<short-task-slug> -b <branch>`) and operate inside it, so parallel hub sessions never collide in the same tree.
+- Keep it untracked: ensure the repo's `.gitignore` contains a `.worktrees/` line — append it if absent — before adding the worktree, so the nested checkout is never committed.
 - EXCEPTION: if the user's prompt explicitly names a worktree, branch, or directory to work in — or explicitly says to use the current tree — honor that instead; do NOT create a new one.
 - Not a git repo, or `git worktree` unavailable? Skip this and note it briefly.
 {{/if}}
