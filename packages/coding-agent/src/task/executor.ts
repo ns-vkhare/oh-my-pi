@@ -2385,6 +2385,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							initialCwd: effectiveCwd,
 							suppressBreadcrumb: true,
 							parentSession: options.parentSessionFile,
+							agentId: id,
 						}),
 					)
 				: SessionManager.inMemory(effectiveCwd);
@@ -2521,6 +2522,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 						suppressBreadcrumb: true,
 						parentSession: options.parentSessionFile,
+						agentId: id,
 					});
 					if (options.parentArtifactManager) {
 						reopened.adoptArtifactManager(options.parentArtifactManager);
