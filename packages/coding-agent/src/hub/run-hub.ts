@@ -1,10 +1,14 @@
 /**
- * Hub runtime — entry logic for `omp hub`.
+ * Hub runtime — entry logic for `omp hub`, dispatched three ways by env marker:
  *
- * Outside the hub tmux session (bare shell or a different tmux session) it
- * ensures the hub session exists and attaches/switches to it. Running as the
- * hub window's own process (inside the hub session, on the hub window) it
- * renders the {@link HubView} fullscreen and wires its actions to tmux.
+ * - **Backend supervisor** ({@link HUB_BACKEND_ENV}, window 0 of the backend
+ *   session): {@link runBackendSupervisor} — headless reap loop, no TUI, anchors
+ *   the backend session.
+ * - **View TUI** ({@link HUB_VIEW_ENV}, window 0 of a per-client view session):
+ *   {@link renderHub} — the {@link HubView} fullscreen, wiring foreground/dispatch
+ *   to link backend windows into *this* view.
+ * - **Launcher** (bare shell or an unrelated tmux session): ensure the backend
+ *   exists, then reuse/create a view session and enter it.
  */
 import { statSync } from "node:fs";
 import { ProcessTerminal, TUI } from "@oh-my-pi/pi-tui";
@@ -18,20 +22,22 @@ import { shortenPath } from "../tools/render-utils";
 import * as git from "../utils/git";
 import { type HubRow, HubView } from "./hub-view";
 import {
-	currentTmuxSession,
 	currentTmuxWindow,
 	detachClient,
-	dispatchSession,
-	ensureHubSession,
-	enterHubSession,
-	foregroundSession,
+	dispatchBackendSession,
+	ensureBackendSession,
+	ensureBackendSessionWindow,
+	enterHubView,
+	focusWindowInView,
+	HUB_BACKEND_ENV,
+	HUB_VIEW_ENV,
 	type HubSummary,
-	hubTmuxSession,
-	hubWindowTarget,
+	killSession,
 	killWindow,
 	listHubs,
+	listHubViews,
 	listSessionWindows,
-	selectWindow,
+	viewedWindowIds,
 } from "./tmux";
 
 /** How many recent (idle) sessions to surface alongside live ones. */
@@ -53,21 +59,25 @@ const lastActiveAt = new Map<string, number>();
 /**
  * Kill live session windows idle longer than {@link STALE_SESSION_MS}, measured
  * as the most recent of (a) the session `.jsonl` mtime — the "timeAgo" signal —
- * and (b) the last time the window was foregrounded. The killed omp process
+ * and (b) the last time some client viewed the window. The killed omp process
  * ends; the session file stays on disk, so the session drops to an idle row and
- * re-foregrounding respawns it fresh via `omp --resume`. The active window is
- * never reaped (and its activity is refreshed here); freshly-dispatched windows
- * without a session path yet are skipped.
+ * re-foregrounding respawns it fresh via `omp --resume`. A window currently
+ * viewed by any client is never reaped (and its activity is refreshed here);
+ * freshly-dispatched windows without a session path yet are skipped. Runs in the
+ * backend supervisor, which has no attached client of its own — hence viewers
+ * come from `list-clients` across every view, not the backend's own current
+ * window.
  */
 function reapStaleLiveWindows(): void {
 	const now = Date.now();
 	const windows = listSessionWindows();
+	const viewed = viewedWindowIds();
 	const liveIds = new Set(windows.map(w => w.windowId));
 	for (const id of lastActiveAt.keys()) {
 		if (!liveIds.has(id)) lastActiveAt.delete(id);
 	}
 	for (const window of windows) {
-		if (window.active) {
+		if (viewed.has(window.windowId)) {
 			lastActiveAt.set(window.windowId, now);
 			continue;
 		}
@@ -90,6 +100,20 @@ function reapStaleLiveWindows(): void {
 }
 
 /**
+ * Kill per-client view sessions left unattached longer than {@link STALE_SESSION_MS}.
+ * A detached view lingers so a re-run reattaches to it (backward-compatible Esc),
+ * but an abandoned one is reaped so views don't accumulate forever. The backend
+ * windows a view linked survive — `kill-session` only unlinks them.
+ */
+function reapStaleViews(): void {
+	const now = Date.now();
+	for (const view of listHubViews()) {
+		if (view.attached) continue;
+		if (now - view.activityEpoch * 1000 > STALE_SESSION_MS) killSession(view.session);
+	}
+}
+
+/**
  * Merge live tmux windows with recent on-disk sessions into hub rows. Live rows
  * (running omp processes) come first, then idle recent sessions that don't
  * already have a live window. Idle rows need a disk scan, so this is async.
@@ -97,10 +121,12 @@ function reapStaleLiveWindows(): void {
 async function buildRows(): Promise<HubRow[]> {
 	const liveWindows = listSessionWindows();
 	const livePaths = new Set(liveWindows.map(w => w.sessionPath).filter((p): p is string => Boolean(p)));
+	// "Foreground" is per-view: the backend window this view currently shows.
+	const viewCurrentWindow = currentTmuxWindow();
 	const liveRows: HubRow[] = liveWindows.map(w => ({
 		key: w.sessionPath ?? w.windowId,
 		title: w.title || w.name || "session",
-		meta: w.active ? "live · foreground" : "live",
+		meta: w.windowId === viewCurrentWindow ? "live · foreground" : "live",
 		live: true,
 		sessionPath: w.sessionPath,
 		windowId: w.windowId,
@@ -127,39 +153,38 @@ async function buildRows(): Promise<HubRow[]> {
 	return [...liveRows, ...idleRows];
 }
 
-/** True when this process is the hub window's own process (render the TUI here). */
-function isHubWindowProcess(): boolean {
-	if (currentTmuxSession() !== hubTmuxSession()) return false;
-	const window = currentTmuxWindow();
-	return window !== null && window === hubWindowTarget();
-}
-
 /**
- * Render the hub TUI in the current (hub) window. The hub is the tmux-resident
- * supervisor: Esc *detaches* the client (returns the terminal to the shell) but
- * the hub process keeps running in its window, so its refresh loop — which
- * reaps stale live sessions — runs whether or not anyone is attached. The
- * returned promise resolves only if the UI stops (e.g. the hub window is
- * killed), keeping the process alive meanwhile.
+ * Render the hub TUI as a per-client view (window 0 of a view session). Esc
+ * *detaches* the client (returns the terminal to the shell) but this view
+ * process keeps running unattached, so a later `omp hub` reattaches to it (its
+ * selected session is preserved). Foreground/dispatch link the shared backend
+ * window into *this* view and select it there, so concurrent clients navigate
+ * independently. Reaping is the backend supervisor's job, not the view's. The
+ * returned promise resolves only if the UI stops (e.g. the view is killed).
  */
 async function renderHub(): Promise<void> {
 	await initTheme();
 	const ui = new TUI(new ProcessTerminal());
-	// Never resolves: the hub lives until tmux kills its window (SIGHUP ends the
-	// process). Detach (Esc) leaves it running as the background supervisor.
+	// Never resolves: the view lives until tmux kills its session/window.
 	const persist = new Promise<void>(() => undefined);
 	let latestRows: HubRow[] = [];
 
 	const view = new HubView(
 		{
 			onForeground: row => {
-				if (row.live && row.windowId) {
-					selectWindow(row.windowId);
-				} else if (row.sessionPath) {
-					foregroundSession(row.sessionPath, row.title);
-				}
+				const windowId =
+					row.live && row.windowId
+						? row.windowId
+						: row.sessionPath
+							? ensureBackendSessionWindow(row.sessionPath, row.title)
+							: null;
+				if (windowId) focusWindowInView(windowId);
 			},
-			onDispatch: (prompt, imagePaths) => dispatchSession(prompt, imagePaths),
+			onDispatch: (prompt, imagePaths) => {
+				const windowId = dispatchBackendSession(prompt, imagePaths);
+				if (windowId) focusWindowInView(windowId);
+				return windowId;
+			},
 			// Delete a session: kill its live window (if any), recover its worktree
 			// BEFORE unlinking the file (resolution reads the .jsonl), then remove the
 			// session + artifacts. Returns the worktree path when one is safely removable.
@@ -177,7 +202,7 @@ async function renderHub(): Promise<void> {
 				await git.worktree.remove(getProjectDir(), worktreePath, { force: true });
 				latestRows = await buildRows();
 			},
-			// Detach only: the hub keeps running so background reaping continues.
+			// Detach only: the view keeps running unattached for later reattach.
 			onExit: () => detachClient(),
 			requestRender: () => ui.requestRender(),
 		},
@@ -185,7 +210,6 @@ async function renderHub(): Promise<void> {
 	);
 
 	const refresh = async () => {
-		reapStaleLiveWindows();
 		latestRows = await buildRows();
 		view.refresh();
 		ui.requestRender();
@@ -199,14 +223,38 @@ async function renderHub(): Promise<void> {
 	return persist;
 }
 
-/** Entry for `omp hub`: attach/switch to the hub, or render it when we are the hub window. */
+/**
+ * The backend supervisor (window 0 of the backend session): a headless reap
+ * loop with no TUI. Reaps stale live windows and abandoned view sessions on a
+ * cadence, and — as window 0 of a never-attached session — anchors the backend
+ * so it survives with zero live sessions. Never resolves.
+ */
+function runBackendSupervisor(): Promise<void> {
+	const tick = () => {
+		reapStaleLiveWindows();
+		reapStaleViews();
+	};
+	tick();
+	setInterval(tick, REFRESH_MS);
+	return new Promise<void>(() => undefined);
+}
+
+/**
+ * Entry for `omp hub`. Env markers select the role: backend supervisor, view
+ * TUI, or launcher (ensure the backend exists, then reuse/create a view and
+ * enter it).
+ */
 export async function runHub(): Promise<void> {
-	if (isHubWindowProcess()) {
+	if (process.env[HUB_BACKEND_ENV]) {
+		await runBackendSupervisor();
+		return;
+	}
+	if (process.env[HUB_VIEW_ENV]) {
 		await renderHub();
 		return;
 	}
-	ensureHubSession();
-	enterHubSession();
+	ensureBackendSession();
+	enterHubView();
 }
 
 /** Compact relative time for a hub's last-activity epoch (seconds). */
