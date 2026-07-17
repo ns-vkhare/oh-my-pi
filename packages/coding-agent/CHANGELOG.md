@@ -15,6 +15,8 @@
 ### Fixed
 
 - Fixed concurrent `omp hub` sessions in different projects mirroring each other: the hub's tmux session name is now scoped per project directory (`omp-hub-<project>-<hash>`) instead of a single shared `omp-hub` session, so parallel hubs across projects run independently while a re-run within the same project still reattaches to its existing background hub.
+- Fixed `omp hub` showing a session twice — once "live" under the truncated dispatch prompt and once as a recent row under its real title — for sessions started fresh from the hub. A dispatched window had no session-path tag until now, so the hub couldn't dedup the live window against its own on-disk session; the in-session process now back-fills its window's `@omp_session_path` (and keeps the display title current on rename), so each session appears once under its real name.
+- Fixed two `omp hub` runs in the *same* project mirroring each other (selecting a session in one moved the other). The hub is now split into a shared per-project backend (holds the live session windows, reaps stale ones) and a per-client "view" session that renders its own hub TUI: foregrounding a session `link-window`s the shared backend window into the calling client's view, so each client navigates to different sessions independently while the underlying omp processes stay common. Detaching (Esc) leaves the view running for a later `omp hub` to reattach; the in-session ← back-gesture returns each viewing client to its own view.
 ## [16.5.2] - 2026-07-14
 
 ### Breaking Changes

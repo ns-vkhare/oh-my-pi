@@ -73,6 +73,7 @@ import type { Skill } from "../extensibility/skills";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import { type GuidedGoalMessage, newGuidedGoalSessionId, runGuidedGoalTurn } from "../goals/guided-setup";
 import type { Goal, GoalModeState } from "../goals/state";
+import { tagHubWindow } from "../hub/tmux";
 import { resolveLocalUrlToPath } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import type { MCPManager } from "../mcp";
@@ -957,6 +958,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		pushTerminalTitle();
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.updateEditorBorderColor();
+		// Tag this hub window with its session path so the hub can dedup the live
+		// window against its own on-disk session (a dispatched window starts with
+		// no path — see hub/tmux tagHubWindow). No-op outside a hub-managed window.
+		{
+			const sessionFile = this.sessionManager.getSessionFile();
+			if (sessionFile) tagHubWindow(sessionFile, this.sessionManager.getSessionName());
+		}
 		// Single side-effect point for title changes: every setSessionName caller
 		// (first-input titling, /rename, extension renames, plan seeding, replan
 		// refresh) gets the terminal title + accent updates from here. Registered
@@ -966,6 +974,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.sessionManager.onSessionNameChanged(() => {
 				setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 				this.#handleSessionAccentInputsChanged();
+				const sessionFile = this.sessionManager.getSessionFile();
+				if (sessionFile) tagHubWindow(sessionFile, this.sessionManager.getSessionName());
 			}),
 		);
 		this.#syncEditorMaxHeight();

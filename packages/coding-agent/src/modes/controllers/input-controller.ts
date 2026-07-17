@@ -5,8 +5,8 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@oh-my-pi/pi-tui";
 import { $env, isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { isSettingsInitialized, settings } from "../../config/settings";
+import { switchViewersHome } from "../../hub/tmux";
 import { resolveLocalRoot } from "../../internal-urls";
-import { selectWindow } from "../../hub/tmux";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { extractImagePathFromText } from "../../modes/components/custom-editor";
 import { renderSegmentTrack } from "../../modes/components/segment-track";
@@ -249,18 +249,18 @@ export class InputController {
 		if (!this.#hubBackgroundListenerInstalled) {
 			this.#hubBackgroundListenerInstalled = true;
 			// Under the tmux session hub (OMP_HUB set), ← on an empty editor
-			// backgrounds this session and returns to the hub window — the session
-			// keeps running in its tmux window (the Claude-Code "agent view" gesture).
-			// Runs after the focused-subagent left-tap above, so a focused subagent
-			// still unfocuses first; only the top-level editor reaches here.
+			// backgrounds this session and returns each viewing client to its own
+			// hub view window — the session keeps running in its tmux window (the
+			// Claude-Code "agent view" gesture). Runs after the focused-subagent
+			// left-tap above, so a focused subagent still unfocuses first; only the
+			// top-level editor reaches here.
 			this.ctx.ui.addInputListener(data => {
-				const hubWindow = $env.OMP_HUB_WINDOW;
-				if (!hubWindow) return undefined;
+				if (!$env.OMP_HUB) return undefined;
 				if (this.ctx.focusedAgentId) return undefined;
 				if (!matchesKey(data, "left")) return undefined;
 				if (this.ctx.ui.getFocused() !== this.ctx.editor) return undefined;
 				if (this.ctx.editor.getText().trim()) return undefined;
-				selectWindow(hubWindow);
+				switchViewersHome();
 				return { consume: true };
 			});
 		}
