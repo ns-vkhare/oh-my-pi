@@ -57,13 +57,28 @@ const STALE_SESSION_MS = 24 * 60 * 60 * 1000;
 const lastActiveAt = new Map<string, number>();
 
 /**
+ * Window ids whose session `.jsonl` has been observed on disk at least once.
+ * A freshly dispatched session tags its window with `@omp_session_path` at init
+ * (see hub/tmux `tagHubWindow`), but the file itself is created lazily — not
+ * until the first assistant message trips SessionManager's persistence gate. So
+ * a tagged path with no file yet means "still starting", NOT "deleted": the
+ * reaper must only treat `statSync` ENOENT as a genuine deletion once the file
+ * was seen here before. Without this a reaper tick landing in the create gap
+ * `kill-window`s a live session mid-first-turn (SIGHUP → the turn aborts with a
+ * red "Operation aborted"), which the user hits every dispatch under real
+ * first-token latency. Pruned alongside {@link lastActiveAt}.
+ */
+const fileSeenWindows = new Set<string>();
+
+/**
  * Kill live session windows idle longer than {@link STALE_SESSION_MS}, measured
  * as the most recent of (a) the session `.jsonl` mtime — the "timeAgo" signal —
  * and (b) the last time some client viewed the window. The killed omp process
  * ends; the session file stays on disk, so the session drops to an idle row and
- * re-foregrounding respawns it fresh via `omp --resume`. A window currently
  * viewed by any client is never reaped (and its activity is refreshed here);
- * freshly-dispatched windows without a session path yet are skipped. Runs in the
+ * freshly-dispatched windows without a session path yet, or whose tagged
+ * `.jsonl` has not been created on disk yet (see {@link fileSeenWindows}), are
+ * skipped so a still-starting session is never killed mid-first-turn. Runs in the
  * backend supervisor, which has no attached client of its own — hence viewers
  * come from `list-clients` across every view, not the backend's own current
  * window.
@@ -76,6 +91,9 @@ function reapStaleLiveWindows(): void {
 	for (const id of lastActiveAt.keys()) {
 		if (!liveIds.has(id)) lastActiveAt.delete(id);
 	}
+	for (const id of fileSeenWindows) {
+		if (!liveIds.has(id)) fileSeenWindows.delete(id);
+	}
 	for (const window of windows) {
 		if (viewed.has(window.windowId)) {
 			lastActiveAt.set(window.windowId, now);
@@ -85,10 +103,18 @@ function reapStaleLiveWindows(): void {
 		let mtimeMs = 0;
 		try {
 			mtimeMs = statSync(window.sessionPath).mtimeMs;
+			// File confirmed on disk: from now on an ENOENT is a genuine deletion.
+			fileSeenWindows.add(window.windowId);
 		} catch {
-			// Session file gone (deleted): reap the orphaned window.
-			killWindow(window.windowId);
-			lastActiveAt.delete(window.windowId);
+			// A freshly dispatched session tags its window with the path before the
+			// `.jsonl` exists (lazy creation — see fileSeenWindows). Only reap when
+			// the file was seen before (genuine deletion); a never-seen file means
+			// the session is still creating it, so leave the live window alone.
+			if (fileSeenWindows.has(window.windowId)) {
+				killWindow(window.windowId);
+				lastActiveAt.delete(window.windowId);
+				fileSeenWindows.delete(window.windowId);
+			}
 			continue;
 		}
 		const lastActivity = Math.max(mtimeMs, lastActiveAt.get(window.windowId) ?? 0);
