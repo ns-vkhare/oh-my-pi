@@ -1,0 +1,14 @@
+{
+  "name": "omp-slack-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun bridge.ts",
+    "test": "bun test",
+    "check": "bun x tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.6.0"
+  }
+}

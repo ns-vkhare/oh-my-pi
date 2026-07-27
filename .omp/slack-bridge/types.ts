@@ -1,0 +1,323 @@
+/**
+ * Shared contracts for the omp Slack bridge.
+ *
+ * SINGLE SOURCE OF TRUTH. Implementations (omp-rpc.ts, slack.ts, bridge.ts,
+ * blocks.ts, registry.ts) import from this file and MUST NOT redefine or
+ * widen these types. Protocol shapes mirror ~/oh-my-pi-src/docs/rpc.md.
+ */
+
+// ============================================================================
+// omp RPC protocol frames (subset the bridge uses)
+// ============================================================================
+
+/** Commands written to the RPC child's stdin (one JSON object per line). */
+export type OmpRpcCommand =
+	| { id: string; type: "prompt"; message: string; streamingBehavior?: "steer" | "followUp" }
+	| { id: string; type: "abort" }
+	| { id: string; type: "get_state" }
+	| { id: string; type: "get_last_assistant_text" }
+	| { id: string; type: "set_session_name"; name: string }
+	| { id: string; type: "set_host_tools"; tools: OmpHostToolDefinition[] };
+
+/** Response frame correlated by `id`. */
+export interface OmpRpcResponse {
+	type: "response";
+	id?: string;
+	command: string;
+	success: boolean;
+	data?: unknown;
+	error?: string;
+}
+
+/** `get_state` payload subset the bridge consumes. */
+export interface OmpSessionState {
+	model?: { provider: string; id: string };
+	isStreaming: boolean;
+	sessionFile?: string;
+	sessionId?: string;
+	sessionName?: string;
+	messageCount?: number;
+	contextUsage?: { tokens: number; contextWindow: number; percent: number } | null;
+}
+
+/** Agent lifecycle/tool events forwarded by RPC mode (fields beyond `type` are loosely typed on purpose — treat unknown shapes as absent). */
+export interface OmpAgentEvent {
+	type:
+		| "agent_start"
+		| "agent_end"
+		| "turn_start"
+		| "turn_end"
+		| "tool_execution_start"
+		| "tool_execution_update"
+		| "tool_execution_end"
+		| "message_start"
+		| "message_update"
+		| "message_end"
+		| "auto_compaction_start"
+		| "auto_compaction_end"
+		| "auto_retry_start"
+		| "auto_retry_end";
+	/** Present on tool_execution_* in current runtime; extract defensively. */
+	toolName?: string;
+	args?: Record<string, unknown>;
+	[key: string]: unknown;
+}
+
+/** Extension/tool UI request emitted by the RPC server (ask questions arrive as `select`). */
+export type OmpUiRequest =
+	| { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number }
+	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
+	| {
+			type: "extension_ui_request";
+			id: string;
+			method: "input";
+			title: string;
+			placeholder?: string;
+			timeout?: number;
+	  }
+	| {
+			type: "extension_ui_request";
+			id: string;
+			method: "editor";
+			title: string;
+			prefill?: string;
+			timeout?: number;
+	  }
+	| { type: "extension_ui_request"; id: string; method: "cancel"; targetId: string }
+	| { type: "extension_ui_request"; id: string; method: "notify"; message: string; level?: string }
+	| { type: "extension_ui_request"; id: string; method: "setStatus"; statusKey: string; text?: string }
+	| { type: "extension_ui_request"; id: string; method: "open_url"; url: string; instructions?: string };
+
+/** UI response written to stdin. `value`: select → chosen option LABEL, input/editor → text. */
+export type OmpUiResponse =
+	| { type: "extension_ui_response"; id: string; value: string }
+	| { type: "extension_ui_response"; id: string; confirmed: boolean }
+	| { type: "extension_ui_response"; id: string; cancelled: true };
+
+// ============================================================================
+// Host tool sub-protocol (docs/rpc.md §Host Tool Sub-Protocol)
+//
+// The builtin `ask` tool does NOT register in RPC mode (no interactive UI at
+// tool-registry construction), so the bridge owns an `ask` host tool instead:
+// registered via set_host_tools, served via host_tool_call/host_tool_result.
+// ============================================================================
+
+/** Host-owned tool definition sent with `set_host_tools`. `parameters` is JSON Schema. */
+export interface OmpHostToolDefinition {
+	name: string;
+	label?: string;
+	description: string;
+	parameters: Record<string, unknown>;
+}
+
+/** Server → host: execute a host-owned tool. */
+export interface OmpHostToolCall {
+	type: "host_tool_call";
+	id: string;
+	toolCallId: string;
+	toolName: string;
+	arguments: Record<string, unknown>;
+}
+
+/** Server → host: a pending host tool call was aborted. */
+export interface OmpHostToolCancel {
+	type: "host_tool_cancel";
+	id: string;
+	targetId: string;
+}
+
+/** Host → server: completion for a host_tool_call (correlate on its `id`). */
+export interface OmpHostToolResult {
+	type: "host_tool_result";
+	id: string;
+	result: { content: Array<{ type: "text"; text: string }> };
+	isError?: boolean;
+}
+
+/** Arguments of the bridge-owned `ask` host tool (mirrors the builtin ask schema). */
+export interface AskToolArgs {
+	questions: Array<{
+		id: string;
+		question: string;
+		header?: string;
+		options: Array<{ label: string; description?: string }>;
+		multi?: boolean;
+		recommended?: number;
+	}>;
+}
+
+// ============================================================================
+// OmpRpc — contract implemented by omp-rpc.ts (RpcCore)
+// ============================================================================
+
+export interface OmpRpcOptions {
+	/** argv[0] for the omp CLI (default "omp"; may be a shell-script wrapper). */
+	ompBin: string;
+	/** Working directory for the agent process. */
+	cwd: string;
+	/** Resume an existing session file instead of starting fresh. */
+	resumeSessionPath?: string;
+	/** Extra env merged over process.env (e.g. OMP_HUB_NEW_SESSION=1). */
+	env?: Record<string, string>;
+	/** Extra CLI args (e.g. ["-m", "provider/model"]). */
+	extraArgs?: string[];
+	/** Ready-handshake timeout ms (default 30_000). */
+	readyTimeoutMs?: number;
+}
+
+export interface OmpRpcEvents {
+	/** Agent lifecycle/tool events (see OmpAgentEvent). */
+	onEvent(listener: (event: OmpAgentEvent) => void): () => void;
+	/** UI requests needing a host answer (select/confirm/input/editor) or display (notify/…). */
+	onUiRequest(listener: (req: OmpUiRequest) => void): () => void;
+	/** Host tool execution requests (after setHostTools). */
+	onHostToolCall(listener: (call: OmpHostToolCall) => void): () => void;
+	/** Cancellation of a pending host tool call (targetId = call id). */
+	onHostToolCancel(listener: (cancel: OmpHostToolCancel) => void): () => void;
+	/** Process exited (code null when killed). Fires exactly once. */
+	onExit(listener: (code: number | null) => void): () => void;
+}
+
+/**
+ * Raw JSONL client over a spawned `omp --mode rpc` child.
+ *
+ * Semantics:
+ * - start(): spawns, waits for {"type":"ready"}; rejects with stderr tail on
+ *   early exit or timeout (child killed on failure). Callable once per instance.
+ * - Commands auto-assign ids and resolve/reject on the correlated response
+ *   (reject when success:false, message = error field).
+ * - prompt(): ALWAYS sends streamingBehavior:"steer". Immediate ack; turn
+ *   completion is observed via onEvent agent_end.
+ * - respondUi(): fire-and-forget stdin write (no response frame exists).
+ * - stop(): SIGTERM, then SIGKILL after 5s if still alive; pending requests
+ *   reject; onExit fires exactly once.
+ * - alive: true between successful start() and exit.
+ */
+export interface OmpRpc extends OmpRpcEvents {
+	readonly alive: boolean;
+	start(): Promise<void>;
+	prompt(message: string): Promise<void>;
+	abort(): Promise<void>;
+	getState(): Promise<OmpSessionState>;
+	getLastAssistantText(): Promise<string | null>;
+	setSessionName(name: string): Promise<void>;
+	respondUi(response: OmpUiResponse): void;
+	/** Register/replace host-owned tools (id-correlated `set_host_tools`). */
+	setHostTools(tools: OmpHostToolDefinition[]): Promise<void>;
+	/** Fire-and-forget completion write for a host_tool_call. */
+	respondHostTool(result: OmpHostToolResult): void;
+	stop(): Promise<void>;
+}
+
+// ============================================================================
+// Slack transport — contract implemented by slack.ts (SlackTransport)
+// ============================================================================
+
+/** Inbound DM (message.im event, bot/self messages already filtered out). */
+export interface SlackInboundMessage {
+	kind: "message";
+	channel: string;
+	user: string;
+	text: string;
+	ts: string;
+	/** Set when the message is a threaded reply. */
+	threadTs?: string;
+}
+
+/** Inbound block action (button click / select) from an `interactive` envelope. */
+export interface SlackBlockAction {
+	kind: "action";
+	channel: string;
+	user: string;
+	/** ts of the message carrying the actioned block. */
+	messageTs: string;
+	threadTs?: string;
+	actionId: string;
+	/** Button value / selected option value. */
+	value: string;
+}
+
+export type SlackInbound = SlackInboundMessage | SlackBlockAction;
+
+/** Minimal Block Kit types the bridge emits (structural, not exhaustive). */
+export interface SlackBlock {
+	type: string;
+	[key: string]: unknown;
+}
+
+export interface SlackPostArgs {
+	channel: string;
+	text: string;
+	blocks?: SlackBlock[];
+	threadTs?: string;
+}
+
+/**
+ * Socket Mode client + Web API wrapper. Zero omp knowledge.
+ *
+ * Semantics:
+ * - start(): auth.test (validates bot token, learns bot user id), opens the
+ *   Socket Mode WebSocket via apps.connections.open, resolves once connected.
+ *   Auto-reconnects with capped exponential backoff until stop(); envelopes
+ *   are acked immediately, then dispatched; event deliveries deduped by
+ *   event_id (bounded LRU); messages from the bot itself never dispatched.
+ * - onInbound: message.im events and block actions from allowed envelope
+ *   types, normalized. NO allowlist filtering here — bridge owns policy.
+ * - Web API calls throw Error(`slack ${method}: ${error}`) on ok:false.
+ * - postMessage returns the new message ts.
+ * - uploadText: files.uploadV2 flow (getUploadURLExternal → POST bytes →
+ *   completeUploadExternal) attaching a text snippet to the thread.
+ */
+export interface SlackTransport {
+	start(): Promise<void>;
+	stop(): Promise<void>;
+	onInbound(listener: (inbound: SlackInbound) => void): () => void;
+	postMessage(args: SlackPostArgs): Promise<string>;
+	updateMessage(args: { channel: string; ts: string; text: string; blocks?: SlackBlock[] }): Promise<void>;
+	uploadText(args: { channel: string; threadTs: string; filename: string; content: string }): Promise<void>;
+	/** Bot's own user id (available after start()). */
+	readonly botUserId: string;
+}
+
+// ============================================================================
+// Registry — contract implemented by registry.ts (BridgeCore)
+// ============================================================================
+
+export interface TaskRecord {
+	/** Slack thread root ts — primary key. */
+	threadTs: string;
+	/** DM channel id. */
+	channel: string;
+	/** Durable session key; set once known (post-start get_state). */
+	sessionPath?: string;
+	/** Working directory the task was started in. */
+	cwd: string;
+	/** Display name (session name / prompt head). */
+	name: string;
+	createdAt: number;
+	lastActivityAt: number;
+}
+
+export interface RegistryData {
+	tasks: TaskRecord[];
+}
+
+// ============================================================================
+// Bridge config
+// ============================================================================
+
+export interface BridgeConfig {
+	slackAppToken: string;
+	slackBotToken: string;
+	/** Slack member IDs allowed to use the bridge. Non-empty (enforced at load). */
+	allowedUsers: string[];
+	ompBin: string;
+	/** alias → absolute path. */
+	repos: Record<string, string>;
+	defaultRepo?: string;
+	maxTasks: number;
+	idleTtlMin: number;
+	sessionNamePrefix: string;
+	/** State/registry directory (default ~/.omp/slack-bridge). */
+	stateDir: string;
+}

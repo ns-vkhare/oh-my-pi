@@ -1,0 +1,258 @@
+/**
+ * Block Kit / mrkdwn rendering helpers. Pure — no I/O.
+ *
+ * Every user-visible string routes through these so mrkdwn control chars are
+ * escaped and long content is chunked/truncated to Slack limits.
+ */
+
+import type { OmpUiRequest, SlackBlock } from "./types";
+
+/** Slack section text hard limit is 3000 chars; leave headroom. */
+const DEFAULT_CHUNK_SIZE = 2900;
+/** static_select option labels cap at 75 chars. */
+const OPTION_LABEL_MAX = 75;
+/** Buttons vs. dropdown threshold for select requests. */
+const BUTTON_LIMIT = 5;
+/** finalTextBlocks caps its section count; caller uploads the full text. */
+const FINAL_BLOCK_CAP = 8;
+
+const PHASE_EMOJI: Record<string, string> = {
+	starting: "⏳",
+	working: "🛠️",
+	done: "✅",
+	error: "❌",
+	killed: "💀",
+};
+
+const NOTIFY_EMOJI: Record<string, string> = {
+	info: "ℹ️",
+	warn: "⚠️",
+	error: "❌",
+};
+
+/** Escape the three mrkdwn control characters per Slack's rules. */
+export function escapeMrkdwn(text: string): string {
+	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Truncate to `max` chars with a trailing ellipsis when cut. */
+export function truncate(text: string, max: number): string {
+	if (text.length <= max) return text;
+	if (max <= 1) return text.slice(0, max);
+	return `${text.slice(0, max - 1)}…`;
+}
+
+/** Split text into chunks ≤ `chunkSize`, preferring line boundaries. */
+export function chunkText(text: string, chunkSize: number = DEFAULT_CHUNK_SIZE): string[] {
+	if (text.length <= chunkSize) return [text];
+	const chunks: string[] = [];
+	let current = "";
+	for (const line of text.split("\n")) {
+		// A single line longer than the chunk size is hard-split.
+		if (line.length > chunkSize) {
+			if (current) {
+				chunks.push(current);
+				current = "";
+			}
+			for (let i = 0; i < line.length; i += chunkSize) {
+				chunks.push(line.slice(i, i + chunkSize));
+			}
+			continue;
+		}
+		const candidate = current ? `${current}\n${line}` : line;
+		if (candidate.length > chunkSize) {
+			chunks.push(current);
+			current = line;
+		} else {
+			current = candidate;
+		}
+	}
+	if (current) chunks.push(current);
+	return chunks.length > 0 ? chunks : [""];
+}
+
+function section(text: string): SlackBlock {
+	return { type: "section", text: { type: "mrkdwn", text } };
+}
+
+/** Header for a newly dispatched task: name, context line, interaction hint. */
+export function taskHeaderBlocks(args: { name: string; cwd: string; sessionPath?: string; model?: string }): SlackBlock[] {
+	const contextParts = [`📁 \`${escapeMrkdwn(args.cwd)}\``];
+	if (args.model) contextParts.push(`🧠 ${escapeMrkdwn(args.model)}`);
+	const blocks: SlackBlock[] = [
+		section(`*${escapeMrkdwn(args.name)}*`),
+		{ type: "context", elements: [{ type: "mrkdwn", text: contextParts.join("  ·  ") }] },
+	];
+	if (args.sessionPath) {
+		blocks.push({
+			type: "context",
+			elements: [{ type: "mrkdwn", text: `🗂️ \`${escapeMrkdwn(args.sessionPath)}\`` }],
+		});
+	}
+	blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: "💬 _reply in this thread to interact_" }] });
+	return blocks;
+}
+
+/** Single mrkdwn status line: phase emoji + up to the last 4 tool labels. */
+export function statusText(args: { phase: "starting" | "working" | "done" | "error" | "killed"; toolLines: string[]; detail?: string }): string {
+	const emoji = PHASE_EMOJI[args.phase] ?? "•";
+	const lines = [`${emoji} *${args.phase}*${args.detail ? ` — ${escapeMrkdwn(args.detail)}` : ""}`];
+	for (const line of args.toolLines.slice(-4)) lines.push(`> ${escapeMrkdwn(line)}`);
+	return lines.join("\n");
+}
+
+/** Blocks for a UI request needing a Slack answer (select/confirm/input/editor). */
+export function uiRequestBlocks(req: OmpUiRequest & { method: "select" | "confirm" | "input" | "editor" }): SlackBlock[] {
+	if (req.method === "select") {
+		const listed = req.options.map((opt, i) => `${i + 1}. ${escapeMrkdwn(opt)}`).join("\n");
+		const blocks: SlackBlock[] = [section(`*${escapeMrkdwn(req.title)}*\n${listed}`)];
+		if (req.options.length <= BUTTON_LIMIT) {
+			blocks.push({
+				type: "actions",
+				elements: req.options.map((opt, i) => ({
+					type: "button",
+					text: { type: "plain_text", text: truncate(opt, OPTION_LABEL_MAX) },
+					action_id: `ui:${req.id}:${i}`,
+					value: opt,
+					...(i === 0 ? { style: "primary" } : {}),
+				})),
+			});
+		} else {
+			blocks.push({
+				type: "actions",
+				elements: [
+					{
+						type: "static_select",
+						action_id: `ui:${req.id}`,
+						placeholder: { type: "plain_text", text: "Choose an option" },
+						options: req.options.map((opt) => ({
+							text: { type: "plain_text", text: truncate(opt, OPTION_LABEL_MAX) },
+							value: opt,
+						})),
+					},
+				],
+			});
+		}
+		return blocks;
+	}
+
+	if (req.method === "confirm") {
+		return [
+			section(`*${escapeMrkdwn(req.title)}*\n${escapeMrkdwn(req.message)}`),
+			{
+				type: "actions",
+				elements: [
+					{
+						type: "button",
+						text: { type: "plain_text", text: "Yes" },
+						action_id: `ui:${req.id}:yes`,
+						value: "yes",
+						style: "primary",
+					},
+					{
+						type: "button",
+						text: { type: "plain_text", text: "No" },
+						action_id: `ui:${req.id}:no`,
+						value: "no",
+						style: "danger",
+					},
+				],
+			},
+		];
+	}
+
+	// input / editor — answered by a thread reply.
+	const hint = req.method === "input" ? req.placeholder : req.prefill;
+	const blocks: SlackBlock[] = [section(`*${escapeMrkdwn(req.title)}*\n_Reply in this thread with your answer._`)];
+	if (hint) blocks.push(section(`> ${escapeMrkdwn(hint)}`));
+	return blocks;
+}
+
+/** Replacement blocks for an answered UI message. */
+export function answeredBlocks(args: { title: string; answer: string; user: string }): SlackBlock[] {
+	return [
+		section(`*${escapeMrkdwn(args.title)}*`),
+		section(`✅ ${escapeMrkdwn(args.answer)} — <@${args.user}>`),
+	];
+}
+
+/**
+ * Blocks for one `ask` host-tool question. Section with the question text
+ * (header as a bold prefix line when present) and a numbered mrkdwn list of
+ * option labels/descriptions; interactive element is buttons (≤5 options) or a
+ * static_select (>5). action_id encodes callId/questionIndex[/optionIndex].
+ */
+export function askQuestionBlocks(args: {
+	callId: string;
+	questionIndex: number;
+	question: string;
+	header?: string;
+	options: Array<{ label: string; description?: string }>;
+	multi?: boolean;
+	recommended?: number;
+}): SlackBlock[] {
+	const { callId, questionIndex, question, header, options, multi, recommended } = args;
+	const lines: string[] = [];
+	if (header) lines.push(`*${escapeMrkdwn(header)}*`);
+	lines.push(escapeMrkdwn(question));
+	const listed = options
+		.map((opt, i) => `${i + 1}. *${escapeMrkdwn(opt.label)}*${opt.description ? ` — ${escapeMrkdwn(opt.description)}` : ""}`)
+		.join("\n");
+	if (listed) lines.push(listed);
+	const blocks: SlackBlock[] = [section(lines.join("\n"))];
+
+	if (options.length <= BUTTON_LIMIT) {
+		blocks.push({
+			type: "actions",
+			elements: options.map((opt, i) => ({
+				type: "button",
+				text: { type: "plain_text", text: truncate(opt.label, OPTION_LABEL_MAX) },
+				action_id: `ask:${callId}:${questionIndex}:${i}`,
+				value: opt.label,
+				...(recommended === i ? { style: "primary" } : {}),
+			})),
+		});
+	} else {
+		blocks.push({
+			type: "actions",
+			elements: [
+				{
+					type: "static_select",
+					action_id: `ask:${callId}:${questionIndex}`,
+					placeholder: { type: "plain_text", text: "Choose an option" },
+					options: options.map((opt) => ({
+						text: { type: "plain_text", text: truncate(opt.label, OPTION_LABEL_MAX) },
+						value: truncate(opt.label, OPTION_LABEL_MAX),
+					})),
+				},
+			],
+		});
+	}
+
+	if (multi) {
+		blocks.push({
+			type: "context",
+			elements: [{ type: "mrkdwn", text: "multi-select: reply in thread with comma-separated numbers or labels" }],
+		});
+	}
+	return blocks;
+}
+
+/** Replacement blocks for an answered `ask` question message. */
+export function askAnsweredBlocks(args: { question: string; answer: string; user: string }): SlackBlock[] {
+	return [
+		section(`*${escapeMrkdwn(args.question)}*`),
+		section(`✅ ${escapeMrkdwn(args.answer)} — <@${args.user}>`),
+	];
+}
+
+/** Chunked final-answer sections, capped at FINAL_BLOCK_CAP blocks. */
+export function finalTextBlocks(text: string): SlackBlock[] {
+	return chunkText(text).slice(0, FINAL_BLOCK_CAP).map((chunk) => section(chunk));
+}
+
+/** Prefixed notify line for a `notify` UI request. */
+export function notifyText(level: string | undefined, message: string): string {
+	const emoji = NOTIFY_EMOJI[level ?? "info"] ?? "ℹ️";
+	return `${emoji} ${escapeMrkdwn(message)}`;
+}

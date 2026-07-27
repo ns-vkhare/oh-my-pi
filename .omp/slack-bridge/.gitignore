@@ -1,0 +1,8 @@
+# Runtime state and secrets never belong in the repo — they live in the
+# installed copy at ~/.omp/slack-bridge only.
+.env
+state.json
+state.json.bak
+bridge.log
+node_modules/
+bun.lock

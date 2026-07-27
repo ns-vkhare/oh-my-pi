@@ -1,0 +1,1053 @@
+/**
+ * omp Slack bridge daemon.
+ *
+ * Wires the Slack transport (./slack) to omp RPC processes (./omp-rpc):
+ * routes DM commands and thread replies, relays `ask`/UI requests as Block Kit
+ * messages, renders per-turn status, persists the thread↔session registry, and
+ * reaps idle processes (hub parity). Run with `bun bridge.ts`.
+ */
+
+import {
+	answeredBlocks,
+	askAnsweredBlocks,
+	askQuestionBlocks,
+	finalTextBlocks,
+	notifyText,
+	statusText,
+	taskHeaderBlocks,
+	uiRequestBlocks,
+} from "./blocks";
+import { createOmpRpc } from "./omp-rpc";
+import { createSlackTransport } from "./slack";
+import { TaskRegistry } from "./registry";
+import type {
+	AskToolArgs,
+	BridgeConfig,
+	OmpHostToolCall,
+	OmpHostToolCancel,
+	OmpHostToolDefinition,
+	OmpRpc,
+	OmpRpcOptions,
+	OmpUiRequest,
+	SlackBlockAction,
+	SlackInbound,
+	SlackInboundMessage,
+	SlackTransport,
+	TaskRecord,
+} from "./types";
+
+const STATUS_THROTTLE_MS = 2_000;
+const REAPER_INTERVAL_MS = 60_000;
+/** Slack section text cap; longer final text is uploaded as a snippet. */
+const FINAL_INLINE_MAX = 2_900;
+const MINUTE_MS = 60_000;
+
+/** A UI request awaiting a Slack answer, plus the message showing it. */
+interface PendingUi {
+	req: OmpUiRequest;
+	messageTs: string;
+}
+
+/**
+ * A live `ask` host-tool call awaiting answers. One Slack message per question
+ * (parallel arrays), answers filled as they arrive; completion fires when all
+ * are answered.
+ */
+interface PendingAsk {
+	callId: string;
+	questions: AskToolArgs["questions"];
+	answers: Array<string | undefined>;
+	messageTs: string[];
+}
+
+/** In-memory state for one live RPC process bound to a Slack thread. */
+interface LiveTask {
+	rpc: OmpRpc;
+	record: TaskRecord;
+	statusTs?: string;
+	/** In-flight status post — guards against agent_start/turn_start double-posting. */
+	statusPost?: Promise<void>;
+	toolLines: string[];
+	turnActive: boolean;
+	pendingUi: Map<string, PendingUi>;
+	pendingTextUi?: PendingUi;
+	pendingAsk?: PendingAsk;
+	/** Last text posted per setStatus key (dedup). */
+	statusByKey: Map<string, string>;
+	/** Throttle bookkeeping for status chat.update. */
+	lastStatusUpdate: number;
+	statusUpdateTimer?: ReturnType<typeof setTimeout>;
+	disposers: Array<() => void>;
+}
+
+// ============================================================================
+// Config
+// ============================================================================
+
+/** Parse a `.env` file body: KEY=VALUE lines, `#` comments, optional quotes. */
+export function parseEnvFile(body: string): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const raw of body.split("\n")) {
+		const line = raw.trim();
+		if (!line || line.startsWith("#")) continue;
+		const eq = line.indexOf("=");
+		if (eq <= 0) continue;
+		const key = line.slice(0, eq).trim();
+		let value = line.slice(eq + 1).trim();
+		if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+			value = value.slice(1, -1);
+		}
+		out[key] = value;
+	}
+	return out;
+}
+
+function expandHome(path: string, home: string): string {
+	if (path === "~") return home;
+	if (path.startsWith("~/")) return `${home}/${path.slice(2)}`;
+	return path;
+}
+
+/** Build the bridge config from environment variables (see DESIGN.md §Config). */
+export function loadConfig(env: Record<string, string | undefined>, home: string): BridgeConfig {
+	const slackAppToken = env.SLACK_APP_TOKEN?.trim() ?? "";
+	const slackBotToken = env.SLACK_BOT_TOKEN?.trim() ?? "";
+	if (!slackAppToken) throw new Error("SLACK_APP_TOKEN is required (see ~/.omp/slack-bridge/.env)");
+	if (!slackBotToken) throw new Error("SLACK_BOT_TOKEN is required (see ~/.omp/slack-bridge/.env)");
+
+	const allowedUsers = (env.SLACK_ALLOWED_USERS ?? "")
+		.split(",")
+		.map((u) => u.trim())
+		.filter(Boolean);
+	if (allowedUsers.length === 0) {
+		throw new Error("SLACK_ALLOWED_USERS is empty — refusing to start (set a comma-separated list of Slack member IDs)");
+	}
+
+	const repos: Record<string, string> = {};
+	for (const entry of (env.REPOS ?? "").split(",")) {
+		const trimmed = entry.trim();
+		if (!trimmed) continue;
+		const eq = trimmed.indexOf("=");
+		if (eq <= 0) continue;
+		const alias = trimmed.slice(0, eq).trim();
+		const path = expandHome(trimmed.slice(eq + 1).trim(), home);
+		if (alias && path) repos[alias] = path;
+	}
+
+	const maxTasksRaw = Number.parseInt(env.MAX_TASKS ?? "", 10);
+	const idleTtlRaw = Number.parseInt(env.IDLE_TTL_MIN ?? "", 10);
+
+	return {
+		slackAppToken,
+		slackBotToken,
+		allowedUsers,
+		ompBin: env.OMP_BIN?.trim() || "omp",
+		repos,
+		defaultRepo: env.DEFAULT_REPO?.trim() || undefined,
+		maxTasks: Number.isFinite(maxTasksRaw) && maxTasksRaw > 0 ? maxTasksRaw : 4,
+		idleTtlMin: Number.isFinite(idleTtlRaw) && idleTtlRaw > 0 ? idleTtlRaw : 30,
+		sessionNamePrefix: env.SESSION_NAME_PREFIX ?? "slack:",
+		stateDir: `${home}/.omp/slack-bridge`,
+	};
+}
+
+// ============================================================================
+// Bridge
+// ============================================================================
+
+export interface BridgeDeps {
+	config: BridgeConfig;
+	slack: SlackTransport;
+	registry: TaskRegistry;
+	createRpc: (opts: OmpRpcOptions) => OmpRpc;
+}
+
+const HELP_TEXT = [
+	"*omp slack bridge*",
+	"• `run <alias|path> <prompt…>` — start a new task",
+	"• `sessions` — list known sessions",
+	"• `resume <sessionPath>` — reattach an on-disk session",
+	"• `status` — bridge status",
+	"Reply inside a task thread to steer it, or `abort` / `kill` / `status`.",
+].join("\n");
+
+/** The bridge-owned `ask` host tool (see DESIGN.md §omp RPC protocol). */
+const ASK_HOST_TOOL: OmpHostToolDefinition = {
+	name: "ask",
+	description:
+		"Ask the user one or more multiple-choice questions and wait for their answers. Use when you need a decision, clarification, or a choice between approaches. The user answers asynchronously via Slack; there is no timeout. Prefer 2-5 concise options; use recommended: <index> for the default.",
+	parameters: {
+		type: "object",
+		additionalProperties: false,
+		required: ["questions"],
+		properties: {
+			questions: {
+				type: "array",
+				minItems: 1,
+				items: {
+					type: "object",
+					additionalProperties: false,
+					required: ["id", "question", "options"],
+					properties: {
+						id: { type: "string" },
+						question: { type: "string" },
+						header: { type: "string" },
+						options: {
+							type: "array",
+							items: {
+								type: "object",
+								additionalProperties: false,
+								required: ["label"],
+								properties: {
+									label: { type: "string" },
+									description: { type: "string" },
+								},
+							},
+						},
+						multi: { type: "boolean" },
+						recommended: { type: "number" },
+					},
+				},
+			},
+		},
+	},
+};
+
+export class Bridge {
+	readonly #config: BridgeConfig;
+	readonly #slack: SlackTransport;
+	readonly #registry: TaskRegistry;
+	readonly #createRpc: (opts: OmpRpcOptions) => OmpRpc;
+	readonly #live = new Map<string, LiveTask>();
+	readonly #startedAt = Date.now();
+	#reaperTimer: ReturnType<typeof setInterval> | undefined;
+	#unsubscribeInbound: (() => void) | undefined;
+	#shuttingDown = false;
+
+	constructor(deps: BridgeDeps) {
+		this.#config = deps.config;
+		this.#slack = deps.slack;
+		this.#registry = deps.registry;
+		this.#createRpc = deps.createRpc;
+	}
+
+	start(): void {
+		this.#unsubscribeInbound = this.#slack.onInbound((inbound) => {
+			void this.#handleInbound(inbound).catch((err) => {
+				console.error(`bridge: inbound handler error: ${String(err)}`);
+			});
+		});
+		this.#reaperTimer = setInterval(() => void this.#reap(), REAPER_INTERVAL_MS);
+	}
+
+	async shutdown(): Promise<void> {
+		if (this.#shuttingDown) return;
+		this.#shuttingDown = true;
+		clearInterval(this.#reaperTimer);
+		this.#reaperTimer = undefined;
+		this.#unsubscribeInbound?.();
+		await Promise.all([...this.#live.values()].map((task) => task.rpc.stop().catch(() => {})));
+		await this.#registry.flush();
+		await this.#slack.stop().catch(() => {});
+	}
+
+	// --- Inbound routing ----------------------------------------------------
+
+	async #handleInbound(inbound: SlackInbound): Promise<void> {
+		if (!this.#config.allowedUsers.includes(inbound.user)) return;
+		if (inbound.kind === "action") {
+			await this.#handleAction(inbound);
+			return;
+		}
+		if (inbound.threadTs) {
+			await this.#handleThreadReply(inbound, inbound.threadTs);
+			return;
+		}
+		await this.#handleTopLevel(inbound);
+	}
+
+	async #handleTopLevel(msg: SlackInboundMessage): Promise<void> {
+		const text = msg.text.trim();
+		const [first, ...restTokens] = text.split(/\s+/);
+		const command = (first ?? "").toLowerCase();
+		const rest = text.slice((first ?? "").length).trim();
+
+		if (command === "run") {
+			await this.#cmdRun(msg, rest);
+		} else if (command === "sessions") {
+			await this.#cmdSessions(msg);
+		} else if (command === "resume") {
+			await this.#cmdResume(msg, restTokens[0]);
+		} else if (command === "status") {
+			await this.#cmdStatus(msg);
+		} else {
+			await this.#slack.postMessage({ channel: msg.channel, text: HELP_TEXT });
+		}
+	}
+
+	async #cmdRun(msg: SlackInboundMessage, rest: string): Promise<void> {
+		const sp = rest.indexOf(" ");
+		let dirToken = (sp === -1 ? rest : rest.slice(0, sp)).trim();
+		let prompt = (sp === -1 ? "" : rest.slice(sp + 1)).trim();
+
+		// `run <prompt…>` without a repo token falls back to DEFAULT_REPO: when the
+		// first word resolves to neither an alias nor a path, treat all of `rest`
+		// as the prompt.
+		let cwd = dirToken ? this.#resolveDir(dirToken) : undefined;
+		if (!cwd && this.#config.defaultRepo) {
+			const fallback = this.#resolveDir(this.#config.defaultRepo);
+			if (fallback) {
+				cwd = fallback;
+				prompt = rest.trim();
+				dirToken = this.#config.defaultRepo;
+			}
+		}
+		if (!prompt) {
+			await this.#slack.postMessage({ channel: msg.channel, text: "Usage: `run <alias|path> <prompt…>`" });
+			return;
+		}
+		if (!cwd) {
+			await this.#slack.postMessage({
+				channel: msg.channel,
+				text: `Unknown repo \`${dirToken}\`. Use a REPOS alias or an absolute path under \`${this.#home()}\`, or set DEFAULT_REPO.`,
+			});
+			return;
+		}
+
+		if (this.#live.size >= this.#config.maxTasks) {
+			const names = [...this.#live.values()].map((t) => `• ${t.record.name}`).join("\n");
+			await this.#slack.postMessage({
+				channel: msg.channel,
+				text: `At capacity (${this.#config.maxTasks} live tasks). Finish or \`kill\` one first:\n${names}`,
+			});
+			return;
+		}
+
+		const name = `${this.#config.sessionNamePrefix}${headOf(prompt)}`;
+		const headerTs = await this.#slack.postMessage({
+			channel: msg.channel,
+			text: name,
+			blocks: taskHeaderBlocks({ name, cwd }),
+		});
+		const record: TaskRecord = {
+			threadTs: headerTs,
+			channel: msg.channel,
+			cwd,
+			name,
+			createdAt: Date.now(),
+			lastActivityAt: Date.now(),
+		};
+		this.#registry.upsert(record);
+		await this.#spawn({ record, isNew: true, prompt, sessionName: name });
+	}
+
+	async #cmdSessions(msg: SlackInboundMessage): Promise<void> {
+		const records = this.#registry.all();
+		if (records.length === 0) {
+			await this.#slack.postMessage({ channel: msg.channel, text: "No sessions yet. `run <alias|path> <prompt…>` to start one." });
+			return;
+		}
+		const lines = records.map((r) => {
+			const marker = this.#live.has(r.threadTs) ? "⏵ live" : "⏸ idle";
+			return `${marker} · *${r.name}* · \`${r.cwd}\` · ${ageOf(r.lastActivityAt)}`;
+		});
+		await this.#slack.postMessage({
+			channel: msg.channel,
+			text: `*Sessions* (${records.length})\n${lines.join("\n")}\n_reply in a task thread to continue it._`,
+		});
+	}
+
+	async #cmdResume(msg: SlackInboundMessage, sessionPath: string | undefined): Promise<void> {
+		if (!sessionPath) {
+			await this.#slack.postMessage({ channel: msg.channel, text: "Usage: `resume <sessionPath>`" });
+			return;
+		}
+		const existing = this.#registry.bySessionPath(sessionPath);
+		const name = existing?.name ?? `${this.#config.sessionNamePrefix}${basename(sessionPath)}`;
+		const cwd = existing?.cwd ?? this.#home();
+		const headerTs = await this.#slack.postMessage({
+			channel: msg.channel,
+			text: name,
+			blocks: taskHeaderBlocks({ name, cwd, sessionPath }),
+		});
+		const record: TaskRecord = {
+			threadTs: headerTs,
+			channel: msg.channel,
+			cwd,
+			name,
+			sessionPath,
+			createdAt: existing?.createdAt ?? Date.now(),
+			lastActivityAt: Date.now(),
+		};
+		this.#registry.upsert(record);
+		await this.#spawn({ record, isNew: false, resumeSessionPath: sessionPath });
+	}
+
+	async #cmdStatus(msg: SlackInboundMessage): Promise<void> {
+		const uptimeMin = Math.floor((Date.now() - this.#startedAt) / MINUTE_MS);
+		await this.#slack.postMessage({
+			channel: msg.channel,
+			text: `*bridge* · ${this.#live.size} live · ${this.#registry.all().length} registered · up ${uptimeMin}m`,
+		});
+	}
+
+	async #handleThreadReply(msg: SlackInboundMessage, threadTs: string): Promise<void> {
+		let task = this.#live.get(threadTs);
+		if (!task) {
+			const record = this.#registry.byThread(threadTs);
+			if (!record?.sessionPath) return; // Unknown thread — ignore.
+			await this.#spawn({ record, isNew: false, resumeSessionPath: record.sessionPath });
+			task = this.#live.get(threadTs);
+			if (!task) return;
+		}
+
+		const text = msg.text.trim();
+
+		if (task.pendingTextUi) {
+			const pending = task.pendingTextUi;
+			task.pendingTextUi = undefined;
+			task.rpc.respondUi({ type: "extension_ui_response", id: pending.req.id, value: text });
+			await this.#slack
+				.updateMessage({
+					channel: task.record.channel,
+					ts: pending.messageTs,
+					text: `✅ answered`,
+					blocks: answeredBlocks({ title: uiTitle(pending.req), answer: text, user: msg.user }),
+				})
+				.catch(() => {});
+			this.#registry.touch(threadTs);
+			return;
+		}
+
+		const command = text.toLowerCase();
+		if (task.pendingAsk && command !== "abort" && command !== "kill" && command !== "status") {
+			const idx = task.pendingAsk.answers.findIndex((a) => a === undefined);
+			if (idx !== -1) {
+				await this.#answerAskQuestion(task, idx, text, msg.user);
+				return;
+			}
+		}
+		if (command === "abort") {
+			await task.rpc.abort().catch((err) => this.#note(task!, `abort failed: ${String(err)}`));
+			return;
+		}
+		if (command === "kill") {
+			await task.rpc.stop().catch(() => {});
+			await this.#clearPendingAsk(task, "⌛ cancelled");
+			await this.#updateStatusMessage(task, "killed");
+			return;
+		}
+		if (command === "status") {
+			await this.#postState(task);
+			return;
+		}
+		await task.rpc.prompt(text).catch((err) => this.#note(task!, `prompt failed: ${String(err)}`));
+		this.#registry.touch(threadTs);
+	}
+
+	async #postState(task: LiveTask): Promise<void> {
+		try {
+			const state = await task.rpc.getState();
+			const model = state.model ? `${state.model.provider}/${state.model.id}` : "—";
+			const pct = state.contextUsage ? `${state.contextUsage.percent}%` : "—";
+			await this.#slack.postMessage({
+				channel: task.record.channel,
+				threadTs: task.record.threadTs,
+				text: `*state* · ${model} · streaming ${state.isStreaming ? "yes" : "no"} · context ${pct} · \`${state.sessionFile ?? "?"}\``,
+			});
+		} catch (err) {
+			await this.#note(task, `get_state failed: ${String(err)}`);
+		}
+	}
+
+	async #handleAction(action: SlackBlockAction): Promise<void> {
+		if (action.actionId.startsWith("ask:")) {
+			await this.#handleAskAction(action);
+			return;
+		}
+		const parsed = parseActionId(action.actionId);
+		if (!parsed) return;
+		const found = this.#findPendingUi(parsed.reqId);
+		if (!found) {
+			await this.#slack
+				.updateMessage({ channel: action.channel, ts: action.messageTs, text: "⌛ this request has expired", blocks: [] })
+				.catch(() => {});
+			return;
+		}
+		const { task, pending } = found;
+		const req = pending.req;
+
+		let answerLabel: string;
+		if (req.method === "confirm") {
+			const confirmed = parsed.suffix === "yes";
+			task.rpc.respondUi({ type: "extension_ui_response", id: req.id, confirmed });
+			answerLabel = confirmed ? "Yes" : "No";
+		} else if (req.method === "select") {
+			answerLabel = action.value;
+			task.rpc.respondUi({ type: "extension_ui_response", id: req.id, value: action.value });
+		} else {
+			return; // input/editor are answered by thread reply, not actions.
+		}
+
+		task.pendingUi.delete(req.id);
+		await this.#slack
+			.updateMessage({
+				channel: action.channel,
+				ts: pending.messageTs,
+				text: `✅ answered`,
+				blocks: answeredBlocks({ title: uiTitle(req), answer: answerLabel, user: action.user }),
+			})
+			.catch(() => {});
+		this.#registry.touch(task.record.threadTs);
+	}
+
+	#findPendingUi(reqId: string): { task: LiveTask; pending: PendingUi } | undefined {
+		for (const task of this.#live.values()) {
+			const pending = task.pendingUi.get(reqId);
+			if (pending) return { task, pending };
+			if (task.pendingTextUi?.req.id === reqId) return { task, pending: task.pendingTextUi };
+		}
+		return undefined;
+	}
+
+	async #handleAskAction(action: SlackBlockAction): Promise<void> {
+		const parsed = parseAskActionId(action.actionId);
+		const task = parsed ? this.#findPendingAsk(parsed.callId) : undefined;
+		if (!parsed || !task) {
+			await this.#slack
+				.updateMessage({ channel: action.channel, ts: action.messageTs, text: "⌛ expired", blocks: [] })
+				.catch(() => {});
+			return;
+		}
+		// answer = button value or selected option value (both surface as action.value).
+		await this.#answerAskQuestion(task, parsed.questionIndex, action.value, action.user);
+	}
+
+	#findPendingAsk(callId: string): LiveTask | undefined {
+		for (const task of this.#live.values()) {
+			if (task.pendingAsk?.callId === callId) return task;
+		}
+		return undefined;
+	}
+
+	// --- Task lifecycle -----------------------------------------------------
+
+	async #spawn(args: { record: TaskRecord; isNew: boolean; prompt?: string; resumeSessionPath?: string; sessionName?: string }): Promise<void> {
+		const { record, isNew } = args;
+		const rpc = this.#createRpc({
+			ompBin: this.#config.ompBin,
+			cwd: record.cwd,
+			resumeSessionPath: args.resumeSessionPath,
+			env: isNew ? { OMP_HUB_NEW_SESSION: "1" } : {},
+			extraArgs: [],
+		});
+
+		const task: LiveTask = {
+			rpc,
+			record,
+			toolLines: [],
+			turnActive: false,
+			pendingUi: new Map(),
+			statusByKey: new Map(),
+			lastStatusUpdate: 0,
+			disposers: [],
+		};
+		this.#live.set(record.threadTs, task);
+		this.#wireTask(task);
+
+		try {
+			await rpc.start();
+		} catch (err) {
+			this.#disposeTask(task);
+			this.#live.delete(record.threadTs);
+			await this.#slack.postMessage({
+				channel: record.channel,
+				threadTs: record.threadTs,
+				text: `❌ failed to start agent: ${String(err)}`,
+			});
+			return;
+		}
+
+		if (isNew && args.sessionName) {
+			await rpc.setSessionName(args.sessionName).catch(() => {});
+		}
+		try {
+			const state = await rpc.getState();
+			if (state.sessionFile) record.sessionPath = state.sessionFile;
+			if (state.sessionName) record.name = state.sessionName;
+		} catch {
+			// Non-fatal: sessionPath fills in on a later get_state.
+		}
+		record.lastActivityAt = Date.now();
+		this.#registry.upsert(record);
+
+		await rpc.setHostTools([ASK_HOST_TOOL]).catch((err) => console.error(`bridge: set_host_tools failed: ${String(err)}`));
+
+		if (isNew && args.prompt) {
+			await rpc.prompt(args.prompt).catch((err) => this.#note(task, `prompt failed: ${String(err)}`));
+		}
+	}
+
+	#wireTask(task: LiveTask): void {
+		task.disposers.push(
+			task.rpc.onEvent((event) => void this.#onEvent(task, event)),
+			task.rpc.onUiRequest((req) => void this.#onUiRequest(task, req)),
+			task.rpc.onHostToolCall((call) => void this.#onHostToolCall(task, call)),
+			task.rpc.onHostToolCancel((cancel) => void this.#onHostToolCancel(task, cancel)),
+			task.rpc.onExit((code) => void this.#onExit(task, code)),
+		);
+	}
+
+	async #onEvent(task: LiveTask, event: { type: string; toolName?: string; args?: Record<string, unknown> }): Promise<void> {
+		if (event.type === "agent_start" || event.type === "turn_start") {
+			task.turnActive = true;
+			task.toolLines = [];
+			await this.#ensureStatusMessage(task);
+			return;
+		}
+		if (event.type === "tool_execution_start") {
+			const label = toolLabel(event.toolName, event.args);
+			if (task.toolLines[task.toolLines.length - 1] !== label) task.toolLines.push(label);
+			this.#throttledStatusUpdate(task);
+			return;
+		}
+		if (event.type === "agent_end") {
+			task.turnActive = false;
+			this.#clearStatusTimer(task);
+			await this.#finishTurn(task);
+			this.#registry.touch(task.record.threadTs);
+		}
+	}
+
+	#ensureStatusMessage(task: LiveTask): Promise<void> {
+		if (task.statusTs) return Promise.resolve();
+		// Coalesce concurrent callers (agent_start + turn_start fire together):
+		// only the first posts; the rest await the same in-flight promise.
+		task.statusPost ??= (async () => {
+			try {
+				task.statusTs = await this.#slack.postMessage({
+					channel: task.record.channel,
+					threadTs: task.record.threadTs,
+					text: statusText({ phase: "starting", toolLines: [] }),
+				});
+			} catch (err) {
+				console.error(`bridge: failed to post status message: ${String(err)}`);
+			} finally {
+				task.statusPost = undefined;
+			}
+		})();
+		return task.statusPost;
+	}
+
+	#throttledStatusUpdate(task: LiveTask): void {
+		const now = Date.now();
+		const elapsed = now - task.lastStatusUpdate;
+		if (elapsed >= STATUS_THROTTLE_MS) {
+			void this.#updateStatusMessage(task, "working");
+			return;
+		}
+		// Guarantee a trailing update lands after the throttle window.
+		if (task.statusUpdateTimer === undefined) {
+			task.statusUpdateTimer = setTimeout(() => {
+				task.statusUpdateTimer = undefined;
+				void this.#updateStatusMessage(task, "working");
+			}, STATUS_THROTTLE_MS - elapsed);
+		}
+	}
+
+	async #updateStatusMessage(task: LiveTask, phase: "starting" | "working" | "done" | "error" | "killed"): Promise<void> {
+		if (!task.statusTs) return;
+		task.lastStatusUpdate = Date.now();
+		await this.#slack
+			.updateMessage({
+				channel: task.record.channel,
+				ts: task.statusTs,
+				text: statusText({ phase, toolLines: task.toolLines }),
+			})
+			.catch(() => {});
+	}
+
+	async #finishTurn(task: LiveTask): Promise<void> {
+		let finalText: string | null = null;
+		try {
+			finalText = await task.rpc.getLastAssistantText();
+		} catch {
+			finalText = null;
+		}
+		const body = finalText ?? "_(no output)_";
+
+		if (!task.statusTs) {
+			// No status message was posted; send the result as a fresh message.
+			await this.#slack
+				.postMessage({ channel: task.record.channel, threadTs: task.record.threadTs, text: body, blocks: finalTextBlocks(body) })
+				.catch(() => {});
+			return;
+		}
+
+		if (body.length <= FINAL_INLINE_MAX) {
+			await this.#slack
+				.updateMessage({ channel: task.record.channel, ts: task.statusTs, text: body, blocks: finalTextBlocks(body) })
+				.catch(() => {});
+		} else {
+			await this.#updateStatusMessage(task, "done");
+			await this.#slack
+				.uploadText({
+					channel: task.record.channel,
+					threadTs: task.record.threadTs,
+					filename: "response.md",
+					content: body,
+				})
+				.catch((err) => console.error(`bridge: uploadText failed: ${String(err)}`));
+		}
+		task.statusTs = undefined; // Next turn posts a fresh status message.
+	}
+
+	async #onUiRequest(task: LiveTask, req: OmpUiRequest): Promise<void> {
+		try {
+			if (req.method === "select" || req.method === "confirm") {
+				const ts = await this.#slack.postMessage({
+					channel: task.record.channel,
+					threadTs: task.record.threadTs,
+					text: uiTitle(req),
+					blocks: uiRequestBlocks(req),
+				});
+				task.pendingUi.set(req.id, { req, messageTs: ts });
+			} else if (req.method === "input" || req.method === "editor") {
+				const ts = await this.#slack.postMessage({
+					channel: task.record.channel,
+					threadTs: task.record.threadTs,
+					text: uiTitle(req),
+					blocks: uiRequestBlocks(req),
+				});
+				task.pendingTextUi = { req, messageTs: ts };
+			} else if (req.method === "notify") {
+				await this.#slack.postMessage({
+					channel: task.record.channel,
+					threadTs: task.record.threadTs,
+					text: notifyText(req.level, req.message),
+				});
+			} else if (req.method === "setStatus") {
+				if (req.text === undefined) return;
+				if (task.statusByKey.get(req.statusKey) === req.text) return;
+				task.statusByKey.set(req.statusKey, req.text);
+				await this.#slack.postMessage({ channel: task.record.channel, threadTs: task.record.threadTs, text: `ℹ️ ${req.text}` });
+			} else if (req.method === "open_url") {
+				await this.#slack.postMessage({ channel: task.record.channel, threadTs: task.record.threadTs, text: req.url });
+			} else if (req.method === "cancel") {
+				await this.#cancelUi(task, req.targetId);
+			}
+		} catch (err) {
+			console.error(`bridge: ui request (${req.method}) handling error: ${String(err)}`);
+		}
+	}
+
+	async #cancelUi(task: LiveTask, targetId: string): Promise<void> {
+		const pending = task.pendingUi.get(targetId) ?? (task.pendingTextUi?.req.id === targetId ? task.pendingTextUi : undefined);
+		if (!pending) return;
+		task.pendingUi.delete(targetId);
+		if (task.pendingTextUi?.req.id === targetId) task.pendingTextUi = undefined;
+		await this.#slack.updateMessage({ channel: task.record.channel, ts: pending.messageTs, text: "⌛ cancelled", blocks: [] }).catch(() => {});
+	}
+
+	// --- Ask host tool ------------------------------------------------------
+
+	async #onHostToolCall(task: LiveTask, call: OmpHostToolCall): Promise<void> {
+		if (call.toolName !== "ask") {
+			task.rpc.respondHostTool({
+				type: "host_tool_result",
+				id: call.id,
+				result: { content: [{ type: "text", text: "unknown host tool" }] },
+				isError: true,
+			});
+			return;
+		}
+		const questions = parseAskQuestions(call.arguments);
+		if (!questions) {
+			task.rpc.respondHostTool({
+				type: "host_tool_result",
+				id: call.id,
+				result: { content: [{ type: "text", text: "invalid ask arguments" }] },
+				isError: true,
+			});
+			return;
+		}
+
+		// Supersede an already-pending ask on this task.
+		if (task.pendingAsk) await this.#supersedePendingAsk(task);
+
+		const messageTs: string[] = [];
+		for (let i = 0; i < questions.length; i++) {
+			const q = questions[i]!;
+			const ts = await this.#slack.postMessage({
+				channel: task.record.channel,
+				threadTs: task.record.threadTs,
+				text: q.question,
+				blocks: askQuestionBlocks({
+					callId: call.id,
+					questionIndex: i,
+					question: q.question,
+					header: q.header,
+					options: q.options,
+					multi: q.multi,
+					recommended: q.recommended,
+				}),
+			});
+			messageTs.push(ts);
+		}
+		task.pendingAsk = { callId: call.id, questions, answers: new Array(questions.length).fill(undefined), messageTs };
+		this.#registry.touch(task.record.threadTs);
+	}
+
+	async #onHostToolCancel(task: LiveTask, cancel: OmpHostToolCancel): Promise<void> {
+		if (task.pendingAsk?.callId !== cancel.targetId) return;
+		await this.#clearPendingAsk(task, "⌛ cancelled");
+	}
+
+	/** Record an answer, edit the message; complete the call when all answered. */
+	async #answerAskQuestion(task: LiveTask, questionIndex: number, answer: string, user: string): Promise<void> {
+		const pending = task.pendingAsk;
+		if (!pending) return;
+		if (questionIndex < 0 || questionIndex >= pending.questions.length) return;
+		if (pending.answers[questionIndex] !== undefined) return; // Already answered.
+		pending.answers[questionIndex] = answer;
+		await this.#slack
+			.updateMessage({
+				channel: task.record.channel,
+				ts: pending.messageTs[questionIndex]!,
+				text: `✅ ${answer}`,
+				blocks: askAnsweredBlocks({ question: pending.questions[questionIndex]!.question, answer, user }),
+			})
+			.catch(() => {});
+		this.#registry.touch(task.record.threadTs);
+
+		if (pending.answers.every((a) => a !== undefined)) {
+			task.rpc.respondHostTool({
+				type: "host_tool_result",
+				id: pending.callId,
+				result: { content: [{ type: "text", text: formatAskResult(pending) }] },
+			});
+			task.pendingAsk = undefined;
+			this.#registry.touch(task.record.threadTs);
+		}
+	}
+
+	/** Edit unanswered ask messages to `label` and drop pendingAsk. */
+	async #clearPendingAsk(task: LiveTask, label: string): Promise<void> {
+		const pending = task.pendingAsk;
+		if (!pending) return;
+		task.pendingAsk = undefined;
+		for (let i = 0; i < pending.messageTs.length; i++) {
+			if (pending.answers[i] !== undefined) continue;
+			await this.#slack.updateMessage({ channel: task.record.channel, ts: pending.messageTs[i]!, text: label, blocks: [] }).catch(() => {});
+		}
+	}
+
+	/** Supersede an outstanding ask (agent issued a new one before answers landed). */
+	async #supersedePendingAsk(task: LiveTask): Promise<void> {
+		await this.#clearPendingAsk(task, "⌛ superseded");
+	}
+
+	async #onExit(task: LiveTask, code: number | null): Promise<void> {
+		this.#clearStatusTimer(task);
+		await this.#clearPendingAsk(task, "⌛ cancelled");
+		if (task.turnActive) {
+			await this.#slack
+				.postMessage({ channel: task.record.channel, threadTs: task.record.threadTs, text: `💀 agent process exited (code ${code ?? "?"})` })
+				.catch(() => {});
+		}
+		this.#disposeTask(task);
+		this.#live.delete(task.record.threadTs); // Record kept — resumable.
+	}
+
+	async #note(task: LiveTask, text: string): Promise<void> {
+		await this.#slack
+			.postMessage({ channel: task.record.channel, threadTs: task.record.threadTs, text: `⚠️ ${text}` })
+			.catch(() => {});
+	}
+
+	#clearStatusTimer(task: LiveTask): void {
+		clearTimeout(task.statusUpdateTimer);
+		task.statusUpdateTimer = undefined;
+	}
+
+	#disposeTask(task: LiveTask): void {
+		this.#clearStatusTimer(task);
+		for (const dispose of task.disposers) dispose();
+		task.disposers = [];
+	}
+
+	async #reap(): Promise<void> {
+		const now = Date.now();
+		const ttlMs = this.#config.idleTtlMin * MINUTE_MS;
+		for (const task of [...this.#live.values()]) {
+			if (task.turnActive || task.pendingUi.size > 0 || task.pendingTextUi || task.pendingAsk) continue;
+			if (now - task.record.lastActivityAt <= ttlMs) continue;
+			await task.rpc.stop().catch(() => {});
+			await this.#slack
+				.postMessage({ channel: task.record.channel, threadTs: task.record.threadTs, text: "⏸ idle — parked (reply to resume)" })
+				.catch(() => {});
+			this.#disposeTask(task);
+			this.#live.delete(task.record.threadTs);
+		}
+	}
+
+	// --- helpers ------------------------------------------------------------
+
+	#home(): string {
+		// stateDir is `<home>/.omp/slack-bridge`; recover home from it.
+		return this.#config.stateDir.replace(/\/\.omp\/slack-bridge$/, "");
+	}
+
+	#resolveDir(token: string): string | undefined {
+		const alias = this.#config.repos[token];
+		if (alias) return alias;
+		if (token.startsWith("/")) {
+			const home = this.#home();
+			if (token === home || token.startsWith(`${home}/`)) return token;
+		}
+		return undefined;
+	}
+}
+
+// ============================================================================
+// Pure helpers (module-private)
+// ============================================================================
+
+function parseActionId(actionId: string): { reqId: string; suffix?: string } | undefined {
+	if (!actionId.startsWith("ui:")) return undefined;
+	const rest = actionId.slice(3);
+	const colon = rest.lastIndexOf(":");
+	if (colon === -1) return { reqId: rest };
+	const suffix = rest.slice(colon + 1);
+	// Numeric index or yes/no suffix; anything else is part of a colon-free id.
+	if (suffix === "yes" || suffix === "no" || /^\d+$/.test(suffix)) {
+		return { reqId: rest.slice(0, colon), suffix };
+	}
+	return { reqId: rest };
+}
+
+/** Parse `ask:<callId>:<questionIndex>[:<optionIndex>]` action ids. */
+function parseAskActionId(actionId: string): { callId: string; questionIndex: number } | undefined {
+	if (!actionId.startsWith("ask:")) return undefined;
+	const parts = actionId.slice(4).split(":");
+	// callId, questionIndex, and optional optionIndex — callId never contains ':'.
+	if (parts.length < 2) return undefined;
+	const callId = parts[0]!;
+	const questionIndex = Number.parseInt(parts[1]!, 10);
+	if (!callId || !Number.isInteger(questionIndex) || questionIndex < 0) return undefined;
+	return { callId, questionIndex };
+}
+
+/** Narrow an unknown to an index-readable object (checked, no unchecked cast). */
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+/** Validate and normalize `ask` host-tool arguments; undefined when malformed. */
+function parseAskQuestions(args: Record<string, unknown>): AskToolArgs["questions"] | undefined {
+	const raw = args.questions;
+	if (!Array.isArray(raw) || raw.length === 0) return undefined;
+	const questions: AskToolArgs["questions"] = [];
+	for (const item of raw) {
+		if (!isRecord(item)) return undefined;
+		const id = item.id;
+		const question = item.question;
+		const rawOptions = item.options;
+		if (typeof id !== "string" || typeof question !== "string" || !Array.isArray(rawOptions)) return undefined;
+		const options: Array<{ label: string; description?: string }> = [];
+		for (const opt of rawOptions) {
+			if (!isRecord(opt) || typeof opt.label !== "string") return undefined;
+			options.push({ label: opt.label, description: typeof opt.description === "string" ? opt.description : undefined });
+		}
+		questions.push({
+			id,
+			question,
+			header: typeof item.header === "string" ? item.header : undefined,
+			options,
+			multi: typeof item.multi === "boolean" ? item.multi : undefined,
+			recommended: typeof item.recommended === "number" ? item.recommended : undefined,
+		});
+	}
+	return questions;
+}
+
+/** Text summary of a fully-answered ask (single vs. multi-question form). */
+function formatAskResult(pending: PendingAsk): string {
+	if (pending.questions.length === 1) {
+		return `User answered "${pending.questions[0]!.question}": ${pending.answers[0] ?? ""}`;
+	}
+	const lines = pending.questions.map((q, i) => `${i + 1}. ${q.question} → ${pending.answers[i] ?? ""}`);
+	return `User answers:\n${lines.join("\n")}`;
+}
+
+function uiTitle(req: OmpUiRequest): string {
+	return "title" in req && typeof req.title === "string" ? req.title : "Question";
+}
+
+function toolLabel(toolName: string | undefined, args: Record<string, unknown> | undefined): string {
+	const name = toolName ?? "tool";
+	const detail = args && typeof args.path === "string" ? ` ${args.path}` : args && typeof args.command === "string" ? ` ${String(args.command).slice(0, 40)}` : "";
+	return `⏵ ${name}${detail}`;
+}
+
+function headOf(prompt: string): string {
+	const oneLine = prompt.replace(/\s+/g, " ").trim();
+	return oneLine.length > 60 ? `${oneLine.slice(0, 59)}…` : oneLine;
+}
+
+function basename(path: string): string {
+	const parts = path.split("/");
+	return parts[parts.length - 1] || path;
+}
+
+function ageOf(ts: number): string {
+	const mins = Math.floor((Date.now() - ts) / MINUTE_MS);
+	if (mins < 1) return "just now";
+	if (mins < 60) return `${mins}m ago`;
+	const hours = Math.floor(mins / 60);
+	if (hours < 24) return `${hours}h ago`;
+	return `${Math.floor(hours / 24)}d ago`;
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+export async function main(): Promise<void> {
+	const home = process.env.HOME ?? "";
+	const stateDir = `${home}/.omp/slack-bridge`;
+
+	// Parse `<stateDir>/.env` first; process.env wins on conflicts.
+	const merged: Record<string, string | undefined> = { ...process.env };
+	const envFile = Bun.file(`${stateDir}/.env`);
+	if (await envFile.exists()) {
+		const parsed = parseEnvFile(await envFile.text());
+		for (const [key, value] of Object.entries(parsed)) {
+			if (merged[key] === undefined) merged[key] = value;
+		}
+	}
+
+	const config = loadConfig(merged, home);
+	const registry = await TaskRegistry.load(config.stateDir);
+	const slack = createSlackTransport({ appToken: config.slackAppToken, botToken: config.slackBotToken });
+	const bridge = new Bridge({ config, slack, registry, createRpc: createOmpRpc });
+
+	await slack.start();
+	bridge.start();
+
+	const shutdown = () => {
+		void bridge.shutdown().then(() => process.exit(0));
+	};
+	process.on("SIGINT", shutdown);
+	process.on("SIGTERM", shutdown);
+
+	const aliases = Object.keys(config.repos).join(", ") || "(none)";
+	console.log(`bridge up — ${config.allowedUsers.length} allowed user(s), repos: ${aliases}, maxTasks=${config.maxTasks}`);
+}
+
+if (import.meta.main) {
+	main().catch((err) => {
+		console.error(`bridge: fatal: ${String(err)}`);
+		process.exit(1);
+	});
+}
