@@ -60,6 +60,7 @@ import type { PrintModeOptions } from "./modes/print-mode";
 import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
+import { runWatchMode } from "./modes/watch-mode";
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
 import {
 	type CreateAgentSessionOptions,
@@ -1241,6 +1242,33 @@ export async function runRootCommand(
 		settingsInstance.get("theme.dark"),
 		settingsInstance.get("theme.light"),
 	);
+
+	// `--watch` is a spectator on a session ANOTHER process owns, so it forks off
+	// here: everything below builds ownership (session manager, tools, agent,
+	// writer) and `SessionManager.open` would rewrite a file the owner is
+	// appending to. Only the theme and settings above are needed.
+	if (parsedArgs.watch !== undefined) {
+		// Every other mode flag asks this process to OWN a session — the one thing
+		// a spectator must never do. Refuse the combination instead of silently
+		// winning the race for the file.
+		const ownershipFlags: Record<string, boolean> = {
+			"--resume": Boolean(parsedArgs.resume),
+			"--continue": Boolean(parsedArgs.continue),
+			"--fork": parsedArgs.fork !== undefined,
+			"--print": Boolean(parsedArgs.print),
+			"--mode": parsedArgs.mode !== undefined,
+		};
+		const conflicting = Object.keys(ownershipFlags).filter(flag => ownershipFlags[flag]);
+		if (conflicting.length > 0) {
+			process.stderr.write(`${chalk.red(`Error: --watch cannot be combined with ${conflicting.join(", ")}.`)}\n`);
+			process.stderr.write(`${chalk.dim("--watch only tails a session; use --resume to own one.")}\n`);
+			process.exit(1);
+		}
+		stopStartupWatchdog();
+		logger.endTiming();
+		await runWatchMode(parsedArgs.watch);
+		process.exit(0);
+	}
 
 	let scopedModels: ScopedModel[] = [];
 	const modelPatterns = parsedArgs.models ?? settingsInstance.get("enabledModels");

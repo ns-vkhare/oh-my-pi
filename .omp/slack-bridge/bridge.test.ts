@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { Bridge, loadConfig } from "./bridge";
+import { Bridge, loadConfig, type ListSessions, type StoreSession } from "./bridge";
 import { TaskRegistry } from "./registry";
 import type {
 	BridgeConfig,
@@ -226,7 +226,7 @@ afterEach(async () => {
 	while (liveHarnesses.length > 0) await liveHarnesses.pop()!.shutdown();
 });
 
-async function makeHarness(config: BridgeConfig, seed: TaskRecord[] = []): Promise<Harness> {
+async function makeHarness(config: BridgeConfig, seed: TaskRecord[] = [], listSessions?: ListSessions): Promise<Harness> {
 	const slack = new FakeSlack();
 	const dir = `/tmp/bridge-test-${Math.random().toString(36).slice(2)}`;
 	const registry = await TaskRegistry.load(dir);
@@ -237,7 +237,7 @@ async function makeHarness(config: BridgeConfig, seed: TaskRecord[] = []): Promi
 		rpcs.push(rpc);
 		return rpc;
 	};
-	const bridge = new Bridge({ config, slack, registry, createRpc });
+	const bridge = new Bridge({ config, slack, registry, createRpc, listSessions });
 	bridge.start();
 	liveHarnesses.push(bridge);
 	return { slack, registry, bridge, rpcs };
@@ -403,6 +403,67 @@ describe("lazy respawn", () => {
 		expect(respawned.opts.env?.OMP_HUB_NEW_SESSION).toBeUndefined();
 		// The reply is then delivered as a prompt.
 		expect(respawned.prompts).toEqual(["keep going"]);
+	});
+});
+
+describe("session browsing", () => {
+	const REPO = `${HOME}/oh-my-pi-src`;
+	const ALPHA = `${REPO}/.omp/a.jsonl`;
+	const BETA = `${REPO}/.omp/b.jsonl`;
+	/** Stand-in for `omp sessions --json` — newest-first, as the real command emits. */
+	const lister: ListSessions = async () => [
+		{ path: ALPHA, title: "alpha work", modified: new Date(Date.now() - 5 * 60_000).toISOString() },
+		{ path: BETA, firstMessage: "beta first message", modified: new Date(Date.now() - 90 * 60_000).toISOString() },
+	] satisfies StoreSession[];
+
+	function attachedRecord(): TaskRecord {
+		return { threadTs: "threadA", channel: "D1", cwd: REPO, name: "alpha work", sessionPath: ALPHA, createdAt: 1, lastActivityAt: 1 };
+	}
+
+	test("sessions lists the whole store per repo, numbered and aged", async () => {
+		const h = await makeHarness(makeConfig(), [], lister);
+		await h.slack.inject(dm("sessions"));
+
+		const text = h.slack.posted.at(-1)!.args.text;
+		expect(text).toContain(`*omp* · \`${REPO}\``);
+		expect(text).toContain("1. alpha work · 5m ago");
+		expect(text).toContain("2. beta first message · 1h ago");
+	});
+
+	test("resume <n> resumes the mapped session path in its repo cwd", async () => {
+		const h = await makeHarness(makeConfig(), [], lister);
+		await h.slack.inject(dm("sessions"));
+		const beforeHeader = h.slack.posted.length;
+
+		await h.slack.inject(dm("resume 2"));
+
+		expect(h.rpcs).toHaveLength(1);
+		expect(h.rpcs[0]!.opts.resumeSessionPath).toBe(BETA);
+		expect(h.rpcs[0]!.opts.cwd).toBe(REPO);
+		expect(h.rpcs[0]!.opts.env?.OMP_HUB_NEW_SESSION).toBeUndefined();
+		// A task header opened the thread and got registered.
+		const header = h.slack.posted[beforeHeader]!;
+		expect(header.args.blocks).toBeDefined();
+		expect(h.registry.byThread(header.ts)).toBeDefined();
+	});
+
+	test("resume <n> with no live listing points back at `sessions`", async () => {
+		const h = await makeHarness(makeConfig(), [], lister);
+		await h.slack.inject(dm("resume 3"));
+
+		expect(h.rpcs).toHaveLength(0);
+		expect(h.slack.posted.at(-1)!.args.text).toContain("run `sessions` first");
+	});
+
+	test("an already-attached session is badged and resume <n> links its thread instead of spawning", async () => {
+		const h = await makeHarness(makeConfig(), [attachedRecord()], lister);
+		await h.slack.inject(dm("sessions"));
+		expect(h.slack.posted.at(-1)!.args.text).toContain("1. 🔗 alpha work");
+
+		await h.slack.inject(dm("resume 1"));
+
+		expect(h.rpcs).toHaveLength(0);
+		expect(h.slack.posted.at(-1)!.args.text).toContain("threadA");
 	});
 });
 

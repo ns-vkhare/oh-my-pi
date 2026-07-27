@@ -12,6 +12,10 @@
  * truncation, rotation, or sentinel drift fall back to a full rebuild so changed
  * historical entries cannot leave stale components behind. Collab guests use the
  * same append path over the host's byte-capped transcript reads.
+ *
+ * {@link SpectateOverride} (`omp --watch`) reuses that tail against an
+ * arbitrary session file owned by *another process*, swapping the chrome and
+ * routing input out over the Slack bridge instead of into a local session.
  */
 import * as fs from "node:fs";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -31,6 +35,25 @@ import type { AgentHubRemote } from "./agent-hub";
 import { ChatTranscriptBuilder } from "./chat-transcript-builder";
 import { DynamicBorder } from "./dynamic-border";
 import { formatContextUsage } from "./status-line/context-thresholds";
+
+/**
+ * Read-only spectator wiring: tail a session file this process does not own
+ * (`omp --watch`, the Slack bridge's headless sessions) with caller-supplied
+ * chrome. When set, the agent registry is never consulted for the file, the
+ * bottom editor is always mounted, and submits/keys route to the caller.
+ */
+export interface SpectateOverride {
+	/** The `.jsonl` to tail, resolved by the caller. */
+	sessionFile: string;
+	/** Replaces the agent header rows. Called every frame, so it may show live status. */
+	header: () => string[];
+	/** Replaces the footer key hint. */
+	hint: string;
+	/** Bottom-editor submit, already trimmed and non-empty. */
+	onSubmit: (text: string) => void;
+	/** Extra keys, offered before the viewer's own bindings. `true` = consumed. */
+	onKey?: (data: string) => boolean;
+}
 
 export interface AgentTranscriptViewerDeps {
 	agentId: string;
@@ -55,6 +78,7 @@ export interface AgentTranscriptViewerDeps {
 	onClose: () => void;
 	/** Close this viewer AND the hub (hub-toggle keys). */
 	onHubClose: () => void;
+	spectate?: SpectateOverride;
 }
 
 /** How often to re-stat a file-backed transcript for growth (advisor/live tail). */
@@ -184,6 +208,8 @@ export class AgentTranscriptViewer implements Component {
 
 	/** Advisor transcripts are read-only; everything else may be messaged. */
 	get #sendable(): boolean {
+		// Spectators always get an editor: their input is proxied to the owner.
+		if (this.deps.spectate) return true;
 		const ref = this.deps.registry.get(this.deps.agentId);
 		if (!ref || ref.kind === "advisor") return false;
 		return Boolean(this.deps.remote || this.deps.lifecycle);
@@ -213,7 +239,7 @@ export class AgentTranscriptViewer implements Component {
 			this.#fetchRemote();
 			return;
 		}
-		const sessionFile = this.deps.registry.get(this.deps.agentId)?.sessionFile;
+		const sessionFile = this.deps.spectate?.sessionFile ?? this.deps.registry.get(this.deps.agentId)?.sessionFile;
 		if (!sessionFile) {
 			this.#clearLocal("none");
 			return;
@@ -451,6 +477,10 @@ export class AgentTranscriptViewer implements Component {
 			return;
 		}
 
+		// Spectator bindings win over everything below (including Esc, so a
+		// promote-wait can be cancelled without also closing the viewer).
+		if (this.deps.spectate?.onKey?.(data)) return;
+
 		// The hub/observe toggle keys close the whole hub (matches the table view's
 		// toggle semantics), not just this viewer.
 		for (const key of this.deps.hubKeys) {
@@ -521,6 +551,13 @@ export class AgentTranscriptViewer implements Component {
 		this.#editor?.setText("");
 		if (!trimmed) return;
 		this.#notice = undefined;
+		const spectate = this.deps.spectate;
+		if (spectate) {
+			// The steered turn lands via the tail — never touch the transcript here.
+			spectate.onSubmit(trimmed);
+			this.deps.requestRender();
+			return;
+		}
 		const id = this.deps.agentId;
 		if (this.deps.remote) {
 			this.deps.remote.chat(id, trimmed);
@@ -592,6 +629,7 @@ export class AgentTranscriptViewer implements Component {
 	}
 
 	#headerLines(status: AgentStatus | undefined, kind: string | undefined, parentId: string | undefined): string[] {
+		if (this.deps.spectate) return this.deps.spectate.header();
 		const lines = [theme.fg("accent", `Agent Hub ${theme.sep.dot} ${this.deps.agentId}`)];
 		if (status && kind) {
 			const kindTag = theme.fg("dim", ` ${parentId ? `${kind} ${theme.sep.dot} of ${parentId}` : kind}`);
@@ -605,9 +643,11 @@ export class AgentTranscriptViewer implements Component {
 		const lines: string[] = [];
 		const statsLine = this.#statsLine();
 		if (statsLine) lines.push(` ${statsLine}`);
-		const hint = this.#editor
-			? `Enter:send  Esc:close  ${this.deps.expandKeys[0] ?? "ctrl+o"}:expand  empty input → j/k:scroll  g/G:top/bottom`
-			: `Esc:close  ${this.deps.expandKeys[0] ?? "ctrl+o"}:expand  j/k:scroll  g/G:top/bottom`;
+		const hint =
+			this.deps.spectate?.hint ??
+			(this.#editor
+				? `Enter:send  Esc:close  ${this.deps.expandKeys[0] ?? "ctrl+o"}:expand  empty input → j/k:scroll  g/G:top/bottom`
+				: `Esc:close  ${this.deps.expandKeys[0] ?? "ctrl+o"}:expand  j/k:scroll  g/G:top/bottom`);
 		lines.push(` ${theme.fg("dim", hint)}`);
 		return lines;
 	}
@@ -643,6 +683,8 @@ export class AgentTranscriptViewer implements Component {
 			if (this.#remoteUnavailable) return "Transcript lives on the host — not available.";
 			return this.#hasRemoteData ? "No messages yet." : "Loading transcript from host…";
 		}
+		if (this.deps.spectate)
+			return this.#localUnavailable === "missing" ? "Session file is gone." : "No messages yet.";
 		if (!this.deps.registry.get(this.deps.agentId)?.sessionFile) return "No session file available yet.";
 		return "No messages yet.";
 	}

@@ -154,6 +154,55 @@ export function loadConfig(env: Record<string, string | undefined>, home: string
 }
 
 // ============================================================================
+// Session store listing
+// ============================================================================
+
+/** Newest sessions listed per repo. */
+const SESSIONS_PER_REPO = 8;
+const SESSIONS_LIST_TIMEOUT_MS = 10_000;
+
+/** One `omp sessions --json` row, narrowed to the fields the bridge renders. */
+export interface StoreSession {
+	path: string;
+	title?: string;
+	firstMessage?: string;
+	/** ISO mtime; absent when omp could not derive one. */
+	modified?: string;
+}
+
+/** Session-store lister seam — tests inject a fake, production shells out. */
+export type ListSessions = (dir: string) => Promise<StoreSession[]>;
+
+/** Keep well-formed rows only; every rendered field is checked, never cast. */
+function toStoreSession(value: unknown): StoreSession | undefined {
+	if (!isRecord(value) || typeof value.path !== "string") return undefined;
+	return {
+		path: value.path,
+		title: typeof value.title === "string" ? value.title : undefined,
+		firstMessage: typeof value.firstMessage === "string" ? value.firstMessage : undefined,
+		modified: typeof value.modified === "string" ? value.modified : undefined,
+	};
+}
+
+/** Production `ListSessions`: `omp sessions --json --dir <dir>`, killed after 10s. */
+export function spawnSessionLister(ompBin: string): ListSessions {
+	return async (dir) => {
+		const proc = Bun.spawn([ompBin, "sessions", "--json", "--dir", dir], { stdout: "pipe", stderr: "ignore" });
+		const timer = setTimeout(() => proc.kill(), SESSIONS_LIST_TIMEOUT_MS);
+		try {
+			const stdout = await new Response(proc.stdout).text();
+			const code = await proc.exited;
+			if (code !== 0) throw new Error(`omp sessions exited ${code}`);
+			const parsed: unknown = JSON.parse(stdout);
+			if (!Array.isArray(parsed)) throw new Error("omp sessions --json did not return an array");
+			return parsed.map(toStoreSession).filter((s): s is StoreSession => s !== undefined);
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+}
+
+// ============================================================================
 // Bridge
 // ============================================================================
 
@@ -162,13 +211,15 @@ export interface BridgeDeps {
 	slack: SlackTransport;
 	registry: TaskRegistry;
 	createRpc: (opts: OmpRpcOptions) => OmpRpc;
+	/** Session-store lister; defaults to shelling out to `omp sessions --json`. */
+	listSessions?: ListSessions;
 }
 
 const HELP_TEXT = [
 	"*omp slack bridge*",
 	"• `run <alias|path> <prompt…>` — start a new task",
-	"• `sessions` — list known sessions",
-	"• `resume <sessionPath>` — reattach an on-disk session",
+	"• `sessions [alias]` — browse omp sessions (⚡ live·slack, 🔗 attached)",
+	"• `resume <n|sessionPath>` — attach a listed or on-disk session",
 	"• `status` — bridge status",
 	"Reply inside a task thread to steer it, or `abort` / `kill` / `status`.",
 ].join("\n");
@@ -220,6 +271,7 @@ export class Bridge {
 	readonly #slack: SlackTransport;
 	readonly #registry: TaskRegistry;
 	readonly #createRpc: (opts: OmpRpcOptions) => OmpRpc;
+	readonly #listSessions: ListSessions;
 	readonly #live = new Map<string, LiveTask>();
 	readonly #startedAt = Date.now();
 	#reaperTimer: ReturnType<typeof setInterval> | undefined;
@@ -227,12 +279,15 @@ export class Bridge {
 	#shuttingDown = false;
 	/** Cached bot↔user DM channel for top-level notify posts (resolved lazily). */
 	#dmChannel: string | undefined;
+	/** index → session from the last `sessions` listing, consumed by `resume <n>`. */
+	#lastListing = new Map<number, { path: string; cwd: string }>();
 
 	constructor(deps: BridgeDeps) {
 		this.#config = deps.config;
 		this.#slack = deps.slack;
 		this.#registry = deps.registry;
 		this.#createRpc = deps.createRpc;
+		this.#listSessions = deps.listSessions ?? spawnSessionLister(deps.config.ompBin);
 	}
 
 	start(): void {
@@ -378,7 +433,7 @@ export class Bridge {
 		if (command === "run") {
 			await this.#cmdRun(msg, rest);
 		} else if (command === "sessions") {
-			await this.#cmdSessions(msg);
+			await this.#cmdSessions(msg, restTokens[0]);
 		} else if (command === "resume") {
 			await this.#cmdResume(msg, restTokens[0]);
 		} else if (command === "status") {
@@ -444,30 +499,108 @@ export class Bridge {
 		await this.#spawn({ record, isNew: true, prompt, sessionName: name });
 	}
 
-	async #cmdSessions(msg: SlackInboundMessage): Promise<void> {
-		const records = this.#registry.all();
-		if (records.length === 0) {
-			await this.#slack.postMessage({ channel: msg.channel, text: "No sessions yet. `run <alias|path> <prompt…>` to start one." });
+	async #cmdSessions(msg: SlackInboundMessage, alias: string | undefined): Promise<void> {
+		const targets = this.#sessionTargets(alias);
+		if (targets.length === 0) {
+			await this.#slack.postMessage({
+				channel: msg.channel,
+				text: alias
+					? `Unknown repo \`${alias}\`. Use a REPOS alias or an absolute path under \`${this.#home()}\`.`
+					: "No repos configured — set `REPOS` in `.env`.",
+			});
 			return;
 		}
-		const lines = records.map((r) => {
-			const marker = this.#live.has(r.threadTs) ? "⏵ live" : "⏸ idle";
-			return `${marker} · *${r.name}* · \`${r.cwd}\` · ${ageOf(r.lastActivityAt)}`;
-		});
-		await this.#slack.postMessage({
-			channel: msg.channel,
-			text: `*Sessions* (${records.length})\n${lines.join("\n")}\n_reply in a task thread to continue it._`,
-		});
+
+		const listed = await Promise.all(
+			targets.map(async (target) => {
+				try {
+					return { ...target, sessions: await this.#listSessions(target.path) };
+				} catch (err) {
+					return { ...target, error: String(err) };
+				}
+			}),
+		);
+
+		const listing = new Map<number, { path: string; cwd: string }>();
+		const lines: string[] = [];
+		for (const repo of listed) {
+			lines.push(`*${repo.alias}* · \`${repo.path}\``);
+			if ("error" in repo) {
+				lines.push(`  _listing failed: ${repo.error}_`);
+				continue;
+			}
+			// `omp sessions --json` already sorts newest-first.
+			const newest = repo.sessions.slice(0, SESSIONS_PER_REPO);
+			if (newest.length === 0) lines.push("  _no sessions_");
+			for (const session of newest) {
+				const index = listing.size + 1;
+				listing.set(index, { path: session.path, cwd: repo.path });
+				lines.push(`${index}. ${this.#sessionBadges(session.path)}${sessionLine(session)}`);
+			}
+		}
+		this.#lastListing = listing;
+		await this.#slack.postMessage({ channel: msg.channel, text: `${lines.join("\n")}\n_\`resume <n>\` to attach one._` });
 	}
 
-	async #cmdResume(msg: SlackInboundMessage, sessionPath: string | undefined): Promise<void> {
-		if (!sessionPath) {
-			await this.#slack.postMessage({ channel: msg.channel, text: "Usage: `resume <sessionPath>`" });
+	/** Repo alias→path pairs to list: the named one, or every configured repo. */
+	#sessionTargets(alias: string | undefined): Array<{ alias: string; path: string }> {
+		if (alias) {
+			const path = this.#resolveDir(alias);
+			return path ? [{ alias, path }] : [];
+		}
+		return Object.entries(this.#config.repos).map(([name, path]) => ({ alias: name, path }));
+	}
+
+	/**
+	 * Liveness/attachment badges for a store session.
+	 * ponytail: tmux liveness unknown from bridge; badge only slack-owned.
+	 */
+	#sessionBadges(sessionPath: string): string {
+		const marks: string[] = [];
+		if (this.#findLiveBySessionPath(sessionPath)) marks.push("⚡ live·slack");
+		if (this.#registry.bySessionPath(sessionPath)) marks.push("🔗");
+		return marks.length > 0 ? `${marks.join(" ")} ` : "";
+	}
+
+	async #cmdResume(msg: SlackInboundMessage, token: string | undefined): Promise<void> {
+		if (!token) {
+			await this.#slack.postMessage({ channel: msg.channel, text: "Usage: `resume <n|sessionPath>`" });
 			return;
 		}
+
+		let sessionPath = token;
+		let listedCwd: string | undefined;
+		if (/^\d+$/.test(token)) {
+			const picked = this.#lastListing.get(Number.parseInt(token, 10));
+			if (!picked) {
+				await this.#slack.postMessage({ channel: msg.channel, text: `No session #${token} in the last listing — run \`sessions\` first.` });
+				return;
+			}
+			const attached = this.#registry.bySessionPath(picked.path);
+			if (attached) {
+				await this.#slack.postMessage({
+					channel: msg.channel,
+					text: `Already attached — continue in its thread: *${attached.name}* (thread \`${attached.threadTs}\`).`,
+				});
+				return;
+			}
+			sessionPath = picked.path;
+			listedCwd = picked.cwd;
+		}
+
+		// A second RPC child would double-attach: bridge-owned children set
+		// OMP_SLACK_BRIDGE=1, so omp's resume park hook self-skips for them.
+		// ponytail: terminal-owned liveness isn't visible from here — the
+		// cross-owner guard lands with the hub-side lock if it ever bites.
+		const live = this.#findLiveBySessionPath(sessionPath);
+		if (live) {
+			await this.#slack.postMessage({ channel: msg.channel, text: `Already live under the bridge — steer it in its thread (*${live.record.name}*).` });
+			return;
+		}
+
 		const existing = this.#registry.bySessionPath(sessionPath);
 		const name = existing?.name ?? `${this.#config.sessionNamePrefix}${basename(sessionPath)}`;
-		const cwd = existing?.cwd ?? this.#home();
+		const cwd = listedCwd ?? existing?.cwd ?? this.#home();
 		const headerTs = await this.#slack.postMessage({
 			channel: msg.channel,
 			text: name,
@@ -1112,6 +1245,13 @@ function ageOf(ts: number): string {
 	const hours = Math.floor(mins / 60);
 	if (hours < 24) return `${hours}h ago`;
 	return `${Math.floor(hours / 24)}d ago`;
+}
+
+/** `<title|first message> · <age>` for one store-session row. */
+function sessionLine(session: StoreSession): string {
+	const label = headOf(session.title ?? session.firstMessage ?? "") || "(untitled)";
+	const modified = session.modified ? Date.parse(session.modified) : Number.NaN;
+	return `${label} · ${Number.isFinite(modified) ? ageOf(modified) : "?"}`;
 }
 
 // ============================================================================

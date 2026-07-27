@@ -24,7 +24,11 @@ export interface BridgeTaskInfo {
 }
 
 /** Requests this client issues (subset of the bridge's ControlRequest union). */
-type ControlRequest = { op: "status" } | { op: "park"; sessionPath: string };
+type ControlRequest =
+	| { op: "status" }
+	| { op: "park"; sessionPath: string }
+	| { op: "steer"; sessionPath: string; text: string }
+	| { op: "interrupt"; sessionPath: string };
 
 /**
  * Untrusted parse of the bridge's ControlResponse union — the wire shape is
@@ -144,4 +148,48 @@ export async function parkBridgeSession(
 		return null;
 	}
 	return typeof res.reason === "string" ? { parked: res.parked, reason: res.reason } : { parked: res.parked };
+}
+
+/**
+ * Collapse an ack-only response (`{ ok: true }`) to a tri-state: `true` when
+ * the bridge accepted the op, `false` when it answered but refused (unknown
+ * session, task already closed), `null` when it is unreachable.
+ */
+function ack(res: ControlResponse | null, op: string, sessionPath: string): boolean | null {
+	if (!res) return null;
+	if (!res.ok) {
+		logger.debug("Slack bridge op refused", { op, sessionPath, error: res.error });
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Deliver `text` to the bridge-owned session at `sessionPath` — steering the
+ * turn in flight, or prompting the task when it is idle. Used by the `--watch`
+ * spectator, whose editor proxies input to the owning process.
+ * @param timeoutMs Give up after this long (default 2000ms — the bridge relays into an RPC child).
+ * @param sockPath Override the control socket (tests / non-default state dirs).
+ */
+export async function steerBridgeSession(
+	sessionPath: string,
+	text: string,
+	timeoutMs = 2000,
+	sockPath = DEFAULT_SOCKET_PATH,
+): Promise<boolean | null> {
+	return ack(await controlRequest({ op: "steer", sessionPath, text }, timeoutMs, sockPath), "steer", sessionPath);
+}
+
+/**
+ * Abort the main turn of the bridge-owned session at `sessionPath`. Subagents
+ * it spawned keep running — that is the bridge's design, not an omission here.
+ * @param timeoutMs Give up after this long (default 2000ms — the bridge relays into an RPC child).
+ * @param sockPath Override the control socket (tests / non-default state dirs).
+ */
+export async function interruptBridgeSession(
+	sessionPath: string,
+	timeoutMs = 2000,
+	sockPath = DEFAULT_SOCKET_PATH,
+): Promise<boolean | null> {
+	return ack(await controlRequest({ op: "interrupt", sessionPath }, timeoutMs, sockPath), "interrupt", sessionPath);
 }

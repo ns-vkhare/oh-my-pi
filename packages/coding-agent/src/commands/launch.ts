@@ -95,6 +95,9 @@ export default class Index extends Command {
 			char: "r",
 			description: "Resume a session (by ID prefix, path, or picker if omitted)",
 		}),
+		watch: Flags.string({
+			description: "Spectate a session another process owns (read-only tail + proxy input)",
+		}),
 		"session-dir": Flags.string({
 			description: "Directory for session storage and lookup",
 		}),

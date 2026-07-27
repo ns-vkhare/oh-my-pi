@@ -77,8 +77,8 @@ DM the bot:
 
 - `run <alias> <prompt>` — start an omp task in the repo mapped to `<alias>` (see `REPOS` in `.env`). Each task gets its own thread. With `DEFAULT_REPO` set, `run <prompt>` alone targets it.
 - Reply **in the task's thread** to steer a running task, or to continue a finished one.
-- `sessions` — list recent bridge sessions.
-- `resume <sessionPath>` — resume a previous session.
+- `sessions [alias]` — browse **every** omp session on disk, newest 8 per configured repo, numbered. Badges: ⚡ `live·slack` (running under the bridge), 🔗 (already has a thread).
+- `resume <n|sessionPath>` — attach a numbered session from the last `sessions` listing, or an explicit session file. Already-attached sessions link back to their thread instead of double-attaching.
 - In a task thread: `abort`, `kill`, `status`.
 - When the agent asks a question, answer with the **buttons** posted in the thread.
 

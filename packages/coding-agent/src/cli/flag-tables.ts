@@ -125,6 +125,9 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--fork": (result, value) => {
 		result.fork = value;
 	},
+	"--watch": (result, value) => {
+		result.watch = value;
+	},
 	"--provider": (result, value) => {
 		result.provider = value;
 	},
