@@ -65,6 +65,7 @@ nomad-cc's "routing is local" principle, extended to tokens.
         "im:history",
         "im:write",
         "users:read",
+        "files:read",
         "files:write"
       ]
     }
@@ -88,10 +89,11 @@ nomad-cc's "routing is local" principle, extended to tokens.
 ## What admins are approving (risk profile)
 
 - **Scopes are DM-only.** `chat:write`, `im:history`, `im:write`, `users:read`,
-  `files:write`. No channel read scopes, no `channels:history`, no admin
-  scopes. The bot cannot see any conversation except direct messages sent to
-  it. `files:write` exists so long agent outputs upload as snippets into the
-  bot DM thread.
+  `files:read`, `files:write`. No channel read scopes, no `channels:history`,
+  no admin scopes. The bot cannot see any conversation except direct messages
+  sent to it. `files:read`/`files:write` cover files in those DMs only: reading
+  an attachment the user sent the bot, and uploading long agent outputs back as
+  snippets into the bot DM thread.
 - **Only `message.im` events.** The app is deaf to channels, mentions, and
   every other workspace surface.
 - **No hosting, no data egress path.** Socket Mode = outbound WebSocket from

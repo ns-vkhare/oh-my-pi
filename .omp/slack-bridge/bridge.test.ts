@@ -23,6 +23,8 @@ import type {
 	OmpUiResponse,
 	SlackBlock,
 	SlackBlockAction,
+	SlackFileRef,
+	SlackHistoryEntry,
 	SlackInbound,
 	SlackInboundMessage,
 	SlackPostArgs,
@@ -50,6 +52,12 @@ class FakeSlack implements SlackTransport {
 	readonly posted: PostedMessage[] = [];
 	readonly updated: UpdatedMessage[] = [];
 	readonly uploads: Array<{ threadTs: string; content: string }> = [];
+	/** channel → history rows the catch-up sweep will see (newest first). */
+	readonly history = new Map<string, SlackHistoryEntry[]>();
+	/** downloadUrl → bytes. Unknown urls throw, like a missing files:read scope. */
+	readonly downloads = new Map<string, Uint8Array>();
+	connected = true;
+	reconnects = 0;
 	#listeners = new Set<(inbound: SlackInbound) => void>();
 	#counter = 0;
 
@@ -77,6 +85,21 @@ class FakeSlack implements SlackTransport {
 
 	async openDm(userId: string): Promise<string> {
 		return `D-${userId}`;
+	}
+
+	async fetchHistory(args: { channel: string; oldestTs: string; limit?: number }): Promise<SlackHistoryEntry[]> {
+		const rows = this.history.get(args.channel) ?? [];
+		return rows.filter((entry) => Number(entry.message.ts) > Number(args.oldestTs));
+	}
+
+	async downloadFile(url: string): Promise<Uint8Array> {
+		const bytes = this.downloads.get(url);
+		if (!bytes) throw new Error("sign-in page — the bot token lacks the files:read scope");
+		return bytes;
+	}
+
+	reconnect(): void {
+		this.reconnects++;
 	}
 
 	/** Inject an inbound and let the async handler chain settle. */
@@ -208,6 +231,8 @@ function makeConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
 		maxTasks: 4,
 		idleTtlMin: 30,
 		sessionNamePrefix: "slack:",
+		// Off by default: only the catch-up tests want a sweep on start().
+		catchupWindowMin: 0,
 		stateDir: `${HOME}/.omp/slack-bridge`,
 		...overrides,
 	};
@@ -239,6 +264,9 @@ async function makeHarness(config: BridgeConfig, seed: TaskRecord[] = [], listSe
 	};
 	const bridge = new Bridge({ config, slack, registry, createRpc, listSessions });
 	bridge.start();
+	// start() kicks a catch-up sweep; drain it so a test's own sweep is not
+	// swallowed by the overlap guard.
+	await settle();
 	liveHarnesses.push(bridge);
 	return { slack, registry, bridge, rpcs };
 }
@@ -328,6 +356,150 @@ describe("run command", () => {
 		await h.slack.inject(msg);
 		expect(h.slack.posted).toHaveLength(1);
 		expect(h.slack.posted[0]!.args.threadTs).toBe(msg.ts);
+	});
+});
+
+/**
+ * Socket Mode drops whatever arrives while the connection is down — or while it
+ * is a zombie the OS never closed. These cover the recovery path: what gets
+ * replayed, what must never be replayed twice, and what the sweep infers about
+ * a socket that reported itself connected while missing DMs.
+ */
+describe("catch-up", () => {
+	const CHANNEL = "D-UALICE";
+
+	/** A Slack ts `secondsAgo` in the past — the sweep filters on the wall clock. */
+	function agoTs(secondsAgo: number): string {
+		return (Date.now() / 1000 - secondsAgo).toFixed(6);
+	}
+
+	function entry(over: {
+		ts: string;
+		text?: string;
+		user?: string;
+		replyCount?: number;
+		files?: SlackFileRef[];
+		links?: string[];
+	}): SlackHistoryEntry {
+		const message: SlackInboundMessage = {
+			kind: "message",
+			channel: CHANNEL,
+			user: over.user ?? "UALICE",
+			text: over.text ?? "run omp fix the bug",
+			ts: over.ts,
+		};
+		if (over.files) message.files = over.files;
+		if (over.links) message.links = over.links;
+		return { message, replyCount: over.replyCount ?? 0, replyUsers: [] };
+	}
+
+	async function sweep(h: Harness, rows: SlackHistoryEntry[]): Promise<void> {
+		h.slack.history.set(CHANNEL, rows);
+		await h.bridge.catchUp();
+		await settle();
+	}
+
+	test("a DM the socket never delivered is replayed as a command", async () => {
+		const h = await makeHarness(makeConfig({ catchupWindowMin: 60 }));
+		const ts = agoTs(30);
+		await sweep(h, [entry({ ts })]);
+
+		expect(h.rpcs).toHaveLength(1);
+		expect(h.rpcs[0]!.opts.cwd).toBe(`${HOME}/oh-my-pi-src`);
+		expect(h.rpcs[0]!.prompts[0]).toBe("fix the bug");
+		expect(h.slack.posted[0]!.args.threadTs).toBe(ts);
+	});
+
+	test("a DM already answered in its thread is left alone", async () => {
+		const h = await makeHarness(makeConfig({ catchupWindowMin: 60 }));
+		await sweep(h, [entry({ ts: agoTs(30), replyCount: 2 })]);
+
+		expect(h.rpcs).toHaveLength(0);
+		expect(h.slack.reconnects).toBe(0);
+	});
+
+	test("a second sweep does not replay what the first one took", async () => {
+		const h = await makeHarness(makeConfig({ catchupWindowMin: 60 }));
+		const rows = [entry({ ts: agoTs(30) })];
+		await sweep(h, rows);
+		await sweep(h, rows);
+
+		expect(h.rpcs).toHaveLength(1);
+	});
+
+	test("a message the live socket already routed is not replayed", async () => {
+		const h = await makeHarness(makeConfig({ catchupWindowMin: 60 }));
+		const ts = agoTs(5);
+		await h.slack.inject({ kind: "message", channel: CHANNEL, user: "UALICE", text: "run omp fix the bug", ts });
+		expect(h.rpcs).toHaveLength(1);
+
+		// The header reply has not landed in history yet, so the row still looks
+		// unanswered — the ts dedup is what must stop the second spawn.
+		await sweep(h, [entry({ ts })]);
+		expect(h.rpcs).toHaveLength(1);
+	});
+
+	test("DMs older than the window are never replayed", async () => {
+		const h = await makeHarness(makeConfig({ catchupWindowMin: 60 }));
+		await sweep(h, [entry({ ts: agoTs(4 * 3600) })]);
+
+		expect(h.rpcs).toHaveLength(0);
+	});
+
+	test("catchupWindowMin=0 disables the sweep", async () => {
+		const h = await makeHarness(makeConfig({ catchupWindowMin: 0 }));
+		await sweep(h, [entry({ ts: agoTs(30) })]);
+
+		expect(h.rpcs).toHaveLength(0);
+	});
+
+	test("missing a DM while the socket reports connected forces a reconnect", async () => {
+		const h = await makeHarness(makeConfig({ catchupWindowMin: 60 }));
+		h.slack.connected = true;
+		await sweep(h, [entry({ ts: agoTs(30) })]);
+
+		expect(h.slack.reconnects).toBe(1);
+		expect(h.rpcs).toHaveLength(1);
+	});
+
+	test("an attached file is downloaded and the agent gets its local path", async () => {
+		const h = await makeHarness(makeConfig({ catchupWindowMin: 60 }));
+		const url = "https://files.slack.test/F1";
+		h.slack.downloads.set(url, new TextEncoder().encode("%PDF-1.7 resume"));
+		await sweep(h, [
+			entry({
+				ts: agoTs(30),
+				text: "run omp summarize the resume",
+				files: [{ id: "F1", name: "vivek resume.pdf", mimetype: "application/pdf", size: 15, downloadUrl: url }],
+				links: ["https://docs.google.com/document/d/abc/edit"],
+			}),
+		]);
+
+		const prompt = h.rpcs[0]!.prompts[0] ?? "";
+		const local = prompt.match(/^- (\/.+\.pdf) \(application\/pdf/m)?.[1];
+		expect(local).toBeDefined();
+		expect(await Bun.file(local!).text()).toBe("%PDF-1.7 resume");
+		expect(prompt).toContain("https://docs.google.com/document/d/abc/edit");
+		expect(prompt.startsWith("summarize the resume")).toBe(true);
+	});
+
+	test("an unfetchable attachment is named in the prompt with the reason", async () => {
+		const h = await makeHarness(makeConfig({ catchupWindowMin: 60 }));
+		await sweep(h, [
+			entry({
+				ts: agoTs(30),
+				text: "run omp read these",
+				files: [
+					{ id: "F1", name: "gone.pdf", mimetype: "application/pdf", size: 10, downloadUrl: "https://files.slack.test/missing" },
+					{ id: "F2", name: "loop.docx", mimetype: "application/vnd.doc", size: 0, permalink: "https://slack.test/F2" },
+				],
+			}),
+		]);
+
+		const prompt = h.rpcs[0]!.prompts[0] ?? "";
+		expect(prompt).toContain("gone.pdf — download failed");
+		expect(prompt).toContain("files:read");
+		expect(prompt).toContain("loop.docx — hosted outside Slack");
 	});
 });
 
@@ -638,6 +810,16 @@ describe("TaskRegistry", () => {
 		const reloaded = await TaskRegistry.load(dir);
 		expect(reloaded.byThread("t1")).toEqual(rec);
 		expect(reloaded.bySessionPath("/s/one.jsonl")?.name).toBe("task one");
+	});
+
+	test("catch-up watermarks survive a reload, so a restart cannot replay old DMs", async () => {
+		const reg = await TaskRegistry.load(dir);
+		reg.setCatchupTs("D1", "1785151799.503259");
+		await reg.flush();
+
+		const reloaded = await TaskRegistry.load(dir);
+		expect(reloaded.catchupTs("D1")).toBe("1785151799.503259");
+		expect(reloaded.catchupTs("D2")).toBeUndefined();
 	});
 });
 

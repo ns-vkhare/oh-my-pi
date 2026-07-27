@@ -123,6 +123,31 @@ you   (reply in thread) also cover the --dir flag in the test
 bot   ➕ steering delivered — agent will pick it up between tool calls
 ```
 
+### Example: send a file along
+
+```
+you   run omp summarize this resume against the JD  📎 vivek.pdf
+bot   └ ▶ slack:summarize this resume against the JD
+bot     (the agent gets a local copy of vivek.pdf and reads it)
+```
+
+Attachments are downloaded with the bot token into `$TMPDIR/omp-slack-attachments/`
+and their paths appended to the prompt. Files hosted outside Slack (Google Drive,
+Box) cannot be fetched by the bot — they are passed through as links, named so the
+agent knows what it could not read. This needs the `files:read` bot scope: if you
+created the app before that scope existed, re-paste `manifest.json` under
+*App Manifest* and reinstall the app.
+
+### Missed messages
+
+Slack keeps no backlog for Socket Mode apps, so a DM sent while the bridge is
+down — or while its socket is silently dead — is never delivered. The bridge
+re-reads recent DM history on startup and every 2 minutes and runs anything it
+never answered (window: `CATCHUP_WINDOW_MIN`, default 60 minutes; each message
+is answered at most once). Replies typed *inside a task thread* during an outage
+are not recoverable — Slack keeps thread replies out of channel history — so
+retype those.
+
 ### Example: long output
 
 Final answers over ~3k chars arrive as a rendered `response.md` snippet in the

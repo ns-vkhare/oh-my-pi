@@ -14,22 +14,27 @@ const SAVE_DEBOUNCE_MS = 250;
 export class TaskRegistry {
 	readonly #path: string;
 	readonly #tasks = new Map<string, TaskRecord>();
+	/** channel → newest message ts the catch-up sweep has already considered. */
+	readonly #catchup = new Map<string, string>();
 	#saveTimer: ReturnType<typeof setTimeout> | undefined;
 	#saving: Promise<void> | undefined;
 
-	private constructor(path: string, records: TaskRecord[]) {
+	private constructor(path: string, data: RegistryData) {
 		this.#path = path;
-		for (const record of records) this.#tasks.set(record.threadTs, record);
+		for (const record of data.tasks) this.#tasks.set(record.threadTs, record);
+		for (const [channel, ts] of Object.entries(data.catchup ?? {})) {
+			if (typeof ts === "string") this.#catchup.set(channel, ts);
+		}
 	}
 
 	static async load(stateDir: string): Promise<TaskRegistry> {
 		const path = `${stateDir}/state.json`;
 		const file = Bun.file(path);
-		if (!(await file.exists())) return new TaskRegistry(path, []);
+		if (!(await file.exists())) return new TaskRegistry(path, { tasks: [] });
 		try {
 			const parsed = JSON.parse(await file.text()) as RegistryData;
 			const tasks = Array.isArray(parsed?.tasks) ? parsed.tasks : [];
-			return new TaskRegistry(path, tasks);
+			return new TaskRegistry(path, { tasks, catchup: parsed?.catchup });
 		} catch (err) {
 			const backup = `${path}.bak`;
 			console.error(`registry: corrupt state file at ${path} (${String(err)}); renaming to ${backup}`);
@@ -38,8 +43,19 @@ export class TaskRegistry {
 			} catch (backupErr) {
 				console.error(`registry: failed to back up corrupt state file: ${String(backupErr)}`);
 			}
-			return new TaskRegistry(path, []);
+			return new TaskRegistry(path, { tasks: [] });
 		}
+	}
+
+	/** Newest message ts already considered by the catch-up sweep for `channel`. */
+	catchupTs(channel: string): string | undefined {
+		return this.#catchup.get(channel);
+	}
+
+	setCatchupTs(channel: string, ts: string): void {
+		if (this.#catchup.get(channel) === ts) return;
+		this.#catchup.set(channel, ts);
+		this.#scheduleSave();
 	}
 
 	upsert(record: TaskRecord): void {
@@ -90,7 +106,7 @@ export class TaskRegistry {
 	async #save(): Promise<void> {
 		// Serialize concurrent saves so a debounced write can't race flush().
 		while (this.#saving) await this.#saving;
-		const data: RegistryData = { tasks: [...this.#tasks.values()] };
+		const data: RegistryData = { tasks: [...this.#tasks.values()], catchup: Object.fromEntries(this.#catchup) };
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#saving = promise;
 		try {

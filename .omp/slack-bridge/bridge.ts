@@ -7,6 +7,7 @@
  * reaps idle processes (hub parity). Run with `bun bridge.ts`.
  */
 
+import * as os from "node:os";
 import {
 	answeredBlocks,
 	askAnsweredBlocks,
@@ -20,7 +21,7 @@ import {
 } from "./blocks";
 import { BridgeAlreadyRunningError, type ControlHost, startControlServer } from "./control";
 import { createOmpRpc } from "./omp-rpc";
-import { createSlackTransport } from "./slack";
+import { createSlackTransport, LruSet } from "./slack";
 import { TaskRegistry } from "./registry";
 import type {
 	AskToolArgs,
@@ -48,6 +49,15 @@ const FINAL_INLINE_MAX = 2_900;
 const MINUTE_MS = 60_000;
 /** Park's subagent-count probe deadline; a slow/failed probe fails the park CLOSED. */
 const PARK_SUBAGENT_TIMEOUT_MS = 3_000;
+/**
+ * Catch-up cadence — the ceiling on how late a DM can land when Socket Mode
+ * silently stops delivering (see #catchUp).
+ */
+const CATCHUP_INTERVAL_MS = 120_000;
+/** Per-file ceiling for attachments materialized to disk. */
+const ATTACHMENT_MAX_BYTES = 32 * 1024 * 1024;
+/** Remembered inbound message ts values (live + replayed), for dedup. */
+const SEEN_MESSAGE_CAP = 500;
 
 /** A UI request awaiting a Slack answer, plus the message showing it. */
 interface PendingUi {
@@ -150,6 +160,7 @@ export function loadConfig(env: Record<string, string | undefined>, home: string
 
 	const maxTasksRaw = Number.parseInt(env.MAX_TASKS ?? "", 10);
 	const idleTtlRaw = Number.parseInt(env.IDLE_TTL_MIN ?? "", 10);
+	const catchupRaw = Number.parseInt(env.CATCHUP_WINDOW_MIN ?? "", 10);
 
 	return {
 		slackAppToken,
@@ -161,6 +172,7 @@ export function loadConfig(env: Record<string, string | undefined>, home: string
 		maxTasks: Number.isFinite(maxTasksRaw) && maxTasksRaw > 0 ? maxTasksRaw : 4,
 		idleTtlMin: Number.isFinite(idleTtlRaw) && idleTtlRaw > 0 ? idleTtlRaw : 30,
 		sessionNamePrefix: env.SESSION_NAME_PREFIX ?? "slack:",
+		catchupWindowMin: Number.isFinite(catchupRaw) && catchupRaw >= 0 ? catchupRaw : 60,
 		stateDir: `${home}/.omp/slack-bridge`,
 	};
 }
@@ -287,6 +299,11 @@ export class Bridge {
 	readonly #live = new Map<string, LiveTask>();
 	readonly #startedAt = Date.now();
 	#reaperTimer: ReturnType<typeof setInterval> | undefined;
+	#catchupTimer: ReturnType<typeof setInterval> | undefined;
+	/** Guards against overlapping catch-up sweeps (a replay can outlive the interval). */
+	#catchupRunning = false;
+	/** ts of every message already routed, live or replayed — the two paths must not both act. */
+	readonly #seenMessages = new LruSet(SEEN_MESSAGE_CAP);
 	#unsubscribeInbound: (() => void) | undefined;
 	#shuttingDown = false;
 	/** Cached bot↔user DM channel for top-level notify posts (resolved lazily). */
@@ -309,6 +326,8 @@ export class Bridge {
 			});
 		});
 		this.#reaperTimer = setInterval(() => void this.#reap(), REAPER_INTERVAL_MS);
+		this.#catchupTimer = setInterval(() => void this.catchUp(), CATCHUP_INTERVAL_MS);
+		void this.catchUp();
 	}
 
 	async shutdown(): Promise<void> {
@@ -316,6 +335,8 @@ export class Bridge {
 		this.#shuttingDown = true;
 		clearInterval(this.#reaperTimer);
 		this.#reaperTimer = undefined;
+		clearInterval(this.#catchupTimer);
+		this.#catchupTimer = undefined;
 		this.#unsubscribeInbound?.();
 		await Promise.all([...this.#live.values()].map((task) => task.rpc.stop().catch(() => {})));
 		await this.#registry.flush();
@@ -443,11 +464,121 @@ export class Bridge {
 			await this.#handleAction(inbound);
 			return;
 		}
+		// The live socket and the catch-up sweep can both surface the same message
+		// (a reply that has not landed in history yet still looks unanswered).
+		if (this.#seenMessages.seen(inbound.ts)) return;
 		if (inbound.threadTs) {
 			await this.#handleThreadReply(inbound, inbound.threadTs);
 			return;
 		}
 		await this.#handleTopLevel(inbound);
+	}
+
+	// --- Catch-up -----------------------------------------------------------
+
+	/**
+	 * Replay DMs Socket Mode never delivered.
+	 *
+	 * Socket Mode has no backlog. Anything sent while the bridge is down — or
+	 * while its socket is a zombie the OS never closed, which is what a proxy
+	 * that drops idle TLS leaves behind — is gone for good. So the bridge also
+	 * *asks*: on startup and every {@link CATCHUP_INTERVAL_MS}, it reads recent
+	 * DM history and routes anything it has not already answered.
+	 *
+	 * Unanswered means: no thread replies, no task record keyed on its ts, and
+	 * not already routed this process. The per-channel watermark keeps the sweep
+	 * monotonic across restarts; `catchupWindowMin` bounds how far a cold start
+	 * (empty watermark) reaches back.
+	 */
+	async catchUp(): Promise<void> {
+		if (this.#config.catchupWindowMin <= 0 || this.#catchupRunning || this.#shuttingDown) return;
+		this.#catchupRunning = true;
+		try {
+			for (const user of this.#config.allowedUsers) {
+				await this.#catchUpUser(user);
+			}
+		} catch (err) {
+			console.error(`bridge: catch-up sweep failed: ${String(err)}`);
+		} finally {
+			this.#catchupRunning = false;
+		}
+	}
+
+	async #catchUpUser(user: string): Promise<void> {
+		const channel = await this.#slack.openDm(user);
+		const floorTs = ((Date.now() - this.#config.catchupWindowMin * MINUTE_MS) / 1000).toFixed(6);
+		const mark = this.#registry.catchupTs(channel);
+		const oldestTs = mark && Number(mark) > Number(floorTs) ? mark : floorTs;
+
+		const entries = await this.#slack.fetchHistory({ channel, oldestTs });
+		if (entries.length === 0) return;
+
+		let newestTs = oldestTs;
+		const missed: SlackInboundMessage[] = [];
+		// history arrives newest-first; replay in the order the user typed.
+		for (const entry of entries.slice().reverse()) {
+			const msg = entry.message;
+			if (Number(msg.ts) > Number(newestTs)) newestTs = msg.ts;
+			if (msg.user !== user) continue;
+			if (msg.threadTs && msg.threadTs !== msg.ts) continue; // thread replies are not in history
+			if (entry.replyCount > 0) continue; // the bridge already answered in-thread
+			if (this.#registry.byThread(msg.ts)) continue; // already spawned a task on it
+			missed.push(msg);
+		}
+		this.#registry.setCatchupTs(channel, newestTs);
+		if (missed.length === 0) return;
+
+		// Messages the socket should have delivered but didn't: it is lying about
+		// being open. Rebuild it before replaying, or the next DM is lost too.
+		if (this.#slack.connected) {
+			console.error(`bridge: socket reported open but missed ${missed.length} DM(s) — forcing reconnect`);
+			this.#slack.reconnect();
+		}
+		for (const msg of missed) {
+			console.log(`bridge: replaying missed DM ${msg.ts}`);
+			await this.#handleInbound(msg).catch((err) => {
+				console.error(`bridge: replay of ${msg.ts} failed: ${String(err)}`);
+			});
+		}
+	}
+
+	/**
+	 * Materialize a message's Slack attachments and describe them for the agent.
+	 *
+	 * Slack files are not reachable by path from a repo checkout, so the only way
+	 * an attachment can inform a run is a local copy plus a line in the prompt.
+	 * Files that cannot be fetched (external hosts, oversized, missing scope) are
+	 * still named — the agent must know something was attached and why it is not
+	 * readable rather than silently answering without it.
+	 */
+	async #attachmentNote(msg: SlackInboundMessage): Promise<string> {
+		const files = msg.files ?? [];
+		const links = msg.links ?? [];
+		if (files.length === 0 && links.length === 0) return "";
+
+		const dir = `${os.tmpdir()}/omp-slack-attachments/${msg.ts}`;
+		const lines: string[] = [];
+		for (const file of files) {
+			if (!file.downloadUrl) {
+				lines.push(`- ${file.name} — hosted outside Slack, no local copy${file.permalink ? ` (${file.permalink})` : ""}`);
+				continue;
+			}
+			if (file.size > ATTACHMENT_MAX_BYTES) {
+				lines.push(`- ${file.name} — skipped, ${file.size} bytes exceeds the ${ATTACHMENT_MAX_BYTES} byte cap`);
+				continue;
+			}
+			try {
+				const bytes = await this.#slack.downloadFile(file.downloadUrl);
+				const path = `${dir}/${safeFilename(file.name)}`;
+				await Bun.write(path, bytes);
+				lines.push(`- ${path} (${file.mimetype}, ${bytes.byteLength} bytes)`);
+			} catch (err) {
+				console.error(`bridge: attachment ${file.name} failed: ${String(err)}`);
+				lines.push(`- ${file.name} — download failed: ${String(err)}`);
+			}
+		}
+		for (const link of links) lines.push(`- ${link} — linked, not downloaded`);
+		return `\n\nAttached in Slack:\n${lines.join("\n")}`;
 	}
 
 	/**
@@ -538,7 +669,7 @@ export class Bridge {
 			lastActivityAt: Date.now(),
 		};
 		this.#registry.upsert(record);
-		await this.#spawn({ record, isNew: true, prompt, sessionName: name });
+		await this.#spawn({ record, isNew: true, prompt: prompt + (await this.#attachmentNote(msg)), sessionName: name });
 	}
 
 	async #cmdSessions(msg: SlackInboundMessage, alias: string | undefined): Promise<void> {
@@ -749,7 +880,8 @@ export class Bridge {
 			await this.#note(task, "parking in progress — reply again once it settles");
 			return;
 		}
-		await task.rpc.prompt(text).catch((err) => this.#note(task!, `prompt failed: ${String(err)}`));
+		const steer = text + (await this.#attachmentNote(msg));
+		await task.rpc.prompt(steer).catch((err) => this.#note(task!, `prompt failed: ${String(err)}`));
 		this.#registry.touch(threadTs);
 	}
 
@@ -1362,6 +1494,12 @@ function headOf(prompt: string): string {
 function basename(path: string): string {
 	const parts = path.split("/");
 	return parts[parts.length - 1] || path;
+}
+
+/** Slack filenames are user-controlled: keep the name readable, keep it one path segment. */
+function safeFilename(name: string): string {
+	const flat = name.replace(/[/\\]/g, "_").replace(/^\.+/, "").trim();
+	return flat || "attachment";
 }
 
 function ageOf(ts: number): string {

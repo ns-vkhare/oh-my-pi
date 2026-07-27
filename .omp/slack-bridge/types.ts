@@ -234,6 +234,19 @@ export interface OmpRpc extends OmpRpcEvents {
 // Slack transport — contract implemented by slack.ts (SlackTransport)
 // ============================================================================
 
+/** A file carried by an inbound message (`files[]` on the Slack event). */
+export interface SlackFileRef {
+	id: string;
+	name: string;
+	mimetype: string;
+	/** Byte size; 0 for externally hosted files. */
+	size: number;
+	/** Token-authenticated download URL. Absent for external (Drive/Box/…) files. */
+	downloadUrl?: string;
+	/** Slack permalink — always usable by a human, never by the bot. */
+	permalink?: string;
+}
+
 /** Inbound DM (message.im event, bot/self messages already filtered out). */
 export interface SlackInboundMessage {
 	kind: "message";
@@ -243,6 +256,19 @@ export interface SlackInboundMessage {
 	ts: string;
 	/** Set when the message is a threaded reply. */
 	threadTs?: string;
+	/** Attached files (uploads and external references), if any. */
+	files?: SlackFileRef[];
+	/** URLs Slack unfurled into `attachments` (Drive docs, links, …), if any. */
+	links?: string[];
+}
+
+/** One `conversations.history` row: the message plus the thread metadata only history exposes. */
+export interface SlackHistoryEntry {
+	message: SlackInboundMessage;
+	/** Replies in this message's thread (0 when it has no thread). */
+	replyCount: number;
+	/** Users who replied in the thread (`reply_users`, capped by Slack at 5). */
+	replyUsers: string[];
 }
 
 /** Inbound block action (button click / select) from an `interactive` envelope. */
@@ -288,6 +314,11 @@ export interface SlackPostArgs {
  * - postMessage returns the new message ts.
  * - uploadText: files.uploadV2 flow (getUploadURLExternal → POST bytes →
  *   completeUploadExternal) attaching a text snippet to the thread.
+ * - A 30s client ping keeps the socket honest: a peer that vanished without a
+ *   FIN (proxy/NAT drop) surfaces as a write error → close → reconnect.
+ *   `connected` reports the live readyState; `reconnect()` forces a new socket.
+ * - fetchHistory/downloadFile exist for the bridge's catch-up sweep and
+ *   attachment materialization; they never dispatch to onInbound.
  */
 export interface SlackTransport {
 	start(): Promise<void>;
@@ -298,6 +329,21 @@ export interface SlackTransport {
 	uploadText(args: { channel: string; threadTs: string; filename: string; content: string }): Promise<void>;
 	/** Open (or fetch) the bot↔user DM channel; returns its channel id. */
 	openDm(userId: string): Promise<string>;
+	/**
+	 * Top-level messages of `channel` newer than `oldestTs`, newest first.
+	 * Thread replies are NOT included (Slack keeps them out of history).
+	 */
+	fetchHistory(args: { channel: string; oldestTs: string; limit?: number }): Promise<SlackHistoryEntry[]>;
+	/**
+	 * GET an authenticated `files.slack.com` URL with the bot token.
+	 * Throws when the token lacks `files:read` (Slack answers 200 + an HTML
+	 * sign-in page rather than an error).
+	 */
+	downloadFile(url: string): Promise<Uint8Array>;
+	/** Tear down the current socket and reconnect (used when it looks stale). */
+	reconnect(): void;
+	/** True while the Socket Mode websocket is OPEN. */
+	readonly connected: boolean;
 	/** Bot's own user id (available after start()). */
 	readonly botUserId: string;
 }
@@ -323,6 +369,11 @@ export interface TaskRecord {
 
 export interface RegistryData {
 	tasks: TaskRecord[];
+	/**
+	 * channel → ts of the newest message the catch-up sweep has already
+	 * considered. Monotonic: a message is never replayed twice across restarts.
+	 */
+	catchup?: Record<string, string>;
 }
 
 // ============================================================================
@@ -387,6 +438,11 @@ export interface BridgeConfig {
 	maxTasks: number;
 	idleTtlMin: number;
 	sessionNamePrefix: string;
+	/**
+	 * How far back the catch-up sweep may reach for DMs missed while the socket
+	 * was down (minutes). 0 disables catch-up entirely.
+	 */
+	catchupWindowMin: number;
 	/** State/registry directory (default ~/.omp/slack-bridge). */
 	stateDir: string;
 }

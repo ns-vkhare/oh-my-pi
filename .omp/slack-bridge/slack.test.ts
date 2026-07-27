@@ -237,6 +237,49 @@ test("bot-authored and subtype messages are ignored", async () => {
 	await t.stop();
 });
 
+test("a file_share DM dispatches with normalized file refs and unfurled links", async () => {
+	const t = createSlackTransport({ appToken: "xapp-1", botToken: "xoxb-1", apiBaseUrl: mock.baseUrl });
+	const received: SlackInbound[] = [];
+	t.onInbound((i) => received.push(i));
+	await t.start();
+	await mock.waitForSocket();
+
+	mock.pushEnvelope({
+		type: "events_api",
+		envelope_id: "env-file",
+		payload: {
+			event_id: "EvFile",
+			event: {
+				type: "message",
+				subtype: "file_share",
+				channel_type: "im",
+				channel: "D1",
+				user: "UALICE",
+				text: "run omp read this",
+				ts: "4.0",
+				files: [
+					{ id: "F1", name: "resume.pdf", mimetype: "application/pdf", size: 42, url_private_download: "https://files.slack.test/F1", permalink: "https://slack.test/F1" },
+					{ id: "F2", name: "loop.docx", mimetype: "application/vnd.doc", size: 0, is_external: true, url_private: "https://drive.test/F2", permalink: "https://slack.test/F2" },
+				],
+				attachments: [{ from_url: "https://docs.google.com/document/d/abc/edit" }],
+			},
+		},
+	});
+
+	await waitUntil(() => received.length > 0);
+	const msg = received[0];
+	expect(msg?.kind).toBe("message");
+	if (msg?.kind !== "message") throw new Error("expected a message");
+	expect(msg.text).toBe("run omp read this");
+	expect(msg.files).toEqual([
+		{ id: "F1", name: "resume.pdf", mimetype: "application/pdf", size: 42, downloadUrl: "https://files.slack.test/F1", permalink: "https://slack.test/F1" },
+		// Externally hosted: no downloadUrl, because the bot token cannot fetch it.
+		{ id: "F2", name: "loop.docx", mimetype: "application/vnd.doc", size: 0, permalink: "https://slack.test/F2" },
+	]);
+	expect(msg.links).toEqual(["https://docs.google.com/document/d/abc/edit"]);
+	await t.stop();
+});
+
 test("block_actions envelope normalizes to a SlackBlockAction", async () => {
 	const t = createSlackTransport({ appToken: "xapp-1", botToken: "xoxb-1", apiBaseUrl: mock.baseUrl });
 	const received: SlackInbound[] = [];

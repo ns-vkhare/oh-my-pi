@@ -4,13 +4,15 @@
  * Zero omp knowledge. Implements the SlackTransport contract from ./types:
  * opens a Socket Mode WebSocket via apps.connections.open, acks every envelope
  * immediately, dedups retried event deliveries, normalizes message.im events
- * and block actions, and reconnects with capped exponential backoff until
- * stop().
+ * and block actions, pings every 30s so a silently dropped peer surfaces as a
+ * close, and reconnects with capped exponential backoff until stop().
  */
 
 import type {
 	SlackBlock,
 	SlackBlockAction,
+	SlackFileRef,
+	SlackHistoryEntry,
 	SlackInbound,
 	SlackInboundMessage,
 	SlackPostArgs,
@@ -22,6 +24,14 @@ const DEFAULT_API_BASE_URL = "https://slack.com/api";
 const DEDUP_CAP = 500;
 const BACKOFF_MAX_MS = 30_000;
 const BACKOFF_BASE_MS = 1_000;
+/**
+ * Client ping cadence. A proxy/NAT that drops the connection without a FIN
+ * leaves a socket that looks OPEN forever and delivers nothing; writing to it
+ * draws the RST that fires `close`, which is what triggers the reconnect.
+ */
+const PING_INTERVAL_MS = 30_000;
+/** Subtypes that still carry a real user message; everything else is chatter. */
+const ACCEPTED_SUBTYPES: Record<string, true> = { file_share: true, thread_broadcast: true };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
@@ -34,7 +44,7 @@ export interface SlackTransportOptions {
 }
 
 /** Bounded insertion-ordered set — drops the oldest key once past `cap`. */
-class LruSet {
+export class LruSet {
 	readonly #cap: number;
 	readonly #set = new Set<string>();
 
@@ -54,6 +64,66 @@ class LruSet {
 	}
 }
 
+/**
+ * A Slack message object — live `message.im` event or `conversations.history`
+ * row, they share a shape — normalized to the bridge's inbound message, or
+ * null when it is not a user message the bridge should act on.
+ *
+ * Attachments are the reason subtypes are not a blanket reject: depending on
+ * the posting client, a DM carrying files arrives either as a plain message
+ * with `files[]` or under the `file_share` subtype.
+ */
+export function normalizeMessage(raw: Record<string, unknown>, botUserId: string): SlackInboundMessage | null {
+	if (raw.type !== "message") return null;
+	if (raw.subtype !== undefined && ACCEPTED_SUBTYPES[String(raw.subtype)] !== true) return null;
+	if (raw.bot_id !== undefined) return null;
+	const user = typeof raw.user === "string" ? raw.user : "";
+	if (!user || user === botUserId) return null;
+
+	const msg: SlackInboundMessage = {
+		kind: "message",
+		channel: String(raw.channel ?? ""),
+		user,
+		text: typeof raw.text === "string" ? raw.text : "",
+		ts: String(raw.ts ?? ""),
+	};
+	if (typeof raw.thread_ts === "string") msg.threadTs = raw.thread_ts;
+
+	const files: SlackFileRef[] = [];
+	if (Array.isArray(raw.files)) {
+		for (const item of raw.files) {
+			if (!isRecord(item)) continue;
+			const file: SlackFileRef = {
+				id: String(item.id ?? ""),
+				name: String(item.name ?? item.title ?? "file"),
+				mimetype: String(item.mimetype ?? "application/octet-stream"),
+				size: typeof item.size === "number" ? item.size : 0,
+			};
+			// Externally hosted files (Drive, Box…) have a url_private pointing at
+			// the provider — useless to the bot token, so they get no downloadUrl.
+			if (item.is_external !== true) {
+				const url = item.url_private_download ?? item.url_private;
+				if (typeof url === "string") file.downloadUrl = url;
+			}
+			if (typeof item.permalink === "string") file.permalink = item.permalink;
+			files.push(file);
+		}
+	}
+	if (files.length > 0) msg.files = files;
+
+	const links: string[] = [];
+	if (Array.isArray(raw.attachments)) {
+		for (const item of raw.attachments) {
+			if (!isRecord(item)) continue;
+			const url = item.from_url ?? item.original_url ?? item.title_link;
+			if (typeof url === "string" && !links.includes(url)) links.push(url);
+		}
+	}
+	if (links.length > 0) msg.links = links;
+
+	return msg;
+}
+
 export function createSlackTransport(options: SlackTransportOptions): SlackTransport {
 	return new SlackTransportImpl(options);
 }
@@ -70,6 +140,7 @@ class SlackTransportImpl implements SlackTransport {
 	#ws: WebSocket | null = null;
 	#stopped = false;
 	#reconnectAttempts = 0;
+	#pingTimer: Timer | undefined;
 
 	constructor(options: SlackTransportOptions) {
 		this.#appToken = options.appToken;
@@ -81,6 +152,10 @@ class SlackTransportImpl implements SlackTransport {
 		return this.#botUserId;
 	}
 
+	get connected(): boolean {
+		return this.#ws?.readyState === WebSocket.OPEN;
+	}
+
 	async start(): Promise<void> {
 		this.#stopped = false;
 		const auth = await this.#api("auth.test", {}, "bot");
@@ -90,6 +165,7 @@ class SlackTransportImpl implements SlackTransport {
 
 	async stop(): Promise<void> {
 		this.#stopped = true;
+		this.#stopPing();
 		const ws = this.#ws;
 		this.#ws = null;
 		if (ws) {
@@ -99,6 +175,26 @@ class SlackTransportImpl implements SlackTransport {
 				// already closing/closed — nothing to do
 			}
 		}
+	}
+
+	/**
+	 * Drop the current socket; its `close` handler schedules the reconnect.
+	 * Backoff is reset first — this is a deliberate refresh, not a failure.
+	 */
+	reconnect(): void {
+		if (this.#stopped) return;
+		const ws = this.#ws;
+		this.#ws = null;
+		this.#stopPing();
+		this.#reconnectAttempts = 0;
+		if (ws) {
+			try {
+				ws.close();
+			} catch {
+				// already gone — fall through to the immediate reconnect
+			}
+		}
+		this.#scheduleReconnect();
 	}
 
 	onInbound(listener: (inbound: SlackInbound) => void): () => void {
@@ -160,6 +256,37 @@ class SlackTransportImpl implements SlackTransport {
 		throw new Error("slack conversations.open: missing channel id");
 	}
 
+	async fetchHistory(args: { channel: string; oldestTs: string; limit?: number }): Promise<SlackHistoryEntry[]> {
+		const json = await this.#apiForm(
+			"conversations.history",
+			{ channel: args.channel, oldest: args.oldestTs, limit: String(args.limit ?? 50) },
+			"bot",
+		);
+		const rows = Array.isArray(json.messages) ? json.messages : [];
+		const out: SlackHistoryEntry[] = [];
+		for (const row of rows) {
+			if (!isRecord(row)) continue;
+			// history rows carry no channel_type; the caller asked for this channel.
+			const message = normalizeMessage({ ...row, channel: args.channel }, this.#botUserId);
+			if (!message) continue;
+			const replyUsers = Array.isArray(row.reply_users) ? row.reply_users.filter((u): u is string => typeof u === "string") : [];
+			out.push({ message, replyCount: typeof row.reply_count === "number" ? row.reply_count : 0, replyUsers });
+		}
+		return out;
+	}
+
+	async downloadFile(url: string): Promise<Uint8Array> {
+		const res = await fetch(url, { headers: { Authorization: `Bearer ${this.#botToken}` }, redirect: "follow" });
+		if (!res.ok) throw new Error(`slack file download: HTTP ${res.status}`);
+		// Missing `files:read` is not an error response — Slack serves the HTML
+		// sign-in page with a 200. Any HTML body here means "not authorized".
+		if ((res.headers.get("content-type") ?? "").startsWith("text/html")) {
+			await res.text();
+			throw new Error("slack file download: got a sign-in page — the bot token lacks the files:read scope");
+		}
+		return new Uint8Array(await res.arrayBuffer());
+	}
+
 	// ------------------------------------------------------------------------
 	// Web API
 	// ------------------------------------------------------------------------
@@ -216,6 +343,7 @@ class SlackTransportImpl implements SlackTransport {
 		let settled = false;
 
 		ws.addEventListener("open", () => {
+			this.#startPing(ws);
 			// Resolve start()/reconnect on socket open. Slack sends a `hello`
 			// frame immediately after; we reset backoff when that arrives.
 			if (!settled) {
@@ -236,11 +364,31 @@ class SlackTransportImpl implements SlackTransport {
 		});
 
 		ws.addEventListener("close", () => {
-			if (this.#ws === ws) this.#ws = null;
+			if (this.#ws !== ws) return; // superseded socket — its successor owns the state
+			this.#ws = null;
+			this.#stopPing();
 			this.#scheduleReconnect();
 		});
 
 		return promise;
+	}
+
+	#startPing(ws: WebSocket): void {
+		this.#stopPing();
+		this.#pingTimer = setInterval(() => {
+			if (this.#ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+			try {
+				ws.ping();
+			} catch {
+				// write failed — the socket is gone; close fires the reconnect
+			}
+		}, PING_INTERVAL_MS);
+	}
+
+	#stopPing(): void {
+		if (this.#pingTimer === undefined) return;
+		clearInterval(this.#pingTimer);
+		this.#pingTimer = undefined;
 	}
 
 	#scheduleReconnect(): void {
@@ -280,6 +428,7 @@ class SlackTransportImpl implements SlackTransport {
 			// Slack asks us to reconnect (refresh, too many connections…).
 			const ws = this.#ws;
 			this.#ws = null;
+			this.#stopPing();
 			if (ws) {
 				try {
 					ws.close();
@@ -313,21 +462,9 @@ class SlackTransportImpl implements SlackTransport {
 			return; // retried delivery
 		}
 		const event = (payload.event ?? {}) as Record<string, unknown>;
-		if (event.type !== "message" || event.channel_type !== "im") return;
-		if (event.subtype !== undefined) return; // bot_message, message_changed, …
-		if (event.bot_id !== undefined) return;
-		if (event.user === this.#botUserId) return;
-
-		const msg: SlackInboundMessage = {
-			kind: "message",
-			channel: String(event.channel ?? ""),
-			user: String(event.user ?? ""),
-			text: typeof event.text === "string" ? event.text : "",
-			ts: String(event.ts ?? ""),
-		};
-		const threadTs = event.thread_ts;
-		if (typeof threadTs === "string") msg.threadTs = threadTs;
-		this.#dispatch(msg);
+		if (event.channel_type !== "im") return;
+		const msg = normalizeMessage(event, this.#botUserId);
+		if (msg) this.#dispatch(msg);
 	}
 
 	#handleInteractive(payload: Record<string, unknown>): void {

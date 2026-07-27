@@ -56,9 +56,47 @@ Runtime: **Bun only, zero npm dependencies.** `fetch`, `WebSocket`, `Bun.file`,
 ## Slack app (Socket Mode — no public URL)
 
 - Tokens: `SLACK_APP_TOKEN` (`xapp-`, scope `connections:write`) + `SLACK_BOT_TOKEN` (`xoxb-`).
-- Bot scopes: `chat:write`, `im:history`, `im:write`, `users:read`, `files:write`.
+- Bot scopes: `chat:write`, `im:history`, `im:write`, `users:read`, `files:read`, `files:write`. (`files:read` is what makes a DM attachment fetchable; without it Slack answers file downloads with a 200 + HTML sign-in page.)
 - Events: `message.im`. Interactivity enabled (block actions arrive over the socket as `interactive` envelopes).
 - Envelope handling: every envelope MUST be acked (`{envelope_id}`) immediately; payload processing is async after ack. Reconnect on `disconnect` frames / WS close with backoff; dedup retried event deliveries by `event_id`.
+
+### Delivery is not guaranteed — the bridge closes the gap
+
+Socket Mode has **no backlog**: a DM sent while the app has no live socket is
+never delivered, and Slack never retries it. Two failure shapes produce that,
+and the second is invisible from inside the process:
+
+1. the bridge is down (crash, restart, laptop asleep);
+2. the socket is a **zombie** — a proxy or NAT dropped the TCP connection
+   without a FIN, so `readyState` still reads OPEN and nothing ever arrives.
+
+Three mechanisms, in order of who catches what:
+
+- **Client ping every 30s** (`slack.ts`): writing to a dead peer draws the RST
+  that fires `close`, which is what starts the reconnect. Catches (2) whenever
+  the path is merely dropped rather than black-holed.
+- **Catch-up sweep every 2 min and on startup** (`bridge.ts#catchUp`):
+  `conversations.history` per allowed-user DM, replaying every top-level
+  message that has no thread replies, no task record on its ts, and was not
+  already routed this process. Bounded by `CATCHUP_WINDOW_MIN` (default 60) so
+  a cold start never replays yesterday, and by a per-channel watermark in
+  `state.json` so a restart never replays what a previous sweep took.
+- **Stale-socket inference**: finding missed DMs while `connected` is true
+  proves the socket is lying, so the sweep forces a reconnect before replaying.
+
+Not covered: **thread replies** missed while down. `conversations.history`
+returns only top-level messages, so a steer typed into a task thread during an
+outage is lost — retype it.
+
+### Attachments
+
+A DM's `files[]` (upload or `file_share` subtype) are downloaded with the bot
+token into `$TMPDIR/omp-slack-attachments/<ts>/` and appended to the prompt as
+local paths, so the agent can `read` them. Files hosted outside Slack (Drive,
+Box) have no bot-fetchable URL and are listed by name + permalink instead;
+unfurled link URLs (`attachments[].from_url`) are passed through as-is. A file
+that cannot be fetched is still named in the prompt with the reason — the agent
+must never answer as if nothing was attached.
 
 ## UX (DM with the bot)
 
@@ -100,7 +138,8 @@ Agent → Slack rendering:
 `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_ALLOWED_USERS`,
 `OMP_BIN` (default `omp`), `REPOS` (`alias=path,alias=path`),
 `DEFAULT_REPO` (alias used when `run` gets no dir), `MAX_TASKS` (default 4),
-`IDLE_TTL_MIN` (default 30), `SESSION_NAME_PREFIX` (default `slack:`).
+`IDLE_TTL_MIN` (default 30), `SESSION_NAME_PREFIX` (default `slack:`),
+`CATCHUP_WINDOW_MIN` (default 60, 0 disables the missed-DM sweep).
 
 ## Lifecycle invariants
 
@@ -108,7 +147,8 @@ Agent → Slack rendering:
 2. At most `MAX_TASKS` live procs; `run` beyond that → polite refusal listing live tasks.
 3. Reaper tick (60s): proc idle (no turn active, no pending UI request) longer than TTL → SIGTERM, mark idle.
 4. Bridge shutdown (SIGINT/SIGTERM): SIGTERM all children, flush registry, close WS.
-5. Every pending UI request belongs to exactly one thread; answering twice is a no-op (second click edits message to current state).
+5. A top-level DM is answered at most once: the catch-up sweep skips anything with thread replies, a task record on its ts, or a ts already routed this process, and its per-channel watermark in `state.json` only moves forward.
+6. Every pending UI request belongs to exactly one thread; answering twice is a no-op (second click edits message to current state).
 
 ## Verification gates (run by orchestrator, not implementers)
 
