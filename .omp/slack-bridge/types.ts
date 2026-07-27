@@ -17,7 +17,8 @@ export type OmpRpcCommand =
 	| { id: string; type: "get_state" }
 	| { id: string; type: "get_last_assistant_text" }
 	| { id: string; type: "set_session_name"; name: string }
-	| { id: string; type: "set_host_tools"; tools: OmpHostToolDefinition[] };
+	| { id: string; type: "set_host_tools"; tools: OmpHostToolDefinition[] }
+	| { id: string; type: "get_subagents" };
 
 /** Response frame correlated by `id`. */
 export interface OmpRpcResponse {
@@ -200,6 +201,8 @@ export interface OmpRpc extends OmpRpcEvents {
 	abort(): Promise<void>;
 	getState(): Promise<OmpSessionState>;
 	getLastAssistantText(): Promise<string | null>;
+	/** Running subagent count (0 when unknown/none). */
+	getSubagents(): Promise<number>;
 	setSessionName(name: string): Promise<void>;
 	respondUi(response: OmpUiResponse): void;
 	/** Register/replace host-owned tools (id-correlated `set_host_tools`). */
@@ -275,6 +278,8 @@ export interface SlackTransport {
 	postMessage(args: SlackPostArgs): Promise<string>;
 	updateMessage(args: { channel: string; ts: string; text: string; blocks?: SlackBlock[] }): Promise<void>;
 	uploadText(args: { channel: string; threadTs: string; filename: string; content: string }): Promise<void>;
+	/** Open (or fetch) the bot↔user DM channel; returns its channel id. */
+	openDm(userId: string): Promise<string>;
 	/** Bot's own user id (available after start()). */
 	readonly botUserId: string;
 }
@@ -301,6 +306,52 @@ export interface TaskRecord {
 export interface RegistryData {
 	tasks: TaskRecord[];
 }
+
+// ============================================================================
+// Control socket — implemented by control.ts, consumed by omp core
+// (packages/coding-agent src/hub/bridge-client.ts mirrors these shapes) and
+// by the slack-notify extension.
+//
+// Unix domain socket at `<stateDir>/bridge.sock`, one JSON object per line,
+// exactly one response per request. Doubles as the single-instance lock:
+// a starting bridge that gets a `ping` answer from the socket exits; a dead
+// socket file is unlinked and rebound.
+// ============================================================================
+
+export type ControlRequest =
+	| { op: "ping" }
+	| { op: "status" }
+	/** Park the live task owning `sessionPath` — ONLY when quiescent (turn done,
+	 * no running subagents, no pending ask). Stops its RPC process (registry
+	 * entry and Slack thread survive) and posts a handoff note to the thread.
+	 * Busy → { parked: false, reason }. Used by `omp --resume` / spectator promote. */
+	| { op: "park"; sessionPath: string }
+	/** Route text into a bridge-owned live session as a prompt/steer (spectator
+	 * proxy input). Session not live under the bridge → error. */
+	| { op: "steer"; sessionPath: string; text: string }
+	/** Abort the main agent's current turn only (running subagents unaffected). */
+	| { op: "interrupt"; sessionPath: string }
+	/** From the slack-notify extension inside a terminal session: post/refresh a
+	 * notification thread for the session. Binds sessionPath ↔ thread in the
+	 * registry so later thread replies attach the session to Slack. */
+	| { op: "notify"; sessionPath: string; cwd: string; kind: "turn_end" | "ask_pending"; text: string };
+
+export interface ControlTaskInfo {
+	sessionPath?: string;
+	threadTs: string;
+	channel: string;
+	name: string;
+	turnActive: boolean;
+	/** Running subagent count at status time (0 when unknown/none). */
+	subagentsRunning: number;
+}
+
+export type ControlResponse =
+	| { ok: true; pid: number }
+	| { ok: true; tasks: ControlTaskInfo[] }
+	| { ok: true; parked: boolean; reason?: string }
+	| { ok: true }
+	| { ok: false; error: string };
 
 // ============================================================================
 // Bridge config

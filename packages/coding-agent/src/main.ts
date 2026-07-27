@@ -6,6 +6,7 @@
  */
 import * as fsSync from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
@@ -51,6 +52,7 @@ import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
+import { parkBridgeSession } from "./hub/bridge-client";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
@@ -571,6 +573,40 @@ export class SessionResolutionError extends Error {
 	}
 }
 
+/** Print a {@link SessionResolutionError} cleanly and exit — no stack trace. */
+function exitWithSessionResolutionError(error: SessionResolutionError): never {
+	process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
+	if (error.hint) {
+		process.stderr.write(`${chalk.dim(error.hint)}\n`);
+	}
+	process.exit(1);
+}
+
+/**
+ * Slack bridge handshake, run before a terminal attaches to an existing session.
+ *
+ * The bridge daemon may already be driving `sessionPath` headlessly from Slack.
+ * Ask it to park that task (stop its RPC child; the Slack thread survives) so
+ * this terminal can take over. A busy task refuses with a reason and we bail
+ * rather than pointing two agents at one session file. Returns the failure to
+ * raise, or undefined to proceed: an unreachable bridge (null), a parked task,
+ * and a session the bridge does not own all mean "carry on".
+ *
+ * Skipped inside the bridge's own RPC children (`OMP_SLACK_BRIDGE`) and for
+ * `--fork`, which copies the source session instead of attaching to it. Auto-resume
+ * deliberately skips it too: a bare `omp` must never hard-fail just because Slack
+ * happens to own the newest session.
+ */
+async function checkSlackBridgeConflict(sessionPath: string | undefined): Promise<SessionResolutionError | undefined> {
+	if (!sessionPath || $env.OMP_SLACK_BRIDGE) return undefined;
+	const result = await parkBridgeSession(path.resolve(sessionPath));
+	if (!result || result.parked || !result.reason) return undefined;
+	return new SessionResolutionError(
+		`Session is active on Slack (${result.reason}).`,
+		"Reply 'kill' or wait for it to finish, then retry.",
+	);
+}
+
 type MissingCwdMoveResult =
 	| { status: "not-needed" }
 	| { status: "declined" }
@@ -691,6 +727,8 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
+			const conflict = await checkSlackBridgeConflict(sessionArg);
+			if (conflict) throw conflict;
 			return await SessionManager.open(sessionArg, parsed.sessionDir);
 		}
 		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
@@ -747,10 +785,17 @@ export async function createSessionManager(
 				return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
 			}
 		}
+		const conflict = await checkSlackBridgeConflict(match.session.path);
+		if (conflict) throw conflict;
 		return await SessionManager.open(match.session.path, parsed.sessionDir);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		// continueRecent picks the target internally, so the handshake runs after
+		// it resolves — loading an existing session file appends nothing.
+		const conflict = await checkSlackBridgeConflict(manager.getSessionFile());
+		if (conflict) throw conflict;
+		return manager;
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
@@ -1231,11 +1276,7 @@ export async function runRootCommand(
 		);
 	} catch (error: unknown) {
 		if (error instanceof SessionResolutionError) {
-			process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
-			if (error.hint) {
-				process.stderr.write(`${chalk.dim(error.hint)}\n`);
-			}
-			process.exit(1);
+			exitWithSessionResolutionError(error);
 		}
 		throw error;
 	}
@@ -1305,6 +1346,8 @@ export async function runRootCommand(
 			// project in place so the session is built with its configuration.
 			await settingsInstance.reloadForCwd(cwd);
 		}
+		const bridgeConflict = await checkSlackBridgeConflict(selected.path);
+		if (bridgeConflict) exitWithSessionResolutionError(bridgeConflict);
 		sessionManager = await SessionManager.open(selected.path);
 	}
 

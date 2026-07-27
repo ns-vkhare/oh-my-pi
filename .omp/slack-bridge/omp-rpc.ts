@@ -61,7 +61,8 @@ type OutboundCommand =
 	| { type: "get_state" }
 	| { type: "get_last_assistant_text" }
 	| { type: "set_session_name"; name: string }
-	| { type: "set_host_tools"; tools: OmpHostToolDefinition[] };
+	| { type: "set_host_tools"; tools: OmpHostToolDefinition[] }
+	| { type: "get_subagents" };
 
 class OmpRpcClient implements OmpRpc {
 	readonly #options: OmpRpcOptions;
@@ -158,6 +159,18 @@ class OmpRpcClient implements OmpRpc {
 		const data = await this.#send({ type: "get_last_assistant_text" });
 		if (isRecord(data) && typeof data.text === "string") return data.text;
 		return null;
+	}
+
+	async getSubagents(): Promise<number> {
+		const data = await this.#send({ type: "get_subagents" });
+		// Response shape: { subagents: RpcSubagentSnapshot[] }; count status === "running".
+		// Parse defensively — any unexpected shape yields 0.
+		if (!isRecord(data) || !Array.isArray(data.subagents)) return 0;
+		let running = 0;
+		for (const entry of data.subagents) {
+			if (isRecord(entry) && entry.status === "running") running++;
+		}
+		return running;
 	}
 
 	async setSessionName(name: string): Promise<void> {

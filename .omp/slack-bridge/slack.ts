@@ -23,6 +23,10 @@ const DEDUP_CAP = 500;
 const BACKOFF_MAX_MS = 30_000;
 const BACKOFF_BASE_MS = 1_000;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
 export interface SlackTransportOptions {
 	appToken: string;
 	botToken: string;
@@ -145,6 +149,15 @@ class SlackTransportImpl implements SlackTransport {
 			},
 			"bot",
 		);
+	}
+
+	async openDm(userId: string): Promise<string> {
+		const json = await this.#api("conversations.open", { users: userId }, "bot");
+		const channel = json.channel;
+		if (typeof channel === "object" && channel !== null && typeof (channel as { id?: unknown }).id === "string") {
+			return (channel as { id: string }).id;
+		}
+		throw new Error("slack conversations.open: missing channel id");
 	}
 
 	// ------------------------------------------------------------------------

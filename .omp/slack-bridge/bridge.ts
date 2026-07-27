@@ -17,6 +17,7 @@ import {
 	taskHeaderBlocks,
 	uiRequestBlocks,
 } from "./blocks";
+import { BridgeAlreadyRunningError, type ControlHost, startControlServer } from "./control";
 import { createOmpRpc } from "./omp-rpc";
 import { createSlackTransport } from "./slack";
 import { TaskRegistry } from "./registry";
@@ -30,6 +31,7 @@ import type {
 	OmpRpcOptions,
 	OmpUiRequest,
 	SlackBlockAction,
+	ControlTaskInfo,
 	SlackInbound,
 	SlackInboundMessage,
 	SlackTransport,
@@ -223,6 +225,8 @@ export class Bridge {
 	#reaperTimer: ReturnType<typeof setInterval> | undefined;
 	#unsubscribeInbound: (() => void) | undefined;
 	#shuttingDown = false;
+	/** Cached bot↔user DM channel for top-level notify posts (resolved lazily). */
+	#dmChannel: string | undefined;
 
 	constructor(deps: BridgeDeps) {
 		this.#config = deps.config;
@@ -249,6 +253,105 @@ export class Bridge {
 		await Promise.all([...this.#live.values()].map((task) => task.rpc.stop().catch(() => {})));
 		await this.#registry.flush();
 		await this.#slack.stop().catch(() => {});
+	}
+
+	// --- Control plane ------------------------------------------------------
+
+	/** The ControlHost surface served over the control socket (see control.ts). */
+	controlHost(): ControlHost {
+		return {
+			pid: process.pid,
+			status: () => this.#controlStatus(),
+			park: (sessionPath) => this.#controlPark(sessionPath),
+			steer: (sessionPath, text) => this.#controlSteer(sessionPath, text),
+			interrupt: (sessionPath) => this.#controlInterrupt(sessionPath),
+			notify: (event) => this.#controlNotify(event),
+		};
+	}
+
+	#findLiveBySessionPath(sessionPath: string): LiveTask | undefined {
+		for (const task of this.#live.values()) {
+			if (task.record.sessionPath === sessionPath) return task;
+		}
+		return undefined;
+	}
+
+	async #controlStatus(): Promise<ControlTaskInfo[]> {
+		return Promise.all(
+			[...this.#live.values()].map(async (task) => ({
+				sessionPath: task.record.sessionPath,
+				threadTs: task.record.threadTs,
+				channel: task.record.channel,
+				name: task.record.name,
+				turnActive: task.turnActive,
+				subagentsRunning: await task.rpc.getSubagents().catch(() => 0),
+			})),
+		);
+	}
+
+	async #controlPark(sessionPath: string): Promise<{ parked: boolean; reason?: string }> {
+		const task = this.#findLiveBySessionPath(sessionPath);
+		if (!task) return { parked: false }; // Not live under the bridge — caller may resume freely.
+		if (task.turnActive) return { parked: false, reason: "busy: turn active" };
+		if (task.pendingUi.size > 0) return { parked: false, reason: "busy: pending UI request" };
+		if (task.pendingTextUi) return { parked: false, reason: "busy: pending input" };
+		if (task.pendingAsk) return { parked: false, reason: "busy: pending ask" };
+		const running = await task.rpc.getSubagents().catch(() => 0);
+		if (running > 0) return { parked: false, reason: `busy: ${running} subagents running` };
+		// Quiescent: stop the proc (registry entry + Slack thread survive; #onExit
+		// disposes and removes from #live). Post a handoff note to the thread.
+		await task.rpc.stop().catch(() => {});
+		await this.#slack
+			.postMessage({
+				channel: task.record.channel,
+				threadTs: task.record.threadTs,
+				text: "⏸ picked up in terminal — reply here to take back",
+			})
+			.catch(() => {});
+		this.#live.delete(task.record.threadTs);
+		return { parked: true };
+	}
+
+	async #controlSteer(sessionPath: string, text: string): Promise<void> {
+		const task = this.#findLiveBySessionPath(sessionPath);
+		if (!task) throw new Error("session not live under the bridge");
+		await task.rpc.prompt(text);
+		this.#registry.touch(task.record.threadTs);
+	}
+
+	async #controlInterrupt(sessionPath: string): Promise<void> {
+		const task = this.#findLiveBySessionPath(sessionPath);
+		if (!task) throw new Error("session not live under the bridge");
+		await task.rpc.abort();
+	}
+
+	async #controlNotify(event: { sessionPath: string; cwd: string; kind: string; text: string }): Promise<void> {
+		const existing = this.#registry.bySessionPath(event.sessionPath);
+		if (existing) {
+			await this.#slack.postMessage({ channel: existing.channel, threadTs: existing.threadTs, text: event.text });
+			this.#registry.touch(existing.threadTs);
+			return;
+		}
+		// No thread yet: open a new top-level DM message; its ts becomes the thread.
+		const channel = await this.#dmChannelForNotify();
+		const threadTs = await this.#slack.postMessage({ channel, text: event.text });
+		this.#registry.upsert({
+			threadTs,
+			channel,
+			sessionPath: event.sessionPath,
+			cwd: event.cwd,
+			name: headOf(event.text),
+			createdAt: Date.now(),
+			lastActivityAt: Date.now(),
+		});
+	}
+
+	async #dmChannelForNotify(): Promise<string> {
+		if (this.#dmChannel) return this.#dmChannel;
+		const user = this.#config.allowedUsers[0];
+		if (!user) throw new Error("notify: no allowed users configured");
+		this.#dmChannel = await this.#slack.openDm(user);
+		return this.#dmChannel;
 	}
 
 	// --- Inbound routing ----------------------------------------------------
@@ -538,7 +641,9 @@ export class Bridge {
 			ompBin: this.#config.ompBin,
 			cwd: record.cwd,
 			resumeSessionPath: args.resumeSessionPath,
-			env: isNew ? { OMP_HUB_NEW_SESSION: "1" } : {},
+			// OMP_SLACK_BRIDGE marks bridge-owned children: the slack-notify
+			// extension and omp's resume park hook skip themselves under it.
+			env: isNew ? { OMP_SLACK_BRIDGE: "1", OMP_HUB_NEW_SESSION: "1" } : { OMP_SLACK_BRIDGE: "1" },
 			extraArgs: [],
 		});
 
@@ -1035,14 +1140,30 @@ export async function main(): Promise<void> {
 	await slack.start();
 	bridge.start();
 
+	const sockPath = `${config.stateDir}/bridge.sock`;
+	let control: { stop(): Promise<void> };
+	try {
+		control = await startControlServer(sockPath, bridge.controlHost());
+	} catch (err) {
+		if (err instanceof BridgeAlreadyRunningError) {
+			console.error(`bridge: ${err.message} — another instance owns ${sockPath}`);
+			process.exit(1);
+		}
+		throw err;
+	}
+
 	const shutdown = () => {
-		void bridge.shutdown().then(() => process.exit(0));
+		void control
+			.stop()
+			.catch(() => {})
+			.then(() => bridge.shutdown())
+			.then(() => process.exit(0));
 	};
 	process.on("SIGINT", shutdown);
 	process.on("SIGTERM", shutdown);
 
 	const aliases = Object.keys(config.repos).join(", ") || "(none)";
-	console.log(`bridge up — ${config.allowedUsers.length} allowed user(s), repos: ${aliases}, maxTasks=${config.maxTasks}`);
+	console.log(`bridge up — ${config.allowedUsers.length} allowed user(s), repos: ${aliases}, maxTasks=${config.maxTasks}, control ${sockPath}`);
 }
 
 if (import.meta.main) {

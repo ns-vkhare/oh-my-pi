@@ -20,6 +20,7 @@ import { FileSessionStorage } from "../session/session-storage";
 import { resolveSessionWorktree } from "../session/session-worktree";
 import { shortenPath } from "../tools/render-utils";
 import * as git from "../utils/git";
+import { type BridgeTaskInfo, bridgeStatus } from "./bridge-client";
 import { type HubRow, HubView } from "./hub-view";
 import {
 	currentTmuxWindow,
@@ -141,8 +142,9 @@ function reapStaleViews(): void {
 
 /**
  * Merge live tmux windows with recent on-disk sessions into hub rows. Live rows
- * (running omp processes) come first, then idle recent sessions that don't
- * already have a live window. Idle rows need a disk scan, so this is async.
+ * (running omp processes) come first, then Slack-bridge-owned sessions, then the
+ * idle recent sessions that don't already have a live window. Idle rows need a
+ * disk scan and the bridge a socket round-trip, so this is async.
  */
 async function buildRows(): Promise<HubRow[]> {
 	const liveWindows = listSessionWindows();
@@ -158,21 +160,44 @@ async function buildRows(): Promise<HubRow[]> {
 		windowId: w.windowId,
 	}));
 
+	// Fetched concurrently with the disk scan and hard-capped at 250ms, so a
+	// missing or wedged bridge never slows a refresh tick. null (or a throw) means
+	// "no bridge": rows then render exactly as they did before it existed.
+	const bridgePending = bridgeStatus(250).catch(() => null);
+
 	let idleRows: HubRow[] = [];
 	try {
 		const sessionDir = SessionManager.getDefaultSessionDir(getProjectDir());
-		const recent = await getRecentSessions(sessionDir, IDLE_SESSION_LIMIT + livePaths.size);
+		const [recent, bridgeTasks] = await Promise.all([
+			getRecentSessions(sessionDir, IDLE_SESSION_LIMIT + livePaths.size),
+			bridgePending,
+		]);
+		// Sessions the Slack bridge drives headlessly have no tmux window, so they
+		// land among the idle rows — badge them and float them above the truly idle.
+		const bridgeByPath = new Map<string, BridgeTaskInfo>();
+		for (const task of bridgeTasks ?? []) {
+			if (task.sessionPath) bridgeByPath.set(task.sessionPath, task);
+		}
 		idleRows = recent
 			.filter(s => !livePaths.has(s.path))
+			// Stable sort: bridge-owned first, each group keeping its recency order.
+			// Sorted before the slice so a long-lived quiet bridge session is never cut.
+			.sort((a, b) => Number(bridgeByPath.has(b.path)) - Number(bridgeByPath.has(a.path)))
 			.slice(0, IDLE_SESSION_LIMIT)
-			.map(s => ({
-				key: s.path,
-				title: s.name,
-				meta: s.timeAgo,
-				live: false,
-				sessionPath: s.path,
-				windowId: undefined,
-			}));
+			// ponytail: a bridge row stays `live: false` (no tmux window of its own), so
+			// foregrounding it still resumes the session in a window beside the bridge's
+			// process. The badge is the warning; an interlock waits for a real report.
+			.map(s => {
+				const bridge = bridgeByPath.get(s.path);
+				return {
+					key: s.path,
+					title: s.name,
+					meta: bridge ? (bridge.turnActive ? "live · slack · working" : "live · slack") : s.timeAgo,
+					live: false,
+					sessionPath: s.path,
+					windowId: undefined,
+				};
+			});
 	} catch {
 		idleRows = [];
 	}

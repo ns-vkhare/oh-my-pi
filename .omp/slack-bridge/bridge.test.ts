@@ -75,6 +75,10 @@ class FakeSlack implements SlackTransport {
 		this.uploads.push({ threadTs: args.threadTs, content: args.content });
 	}
 
+	async openDm(userId: string): Promise<string> {
+		return `D-${userId}`;
+	}
+
 	/** Inject an inbound and let the async handler chain settle. */
 	async inject(inbound: SlackInbound): Promise<void> {
 		for (const listener of this.#listeners) listener(inbound);
@@ -143,6 +147,11 @@ class FakeRpc implements OmpRpc {
 	async getLastAssistantText(): Promise<string | null> {
 		this.commands.push("get_last_assistant_text");
 		return this.lastAssistantText;
+	}
+	subagentsRunning = 0;
+	async getSubagents(): Promise<number> {
+		this.commands.push("get_subagents");
+		return this.subagentsRunning;
 	}
 	async setSessionName(name: string): Promise<void> {
 		this.commands.push(`set_session_name:${name}`);
