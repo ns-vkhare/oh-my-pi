@@ -71,18 +71,33 @@ A thread opens for the task; everything about that task happens in its thread.
    bun smoke.ts --ask  # ask-tool relay (the button-question path)
    ```
 
-## Usage
+## Commands
 
-DM the bot:
+### Top-level DM (start / find work)
 
-- `run <alias> <prompt>` — start an omp task in the repo mapped to `<alias>` (see `REPOS` in `.env`). Each task gets its own thread. With `DEFAULT_REPO` set, `run <prompt>` alone targets it.
-- Reply **in the task's thread** to steer a running task, or to continue a finished one.
-- `sessions [alias]` — browse **every** omp session on disk, newest 8 per configured repo, numbered. Badges: ⚡ `live·slack` (running under the bridge), 🔗 (already has a thread).
-- `resume <n|sessionPath>` — attach a numbered session from the last `sessions` listing, or an explicit session file. Already-attached sessions link back to their thread instead of double-attaching.
-- In a task thread: `abort`, `kill`, `status`.
-- When the agent asks a question, answer with the **buttons** posted in the thread.
+| Command | What it does |
+|---|---|
+| `run <alias\|path> <prompt…>` | Start a new omp task in the repo mapped to `<alias>` (see `REPOS` in `.env`) or an absolute path under `$HOME`. A thread opens — everything about the task happens there. With `DEFAULT_REPO` set, `run <prompt>` alone targets it. |
+| `sessions [alias]` | Browse **every** omp session on disk — newest 8 per configured repo (or just `<alias>`), numbered. Badges: ⚡ `live·slack` (running under the bridge), 🔗 (already has a thread). |
+| `resume <n>` | Attach session `n` from the last `sessions` listing to a new thread, with full context. |
+| `resume <sessionPath>` | Same, by explicit `.jsonl` path. Already-attached sessions link back to their existing thread instead of double-attaching. |
+| `status` | Bridge health: live tasks, registry size. |
+| `help` (or anything else) | This command list. |
 
-Sessions are standard omp sessions — they also appear in `omp hub`.
+### Inside a task thread (drive the task)
+
+| Message | What it does |
+|---|---|
+| any text | Steers the running turn, continues an idle task, or — if the agent asked a free-text question — answers it. A parked/reaped task is resumed automatically with full context. |
+| *(click a button)* | Answers the agent's multiple-choice question. |
+| `abort` | Abort the current turn (running subagents keep going; their results arrive next turn). |
+| `kill` | Stop the task's omp process. The session survives — reply again later to resume it. |
+| `status` | Task state: model, streaming, context usage, session file. |
+
+Sessions are standard omp sessions — they also appear in `omp hub` (badged
+`live · slack` while the bridge owns them), can be watched read-only with
+`omp --watch <sessionPath>`, and taken over in the terminal with `omp --resume`
+(the bridge parks its task and posts a handoff note to the thread).
 
 ### Example: dispatch, answer a question, get the result
 
