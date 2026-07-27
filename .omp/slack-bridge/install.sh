@@ -109,8 +109,33 @@ PLIST
 	echo "launchd agent installed and loaded: $plist"
 }
 
+# Restart the loaded launchd job onto freshly installed code — never killing
+# live tasks (their sessions would drop mid-turn; parked ones resume fine).
+restart_launchd_if_idle() {
+	local label live_tasks
+	label="com.omp.slack-bridge"
+	live_tasks="$(bun -e "
+		import { controlRequest } from \"$DEST/control\";
+		try {
+			const res = await controlRequest(\"$DEST/bridge.sock\", { op: \"status\" }, 1500);
+			console.log(\"tasks\" in res ? res.tasks.length : 0);
+		} catch { console.log(0); }
+	" 2>/dev/null || echo 0)"
+	if [[ "$live_tasks" == "0" ]]; then
+		launchctl kickstart -k "gui/$(id -u)/$label" 2>/dev/null &&
+			echo "restarted launchd bridge on the new code" ||
+			echo "could not restart launchd bridge — run: launchctl kickstart -k gui/\$(id -u)/$label" >&2
+	else
+		echo "bridge busy ($live_tasks live task(s)) — restart when idle: launchctl kickstart -k gui/\$(id -u)/$label"
+	fi
+}
+
 if [[ "$DAEMON" -eq 1 ]]; then
-	install_launchd
+	install_launchd # unload+load already starts the new code
+elif launchctl list "com.omp.slack-bridge" >/dev/null 2>&1; then
+	# Agent already installed: this run is an update, not an onboarding — no
+	# prompt, just bounce the daemon onto the new code when it's safe.
+	restart_launchd_if_idle
 elif [[ -t 0 ]]; then
 	printf 'Install launchd agent so the bridge starts on login? [y/N] '
 	reply=""
