@@ -46,6 +46,8 @@ export interface HubRow {
 	sessionPath: string | undefined;
 	/** tmux window id when live. */
 	windowId: string | undefined;
+	/** True when the Slack bridge owns this session's live process (no tmux window). Foregrounding spectates via `omp --watch` instead of resuming. */
+	slackLive?: boolean;
 }
 
 export interface HubViewCallbacks {

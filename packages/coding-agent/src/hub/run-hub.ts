@@ -28,6 +28,7 @@ import {
 	dispatchBackendSession,
 	ensureBackendSession,
 	ensureBackendSessionWindow,
+	ensureBackendWatchWindow,
 	enterHubView,
 	focusWindowInView,
 	HUB_BACKEND_ENV,
@@ -184,9 +185,6 @@ async function buildRows(): Promise<HubRow[]> {
 			// Before the slice, so a bridge row inside the fetch window is never cut.
 			.sort((a, b) => Number(bridgeByPath.has(b.path)) - Number(bridgeByPath.has(a.path)))
 			.slice(0, IDLE_SESSION_LIMIT)
-			// ponytail: a bridge row stays `live: false` (no tmux window of its own), so
-			// foregrounding it still resumes the session in a window beside the bridge's
-			// process. The badge is the warning; an interlock waits for a real report.
 			.map(s => {
 				const bridge = bridgeByPath.get(s.path);
 				return {
@@ -196,6 +194,7 @@ async function buildRows(): Promise<HubRow[]> {
 					live: false,
 					sessionPath: s.path,
 					windowId: undefined,
+					slackLive: Boolean(bridge),
 				};
 			});
 		// The fetch above truncates by recency (session-listing.ts:587), so a bridge
@@ -212,6 +211,7 @@ async function buildRows(): Promise<HubRow[]> {
 				live: false,
 				sessionPath,
 				windowId: undefined,
+				slackLive: true,
 			});
 		}
 	} catch {
@@ -239,11 +239,16 @@ async function renderHub(): Promise<void> {
 	const view = new HubView(
 		{
 			onForeground: row => {
+				// A bridge-owned session gets a read-only spectator window (`omp --watch`)
+				// — resuming would just be refused by the park handshake while a turn is
+				// active. Ctrl+T inside the watcher promotes to ownership in place.
 				const windowId =
 					row.live && row.windowId
 						? row.windowId
 						: row.sessionPath
-							? ensureBackendSessionWindow(row.sessionPath, row.title)
+							? row.slackLive
+								? ensureBackendWatchWindow(row.sessionPath, row.title)
+								: ensureBackendSessionWindow(row.sessionPath, row.title)
 							: null;
 				if (windowId) focusWindowInView(windowId);
 			},

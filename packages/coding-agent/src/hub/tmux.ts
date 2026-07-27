@@ -377,9 +377,24 @@ function sessionWindowEnv(newSession = false): string[] {
  * tmux window. Returns the backend window id.
  */
 export function ensureBackendSessionWindow(sessionPath: string, name: string): string | null {
+	return ensureBackendWindow(sessionPath, name, "--resume");
+}
+
+/**
+ * Ensure a backend window *spectating* `sessionPath` via `omp --watch`: a
+ * read-only live tail for a session another process owns (typically the Slack
+ * bridge). Ctrl+T inside the watcher promotes it in place — the spawned
+ * `omp --resume` inherits the same window, whose session tag already matches,
+ * so the hub row flips from spectator to owner without a new window.
+ */
+export function ensureBackendWatchWindow(sessionPath: string, name: string): string | null {
+	return ensureBackendWindow(sessionPath, name, "--watch");
+}
+
+function ensureBackendWindow(sessionPath: string, name: string, flag: "--resume" | "--watch"): string | null {
 	const existing = findWindowForSession(sessionPath);
 	if (existing) return existing.windowId;
-	const argv = [...selfInvocation(), "--resume", sessionPath];
+	const argv = [...selfInvocation(), flag, sessionPath];
 	const windowId = tmux([
 		"new-window",
 		"-d",
