@@ -6,7 +6,7 @@
  * and registry persistence.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, type Mock, spyOn, test } from "bun:test";
 import { Bridge, loadConfig, type ListSessions, type StoreSession } from "./bridge";
 import { TaskRegistry } from "./registry";
 import type {
@@ -243,8 +243,22 @@ async function makeHarness(config: BridgeConfig, seed: TaskRecord[] = [], listSe
 	return { slack, registry, bridge, rpcs };
 }
 
+let dmSeq = 0;
+
 function dm(text: string, user = "UALICE", threadTs?: string): SlackInboundMessage {
-	return { kind: "message", channel: "D1", user, text, ts: `m${Math.random()}`, threadTs };
+	return { kind: "message", channel: "D1", user, text, ts: `m${++dmSeq}`, threadTs };
+}
+
+/**
+ * Emit one streaming thinking block the way RPC mode forwards it: start, deltas
+ * in small chunks (so partial-headline states are exercised), then end.
+ */
+function emitThinking(rpc: FakeRpc, text: string, contentIndex = 0): void {
+	rpc.emitEvent({ type: "message_update", assistantMessageEvent: { type: "thinking_start", contentIndex } });
+	for (const chunk of text.match(/[\s\S]{1,12}/g) ?? []) {
+		rpc.emitEvent({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex, delta: chunk } });
+	}
+	rpc.emitEvent({ type: "message_update", assistantMessageEvent: { type: "thinking_end", contentIndex, content: text } });
 }
 
 // --- tests ------------------------------------------------------------------
@@ -287,30 +301,41 @@ describe("run command", () => {
 		expect(h.rpcs).toHaveLength(0);
 	});
 
-	test("allowlisted run posts header, spawns rpc with cwd + OMP_HUB_NEW_SESSION, prompts after start", async () => {
+	test("allowlisted run threads under the user's message, spawns rpc with cwd + OMP_HUB_NEW_SESSION, prompts after start", async () => {
 		const h = await makeHarness(makeConfig());
-		await h.slack.inject(dm("run omp fix the bug"));
+		const msg = dm("run omp fix the bug");
+		await h.slack.inject(msg);
 
-		// Header posted (first message), its ts becomes threadTs.
+		// The task thread IS the user's message: the header is its first reply.
 		expect(h.slack.posted.length).toBeGreaterThanOrEqual(1);
 		const header = h.slack.posted[0]!;
 		expect(header.args.blocks).toBeDefined();
+		expect(header.args.threadTs).toBe(msg.ts);
+		expect(h.slack.posted.every((p) => p.args.threadTs === msg.ts)).toBe(true);
 
 		expect(h.rpcs).toHaveLength(1);
 		const rpc = h.rpcs[0]!;
 		expect(rpc.opts.cwd).toBe(`${HOME}/oh-my-pi-src`);
 		expect(rpc.opts.env?.OMP_HUB_NEW_SESSION).toBe("1");
 		expect(rpc.prompts).toEqual(["fix the bug"]);
-		// Registry has the record keyed by header ts.
-		expect(h.registry.byThread(header.ts)).toBeDefined();
+		// Registry keyed by the user's message ts, so later replies to it route back.
+		expect(h.registry.byThread(msg.ts)).toBeDefined();
+	});
+
+	test("help for an unknown top-level command replies in the message's thread", async () => {
+		const h = await makeHarness(makeConfig());
+		const msg = dm("what can you do");
+		await h.slack.inject(msg);
+		expect(h.slack.posted).toHaveLength(1);
+		expect(h.slack.posted[0]!.args.threadTs).toBe(msg.ts);
 	});
 });
 
 describe("ui relay", () => {
 	async function runningTask(h: Harness): Promise<{ rpc: FakeRpc; threadTs: string }> {
-		await h.slack.inject(dm("run omp do work"));
-		const threadTs = h.slack.posted[0]!.ts;
-		return { rpc: h.rpcs[0]!, threadTs };
+		const msg = dm("run omp do work");
+		await h.slack.inject(msg);
+		return { rpc: h.rpcs[0]!, threadTs: msg.ts };
 	}
 
 	test("select request posts buttons with ui:<id>:0 and click responds with label", async () => {
@@ -361,8 +386,9 @@ describe("ui relay", () => {
 describe("turn completion", () => {
 	test("agent_end with short text updates status message and bumps lastActivityAt", async () => {
 		const h = await makeHarness(makeConfig());
-		await h.slack.inject(dm("run omp go"));
-		const threadTs = h.slack.posted[0]!.ts;
+		const msg = dm("run omp go");
+		await h.slack.inject(msg);
+		const threadTs = msg.ts;
 		const rpc = h.rpcs[0]!;
 		rpc.lastAssistantText = "All finished.";
 
@@ -379,6 +405,104 @@ describe("turn completion", () => {
 		const finalUpdate = h.slack.updated.find((u) => u.ts === statusTs && u.text.includes("All finished."));
 		expect(finalUpdate).toBeDefined();
 		expect(h.registry.byThread(threadTs)!.lastActivityAt).toBeGreaterThan(1);
+	});
+});
+
+describe("thinking status", () => {
+	/**
+	 * Status updates are chat.update-throttled (2s), so a real turn's stream lands
+	 * as a first immediate flush plus a trailing one. These tests read `Date.now`
+	 * through a spy that jumps 5s per read, so every emitted event flushes at once
+	 * and assertions never wait on a wall-clock timer.
+	 */
+	let clock: Mock<() => number> | undefined;
+	afterEach(() => {
+		clock?.mockRestore();
+		clock = undefined;
+	});
+
+	async function startedTurn(h: Harness): Promise<FakeRpc> {
+		await h.slack.inject(dm("run omp do work"));
+		const rpc = h.rpcs[0]!;
+		rpc.emitEvent({ type: "agent_start" });
+		await settle(); // Status message posted; updates can now land.
+		let t = Date.now();
+		clock = spyOn(Date, "now").mockImplementation(() => (t += 5_000));
+		return rpc;
+	}
+
+	test("a reasoning-summary headline reaches the status message before any tool runs", async () => {
+		const h = await makeHarness(makeConfig());
+		const rpc = await startedTurn(h);
+
+		emitThinking(rpc, "**Mapping the event flow**\n\nThe status only renders tool labels today.\n\n<!-- -->");
+		await settle();
+
+		const text = h.slack.updated.at(-1)!.text;
+		expect(text).toContain("💭 Mapping the event flow");
+		expect(text).not.toContain("<!--");
+		expect(text).not.toContain("⏵"); // No tool call has run yet.
+	});
+
+	test("raw thinking without headlines shows its newest paragraph", async () => {
+		const h = await makeHarness(makeConfig());
+		const rpc = await startedTurn(h);
+
+		emitThinking(rpc, "First I check the registry.\n\nThen I patch the renderer.");
+		await settle();
+
+		expect(h.slack.updated.at(-1)!.text).toContain("💭 Then I patch the renderer.");
+	});
+
+	test("each thinking block and tool call claims its own timeline line, in arrival order", async () => {
+		const h = await makeHarness(makeConfig());
+		const rpc = await startedTurn(h);
+
+		emitThinking(rpc, "**Mapping the event flow**\n\nOnly tool labels render today.", 0);
+		await settle();
+		rpc.emitEvent({ type: "tool_execution_start", toolName: "read", args: { path: "bridge.ts" } });
+		await settle();
+		emitThinking(rpc, "**Patching the renderer**\n\nGive thinking its own line.", 1);
+		await settle();
+
+		const text = h.slack.updated.at(-1)!.text;
+		expect(text).toContain("💭 Mapping the event flow");
+		expect(text).toContain("⏵ read bridge.ts");
+		expect(text).toContain("💭 Patching the renderer");
+		expect(text.indexOf("💭 Mapping")).toBeLessThan(text.indexOf("⏵ read"));
+		expect(text.indexOf("⏵ read")).toBeLessThan(text.indexOf("💭 Patching"));
+	});
+
+	test("a new turn starts from an empty timeline", async () => {
+		const h = await makeHarness(makeConfig());
+		const rpc = await startedTurn(h);
+		emitThinking(rpc, "**Old turn thought**\n\nstale");
+		await settle();
+		expect(h.slack.updated.at(-1)!.text).toContain("Old turn thought");
+
+		rpc.emitEvent({ type: "agent_end" });
+		await settle();
+		rpc.emitEvent({ type: "agent_start" });
+		await settle();
+		emitThinking(rpc, "**Fresh thought**\n\nnew", 3);
+		await settle();
+
+		const text = h.slack.updated.at(-1)!.text;
+		expect(text).toContain("💭 Fresh thought");
+		expect(text).not.toContain("Old turn thought");
+	});
+
+	test("an unchanged timeline does not re-send the status message", async () => {
+		const h = await makeHarness(makeConfig());
+		const rpc = await startedTurn(h);
+		rpc.emitEvent({ type: "tool_execution_start", toolName: "read", args: { path: "a.ts" } });
+		await settle();
+		const sent = h.slack.updated.length;
+
+		// Same tool label again: the timeline is identical, so no chat.update is due.
+		rpc.emitEvent({ type: "tool_execution_start", toolName: "read", args: { path: "a.ts" } });
+		await settle();
+		expect(h.slack.updated).toHaveLength(sent);
 	});
 });
 
@@ -430,21 +554,37 @@ describe("session browsing", () => {
 		expect(text).toContain("2. beta first message · 1h ago");
 	});
 
-	test("resume <n> resumes the mapped session path in its repo cwd", async () => {
+	test("resume <n> resumes the mapped session path in its repo cwd, threaded under the resume message", async () => {
 		const h = await makeHarness(makeConfig(), [], lister);
 		await h.slack.inject(dm("sessions"));
 		const beforeHeader = h.slack.posted.length;
 
-		await h.slack.inject(dm("resume 2"));
+		const msg = dm("resume 2");
+		await h.slack.inject(msg);
 
 		expect(h.rpcs).toHaveLength(1);
 		expect(h.rpcs[0]!.opts.resumeSessionPath).toBe(BETA);
 		expect(h.rpcs[0]!.opts.cwd).toBe(REPO);
 		expect(h.rpcs[0]!.opts.env?.OMP_HUB_NEW_SESSION).toBeUndefined();
-		// A task header opened the thread and got registered.
+		// The task header replies to the resume message and registers that thread.
 		const header = h.slack.posted[beforeHeader]!;
 		expect(header.args.blocks).toBeDefined();
-		expect(h.registry.byThread(header.ts)).toBeDefined();
+		expect(header.args.threadTs).toBe(msg.ts);
+		expect(h.registry.byThread(msg.ts)).toBeDefined();
+	});
+
+	test("a reply under a non-task message runs as a command instead of being dropped", async () => {
+		const h = await makeHarness(makeConfig(), [], lister);
+		const listing = dm("sessions");
+		await h.slack.inject(listing);
+		expect(h.slack.posted.at(-1)!.args.threadTs).toBe(listing.ts);
+
+		// `resume 2` typed inside the listing's own thread still attaches.
+		await h.slack.inject(dm("resume 2", "UALICE", listing.ts));
+
+		expect(h.rpcs).toHaveLength(1);
+		expect(h.rpcs[0]!.opts.resumeSessionPath).toBe(BETA);
+		expect(h.registry.byThread(listing.ts)).toBeDefined();
 	});
 
 	test("resume <n> with no live listing points back at `sessions`", async () => {
@@ -524,9 +664,9 @@ function askPostFor(h: Harness, prefix: string): PostedMessage | undefined {
 
 describe("ask host tool", () => {
 	async function runningTask(h: Harness): Promise<{ rpc: FakeRpc; threadTs: string }> {
-		await h.slack.inject(dm("run omp do work"));
-		const threadTs = h.slack.posted[0]!.ts;
-		return { rpc: h.rpcs[0]!, threadTs };
+		const msg = dm("run omp do work");
+		await h.slack.inject(msg);
+		return { rpc: h.rpcs[0]!, threadTs: msg.ts };
 	}
 
 	const twoQuestions = {

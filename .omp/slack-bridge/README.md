@@ -21,7 +21,8 @@ Then DM the **omp** bot:
 run omp fix the flaky watcher test in packages/tui
 ```
 
-A thread opens for the task; everything about that task happens in its thread.
+The bot replies **in a thread on your message**, and everything about that task
+happens in that thread.
 
 ## Setup
 
@@ -77,7 +78,7 @@ A thread opens for the task; everything about that task happens in its thread.
 
 | Command | What it does |
 |---|---|
-| `run <alias\|path> <prompt…>` | Start a new omp task in the repo mapped to `<alias>` (see `REPOS` in `.env`) or an absolute path under `$HOME`. A thread opens — everything about the task happens there. With `DEFAULT_REPO` set, `run <prompt>` alone targets it. |
+| `run <alias\|path> <prompt…>` | Start a new omp task in the repo mapped to `<alias>` (see `REPOS` in `.env`) or an absolute path under `$HOME`. The bot threads its reply under your message — everything about the task happens in that thread. With `DEFAULT_REPO` set, `run <prompt>` alone targets it. |
 | `sessions [alias]` | Browse **every** omp session on disk — newest 8 per configured repo (or just `<alias>`), numbered. Badges: ⚡ `live·slack` (running under the bridge), 🔗 (already has a thread). |
 | `resume <n>` | Attach session `n` from the last `sessions` listing to a new thread, with full context. |
 | `resume <sessionPath>` | Same, by explicit `.jsonl` path. Already-attached sessions link back to their existing thread instead of double-attaching. |
@@ -103,13 +104,17 @@ Sessions are standard omp sessions — they also appear in `omp hub` (badged
 
 ```
 you   run omp add a --json flag to the sessions command
-bot   ▶ slack:add a --json flag to the sessions command   (thread opens)
-bot   ⏳ starting → 🛠️ working  ⏵ read ⏵ edit ⏵ bash
-bot   ❓ Pick an output shape:   [array of objects] [NDJSON]
+bot   └ ▶ slack:add a --json flag to the sessions command   (in a thread on your message)
+bot     ⏳ starting → 🛠️ working  💭 Checking how sessions is listed today  ⏵ read  💭 Picking the output shape  ⏵ edit
+bot     ❓ Pick an output shape:   [array of objects] [NDJSON]
 you   (click "array of objects")
-bot   ✅ array of objects — @you
-bot   Done — sessions --json emits a single array; test added. (full diff in response.md)
+bot     ✅ array of objects — @you
+bot     Done — sessions --json emits a single array; test added. (full diff in response.md)
 ```
+
+The status line keeps the last four things the agent did: `💭` lines are what it
+is reasoning about (headline or newest sentence, refreshed at most every 2s),
+`⏵` lines are tool calls.
 
 ### Example: steer mid-task
 

@@ -62,11 +62,14 @@ Runtime: **Bun only, zero npm dependencies.** `fetch`, `WebSocket`, `Bun.file`,
 
 ## UX (DM with the bot)
 
-Top-level DM commands (first token, case-insensitive):
+Top-level DM commands (first token, case-insensitive). Every reply is a **thread
+reply on the triggering message** (`thread_ts` = that message's `ts`, or its
+existing root when the command was typed inside a thread), so a task's whole
+thread hangs under what the user asked for:
 
 | Command | Behavior |
 |---|---|
-| `run <alias\|path> <prompt…>` | New task: resolve dir (alias from `REPOS` config, else absolute path under `$HOME`), spawn RPC proc, `set_session_name` from prompt, post task header message — its `ts` becomes the thread id, register thread. |
+| `run <alias\|path> <prompt…>` | New task: resolve dir (alias from `REPOS` config, else absolute path under `$HOME`), spawn RPC proc, `set_session_name` from prompt, post the task header as the first reply under the user's message — that message's `ts` is the thread id, register thread. |
 | `sessions` | List registry entries (live ⏵ / idle ⏸, dir, name, age) + how to continue (`reply in thread`) . |
 | `resume <sessionPath>` | Attach an existing on-disk session (e.g. one started in terminal): spawn `--resume`, post header, register thread. |
 | `status` | Bridge status: live procs / registry size / uptime. |
@@ -77,10 +80,11 @@ In-thread messages:
 - Pending `input`/`editor` request for that thread → the message text answers it.
 - `abort` → RPC `abort`. `kill` → stop proc (session file persists, still resumable). `status` → `get_state` summary.
 - Anything else → `prompt` with `streamingBehavior:"steer"` (steers mid-turn, prompts when idle). Proc dead → respawn `--resume` first (lazy reattach).
+- Thread the registry doesn't know (a reply under a `sessions` listing or a help message) → handled as a fresh top-level command, so the reply is answered instead of dropped.
 
 Agent → Slack rendering:
 
-- Per turn, one **status message** posted on `agent_start`, then `chat.update`d on a ≥2s throttle: spinner line + last few `tool_execution_start` labels (`⏵ bash`, `⏵ edit src/x.ts`). No token-level streaming (Slack rate limits; deltas add fragility).
+- Per turn, one **status message** posted on `agent_start`, then `chat.update`d on a ≥2s throttle: phase line + the last 4 timeline lines. The timeline interleaves thinking excerpts (`💭 …`, one line per thinking block, rewritten in place as it streams) with `tool_execution_start` labels (`⏵ bash`, `⏵ edit src/x.ts`), so a turn that reasons before touching a tool still shows movement. Thinking excerpts come from `message_update` → `assistantMessageEvent` (`thinking_delta`/`thinking_end`); `blocks.ts:thinkingLine` renders the newest complete reasoning-summary headline (gpt-5.x/codex `**Headline**`), else the newest finished sentence, and nothing while the block is still a stub — no token-level streaming (Slack rate limits; deltas add fragility).
 - On `agent_end`: fetch `get_last_assistant_text`, replace status message with final text (mrkdwn, 3000-char section chunks; text > 12k chars → `files.uploadV2` snippet attached to thread).
 - `extension_ui_request select/confirm` → Block Kit message: question + option descriptions; ≤5 options → buttons, else `static_select`; `action_id` = `ui:<requestId>`, value = option label. Click → `extension_ui_response` + edit the ask message to show the choice (`✅ label — answered by @user`). `cancel` request (`targetId`) → edit ask message to `⌛ cancelled` and drop pending state.
 - `notify` → small thread message (info/warn/error prefix). `setStatus`/`open_url` → thread message (URL as link). Everything user-visible passes through `blocks.ts` sanitizers (mrkdwn-escape `&<>`, truncate).

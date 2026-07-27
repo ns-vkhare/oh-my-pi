@@ -15,6 +15,8 @@ const OPTION_LABEL_MAX = 75;
 const BUTTON_LIMIT = 5;
 /** finalTextBlocks caps its section count; caller uploads the full text. */
 const FINAL_BLOCK_CAP = 8;
+/** Status-line budget for one thinking excerpt. */
+const THINKING_EXCERPT_MAX = 90;
 
 const PHASE_EMOJI: Record<string, string> = {
 	starting: "⏳",
@@ -93,12 +95,46 @@ export function taskHeaderBlocks(args: { name: string; cwd: string; sessionPath?
 	return blocks;
 }
 
-/** Single mrkdwn status line: phase emoji + up to the last 4 tool labels. */
-export function statusText(args: { phase: "starting" | "working" | "done" | "error" | "killed"; toolLines: string[]; detail?: string }): string {
+/** Single mrkdwn status line: phase emoji + up to the last 4 timeline lines. */
+export function statusText(args: { phase: "starting" | "working" | "done" | "error" | "killed"; lines: string[]; detail?: string }): string {
 	const emoji = PHASE_EMOJI[args.phase] ?? "•";
-	const lines = [`${emoji} *${args.phase}*${args.detail ? ` — ${escapeMrkdwn(args.detail)}` : ""}`];
-	for (const line of args.toolLines.slice(-4)) lines.push(`> ${escapeMrkdwn(line)}`);
-	return lines.join("\n");
+	const out = [`${emoji} *${args.phase}*${args.detail ? ` — ${escapeMrkdwn(args.detail)}` : ""}`];
+	for (const line of args.lines.slice(-4)) out.push(`> ${escapeMrkdwn(line)}`);
+	return out.join("\n");
+}
+
+/** gpt-5.x pads every reasoning-summary part with an empty HTML comment. */
+const THINKING_NOISE_RE = /<!--\s*-->/g;
+/** Bold headline a gpt-5.x/codex reasoning-summary part opens with (line-anchored: bold mid-prose is not a headline). */
+const THINKING_HEADLINE_RE = /^\s*\*\*(.+?)\*\*/gm;
+/** One finished sentence: ends at a terminator that closes a word, so `blocks.ts:112` and `3.5` stay inside the sentence. */
+const THINKING_SENTENCE_RE = /[^\n]*?[.!?:]+(?=\s|$)/g;
+/** Shorter terminator-free tails are first-delta stubs (`I need to ch`), not thoughts. */
+const THINKING_MIN_TAIL = 24;
+
+/**
+ * Status line for a thinking block, rendered from a *streaming* buffer where
+ * every prefix is a legal input: the newest complete reasoning-summary headline
+ * (gpt-5.x/codex), else the newest finished sentence of raw thinking, else a
+ * long-enough tail for models that think in fragments. Empty while the block has
+ * only a stub — better no line than `💭 I` or a half-written `**headl`.
+ */
+export function thinkingLine(text: string): string {
+	const clean = text.replace(THINKING_NOISE_RE, "");
+	let excerpt = "";
+	for (const match of clean.matchAll(THINKING_HEADLINE_RE)) excerpt = match[1]!.trim();
+	if (!excerpt) {
+		for (const match of clean.matchAll(THINKING_SENTENCE_RE)) excerpt = match[0]!.trim();
+	}
+	if (!excerpt) {
+		let tail = "";
+		for (const raw of clean.split("\n")) {
+			const line = raw.trim();
+			if (line) tail = line;
+		}
+		if (!tail.startsWith("**") && tail.length >= THINKING_MIN_TAIL) excerpt = tail;
+	}
+	return excerpt ? `💭 ${truncate(excerpt, THINKING_EXCERPT_MAX)}` : "";
 }
 
 /** Blocks for a UI request needing a Slack answer (select/confirm/input/editor). */

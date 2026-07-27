@@ -41,6 +41,22 @@ export interface OmpSessionState {
 	contextUsage?: { tokens: number; contextWindow: number; percent: number } | null;
 }
 
+/**
+ * Streaming delta carried by `message_update` — the subset the bridge reads.
+ * Types mirror `AssistantMessageEvent` in packages/ai: `thinking_start` /
+ * `thinking_delta` / `thinking_end`, and the `text_*` / `toolcall_*` families
+ * whose arrival means the open thinking block is over.
+ */
+export interface OmpAssistantMessageEvent {
+	type: string;
+	/** Increment on a `*_delta`. */
+	delta?: string;
+	/** Whole block content on a `*_end`. */
+	content?: string;
+	/** Index of the assistant content block this delta belongs to. */
+	contentIndex?: number;
+}
+
 /** Agent lifecycle/tool events forwarded by RPC mode (fields beyond `type` are loosely typed on purpose — treat unknown shapes as absent). */
 export interface OmpAgentEvent {
 	type:
@@ -61,6 +77,8 @@ export interface OmpAgentEvent {
 	/** Present on tool_execution_* in current runtime; extract defensively. */
 	toolName?: string;
 	args?: Record<string, unknown>;
+	/** Present on `message_update`: the streaming delta that triggered it. */
+	assistantMessageEvent?: OmpAssistantMessageEvent;
 	[key: string]: unknown;
 }
 

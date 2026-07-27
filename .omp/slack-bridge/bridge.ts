@@ -15,6 +15,7 @@ import {
 	notifyText,
 	statusText,
 	taskHeaderBlocks,
+	thinkingLine,
 	uiRequestBlocks,
 } from "./blocks";
 import { BridgeAlreadyRunningError, type ControlHost, startControlServer } from "./control";
@@ -24,6 +25,8 @@ import { TaskRegistry } from "./registry";
 import type {
 	AskToolArgs,
 	BridgeConfig,
+	OmpAgentEvent,
+	OmpAssistantMessageEvent,
 	OmpHostToolCall,
 	OmpHostToolCancel,
 	OmpHostToolDefinition,
@@ -71,7 +74,10 @@ interface LiveTask {
 	statusTs?: string;
 	/** In-flight status post — guards against agent_start/turn_start double-posting. */
 	statusPost?: Promise<void>;
-	toolLines: string[];
+	/** Turn timeline rendered into the status message: thinking excerpts and tool labels, in arrival order. */
+	statusLines: string[];
+	/** Open thinking block: its content-block index, its slot in `statusLines` (unset until it has renderable text), and the text so far. */
+	thinking?: { block: number; line?: number; text: string };
 	turnActive: boolean;
 	pendingUi: Map<string, PendingUi>;
 	pendingTextUi?: PendingUi;
@@ -80,6 +86,8 @@ interface LiveTask {
 	statusByKey: Map<string, string>;
 	/** Throttle bookkeeping for status chat.update. */
 	lastStatusUpdate: number;
+	/** Last status text sent this turn — the immediate and trailing flush often render the same lines, and Slack should not be told twice. */
+	lastStatusText?: string;
 	statusUpdateTimer?: ReturnType<typeof setTimeout>;
 	/** True while a park is stopping this task — refuses concurrent steer/prompt/park. */
 	parking?: boolean;
@@ -442,6 +450,16 @@ export class Bridge {
 		await this.#handleTopLevel(inbound);
 	}
 
+	/**
+	 * Thread every reply hangs under: the triggering message itself for a
+	 * top-level DM — so the answer (and a task's whole thread) reads as a reply
+	 * to what the user typed — or the existing root when the message is already
+	 * a thread reply, since Slack has no nested threads.
+	 */
+	#replyThread(msg: SlackInboundMessage): string {
+		return msg.threadTs ?? msg.ts;
+	}
+
 	async #handleTopLevel(msg: SlackInboundMessage): Promise<void> {
 		const text = msg.text.trim();
 		const [first, ...restTokens] = text.split(/\s+/);
@@ -457,7 +475,7 @@ export class Bridge {
 		} else if (command === "status") {
 			await this.#cmdStatus(msg);
 		} else {
-			await this.#slack.postMessage({ channel: msg.channel, text: HELP_TEXT });
+			await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: HELP_TEXT });
 		}
 	}
 
@@ -479,12 +497,13 @@ export class Bridge {
 			}
 		}
 		if (!prompt) {
-			await this.#slack.postMessage({ channel: msg.channel, text: "Usage: `run <alias|path> <prompt…>`" });
+			await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: "Usage: `run <alias|path> <prompt…>`" });
 			return;
 		}
 		if (!cwd) {
 			await this.#slack.postMessage({
 				channel: msg.channel,
+				threadTs: this.#replyThread(msg),
 				text: `Unknown repo \`${dirToken}\`. Use a REPOS alias or an absolute path under \`${this.#home()}\`, or set DEFAULT_REPO.`,
 			});
 			return;
@@ -494,19 +513,24 @@ export class Bridge {
 			const names = [...this.#live.values()].map((t) => `• ${t.record.name}`).join("\n");
 			await this.#slack.postMessage({
 				channel: msg.channel,
+				threadTs: this.#replyThread(msg),
 				text: `At capacity (${this.#config.maxTasks} live tasks). Finish or \`kill\` one first:\n${names}`,
 			});
 			return;
 		}
 
 		const name = `${this.#config.sessionNamePrefix}${headOf(prompt)}`;
-		const headerTs = await this.#slack.postMessage({
+		// The task thread IS the user's message: the header is its first reply, so
+		// everything about the task reads as an answer to what they asked for.
+		const threadTs = this.#replyThread(msg);
+		await this.#slack.postMessage({
 			channel: msg.channel,
+			threadTs,
 			text: name,
 			blocks: taskHeaderBlocks({ name, cwd }),
 		});
 		const record: TaskRecord = {
-			threadTs: headerTs,
+			threadTs,
 			channel: msg.channel,
 			cwd,
 			name,
@@ -522,6 +546,7 @@ export class Bridge {
 		if (targets.length === 0) {
 			await this.#slack.postMessage({
 				channel: msg.channel,
+				threadTs: this.#replyThread(msg),
 				text: alias
 					? `Unknown repo \`${alias}\`. Use a REPOS alias or an absolute path under \`${this.#home()}\`.`
 					: "No repos configured — set `REPOS` in `.env`.",
@@ -557,7 +582,11 @@ export class Bridge {
 			}
 		}
 		this.#lastListing.set(msg.channel, listing);
-		await this.#slack.postMessage({ channel: msg.channel, text: `${lines.join("\n")}\n_\`resume <n>\` to attach one._` });
+		await this.#slack.postMessage({
+			channel: msg.channel,
+			threadTs: this.#replyThread(msg),
+			text: `${lines.join("\n")}\n_\`resume <n>\` to attach one._`,
+		});
 	}
 
 	/** Repo alias→path pairs to list: the named one, or every configured repo. */
@@ -582,7 +611,7 @@ export class Bridge {
 
 	async #cmdResume(msg: SlackInboundMessage, token: string | undefined): Promise<void> {
 		if (!token) {
-			await this.#slack.postMessage({ channel: msg.channel, text: "Usage: `resume <n|sessionPath>`" });
+			await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: "Usage: `resume <n|sessionPath>`" });
 			return;
 		}
 
@@ -591,7 +620,11 @@ export class Bridge {
 		if (/^\d+$/.test(token)) {
 			const picked = this.#lastListing.get(msg.channel)?.get(Number.parseInt(token, 10));
 			if (!picked) {
-				await this.#slack.postMessage({ channel: msg.channel, text: `No session #${token} in the last listing — run \`sessions\` first.` });
+				await this.#slack.postMessage({
+					channel: msg.channel,
+					threadTs: this.#replyThread(msg),
+					text: `No session #${token} in the last listing — run \`sessions\` first.`,
+				});
 				return;
 			}
 			sessionPath = picked.path;
@@ -604,7 +637,11 @@ export class Bridge {
 		// cross-owner guard lands with the hub-side lock if it ever bites.
 		const live = this.#findLiveBySessionPath(sessionPath);
 		if (live) {
-			await this.#slack.postMessage({ channel: msg.channel, text: `Already live under the bridge — steer it in its thread (*${live.record.name}*).` });
+			await this.#slack.postMessage({
+				channel: msg.channel,
+				threadTs: this.#replyThread(msg),
+				text: `Already live under the bridge — steer it in its thread (*${live.record.name}*).`,
+			});
 			return;
 		}
 		// Dedup both `resume <n>` and `resume <sessionPath>`: an existing registry
@@ -614,6 +651,7 @@ export class Bridge {
 		if (attached) {
 			await this.#slack.postMessage({
 				channel: msg.channel,
+				threadTs: this.#replyThread(msg),
 				text: `Already attached — continue in its thread: *${attached.name}* (thread \`${attached.threadTs}\`).`,
 			});
 			return;
@@ -621,13 +659,16 @@ export class Bridge {
 
 		const name = `${this.#config.sessionNamePrefix}${basename(sessionPath)}`;
 		const cwd = listedCwd ?? this.#home();
-		const headerTs = await this.#slack.postMessage({
+		// Same as `run`: the resumed task's thread hangs under the user's message.
+		const threadTs = this.#replyThread(msg);
+		await this.#slack.postMessage({
 			channel: msg.channel,
+			threadTs,
 			text: name,
 			blocks: taskHeaderBlocks({ name, cwd, sessionPath }),
 		});
 		const record: TaskRecord = {
-			threadTs: headerTs,
+			threadTs,
 			channel: msg.channel,
 			cwd,
 			name,
@@ -643,6 +684,7 @@ export class Bridge {
 		const uptimeMin = Math.floor((Date.now() - this.#startedAt) / MINUTE_MS);
 		await this.#slack.postMessage({
 			channel: msg.channel,
+			threadTs: this.#replyThread(msg),
 			text: `*bridge* · ${this.#live.size} live · ${this.#registry.all().length} registered · up ${uptimeMin}m`,
 		});
 	}
@@ -651,7 +693,13 @@ export class Bridge {
 		let task = this.#live.get(threadTs);
 		if (!task) {
 			const record = this.#registry.byThread(threadTs);
-			if (!record?.sessionPath) return; // Unknown thread — ignore.
+			// Not a task thread — e.g. a reply under a `sessions` listing or a help
+			// message. Treat it as a fresh top-level command so the reply is answered
+			// instead of silently swallowed.
+			if (!record?.sessionPath) {
+				await this.#handleTopLevel(msg);
+				return;
+			}
 			await this.#spawn({ record, isNew: false, resumeSessionPath: record.sessionPath });
 			task = this.#live.get(threadTs);
 			if (!task) return;
@@ -807,7 +855,7 @@ export class Bridge {
 		const task: LiveTask = {
 			rpc,
 			record,
-			toolLines: [],
+			statusLines: [],
 			turnActive: false,
 			pendingUi: new Map(),
 			statusByKey: new Map(),
@@ -860,25 +908,62 @@ export class Bridge {
 		);
 	}
 
-	async #onEvent(task: LiveTask, event: { type: string; toolName?: string; args?: Record<string, unknown> }): Promise<void> {
+	async #onEvent(task: LiveTask, event: OmpAgentEvent): Promise<void> {
 		if (event.type === "agent_start" || event.type === "turn_start") {
 			task.turnActive = true;
-			task.toolLines = [];
+			task.statusLines = [];
+			task.thinking = undefined;
+			task.lastStatusText = undefined;
 			await this.#ensureStatusMessage(task);
+			return;
+		}
+		if (event.type === "message_update") {
+			this.#onAssistantDelta(task, event.assistantMessageEvent);
 			return;
 		}
 		if (event.type === "tool_execution_start") {
 			const label = toolLabel(event.toolName, event.args);
-			if (task.toolLines[task.toolLines.length - 1] !== label) task.toolLines.push(label);
+			if (task.statusLines[task.statusLines.length - 1] !== label) task.statusLines.push(label);
 			this.#throttledStatusUpdate(task);
 			return;
 		}
 		if (event.type === "agent_end") {
 			task.turnActive = false;
+			task.thinking = undefined;
 			this.#clearStatusTimer(task);
 			await this.#finishTurn(task);
 			this.#registry.touch(task.record.threadTs);
 		}
+	}
+
+	/**
+	 * Give each thinking block its own status line, rewritten in place as the
+	 * block streams — so a turn that reasons for a minute before its first tool
+	 * call still shows movement. Any other delta (text, tool call) closes the
+	 * open block, so the next one claims a fresh line instead of appending.
+	 * Slack traffic is unchanged: updates go through the same 2s throttle.
+	 */
+	#onAssistantDelta(task: LiveTask, delta: OmpAssistantMessageEvent | undefined): void {
+		if (!delta) return;
+		if (delta.type !== "thinking_delta" && delta.type !== "thinking_end") {
+			task.thinking = undefined;
+			return;
+		}
+		const block = delta.contentIndex ?? 0;
+		if (task.thinking?.block !== block) task.thinking = { block, text: "" };
+		const open = task.thinking;
+		open.text = delta.type === "thinking_end" ? (delta.content ?? open.text) : open.text + (delta.delta ?? "");
+		const line = thinkingLine(open.text);
+		if (line) {
+			if (open.line === undefined) {
+				open.line = task.statusLines.length;
+				task.statusLines.push(line);
+			} else {
+				task.statusLines[open.line] = line;
+			}
+			this.#throttledStatusUpdate(task);
+		}
+		if (delta.type === "thinking_end") task.thinking = undefined;
 	}
 
 	#ensureStatusMessage(task: LiveTask): Promise<void> {
@@ -890,7 +975,7 @@ export class Bridge {
 				task.statusTs = await this.#slack.postMessage({
 					channel: task.record.channel,
 					threadTs: task.record.threadTs,
-					text: statusText({ phase: "starting", toolLines: [] }),
+					text: statusText({ phase: "starting", lines: [] }),
 				});
 			} catch (err) {
 				console.error(`bridge: failed to post status message: ${String(err)}`);
@@ -919,13 +1004,12 @@ export class Bridge {
 
 	async #updateStatusMessage(task: LiveTask, phase: "starting" | "working" | "done" | "error" | "killed"): Promise<void> {
 		if (!task.statusTs) return;
+		const text = statusText({ phase, lines: task.statusLines });
+		if (text === task.lastStatusText) return; // Nothing moved since the last flush.
+		task.lastStatusText = text;
 		task.lastStatusUpdate = Date.now();
 		await this.#slack
-			.updateMessage({
-				channel: task.record.channel,
-				ts: task.statusTs,
-				text: statusText({ phase, toolLines: task.toolLines }),
-			})
+			.updateMessage({ channel: task.record.channel, ts: task.statusTs, text })
 			.catch(() => {});
 	}
 
@@ -962,6 +1046,7 @@ export class Bridge {
 				.catch((err) => console.error(`bridge: uploadText failed: ${String(err)}`));
 		}
 		task.statusTs = undefined; // Next turn posts a fresh status message.
+		task.lastStatusText = undefined;
 	}
 
 	async #onUiRequest(task: LiveTask, req: OmpUiRequest): Promise<void> {

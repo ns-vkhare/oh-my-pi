@@ -12,7 +12,7 @@
  */
 import { statSync } from "node:fs";
 import { ProcessTerminal, TUI } from "@oh-my-pi/pi-tui";
-import { getProjectDir } from "@oh-my-pi/pi-utils";
+import { getProjectDir, pathIsWithin } from "@oh-my-pi/pi-utils";
 import { initTheme } from "../modes/theme/theme";
 import { getRecentSessions } from "../session/session-listing";
 import { SessionManager } from "../session/session-manager";
@@ -175,9 +175,12 @@ async function buildRows(): Promise<HubRow[]> {
 		]);
 		// Sessions the Slack bridge drives headlessly have no tmux window, so they
 		// land among the idle rows — badge them and float them above the truly idle.
+		// The daemon reports every task it owns across every repo, so scope them to
+		// this hub's session dir exactly like the disk scan above — otherwise one
+		// project's hub lists another project's Slack tasks.
 		const bridgeByPath = new Map<string, BridgeTaskInfo>();
 		for (const task of bridgeTasks ?? []) {
-			if (task.sessionPath) bridgeByPath.set(task.sessionPath, task);
+			if (task.sessionPath && pathIsWithin(sessionDir, task.sessionPath)) bridgeByPath.set(task.sessionPath, task);
 		}
 		idleRows = recent
 			.filter(s => !livePaths.has(s.path))
