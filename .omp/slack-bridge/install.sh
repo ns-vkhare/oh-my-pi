@@ -91,6 +91,8 @@ install_launchd() {
   <dict>
     <key>OMP_BIN</key><string>$omp_bin</string>
     <key>PATH</key><string>$bin_path</string>
+$( [ -n "${NODE_EXTRA_CA_CERTS:-}" ] && printf '    <key>NODE_EXTRA_CA_CERTS</key><string>%s</string>\n' "$NODE_EXTRA_CA_CERTS" )
+$( [ -n "${SSL_CERT_FILE:-}" ] && printf '    <key>SSL_CERT_FILE</key><string>%s</string>\n' "$SSL_CERT_FILE" )
   </dict>
   <key>KeepAlive</key>
   <dict>
