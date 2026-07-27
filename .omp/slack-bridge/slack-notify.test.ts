@@ -60,7 +60,9 @@ function startCollector(): Collector {
 		received,
 		waitFor(n: number) {
 			if (received.length >= n) return Promise.resolve();
-			return new Promise<void>(resolve => waiters.push({ n, resolve }));
+			const { promise, resolve } = Promise.withResolvers<void>();
+			waiters.push({ n, resolve });
+			return promise;
 		},
 		stop() {
 			server.stop(true);

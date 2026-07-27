@@ -12,8 +12,8 @@
  * tsconfig, so it must NOT import "@oh-my-pi/pi-coding-agent" (not a dep). The
  * real omp runtime passes the full ExtensionAPI; we model only what we touch.
  */
-import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ControlRequest } from "./types";
 
 /** The `notify` variant of the frozen control-socket contract. */
@@ -35,7 +35,7 @@ export interface NotifyInput {
 
 // ponytail: hardcoded install location — the bridge owns this exact path and
 // there is only ever one per user. No config knob until a second one exists.
-const SOCK_PATH = join(homedir(), ".omp", "slack-bridge", "bridge.sock");
+const SOCK_PATH = path.join(os.homedir(), ".omp", "slack-bridge", "bridge.sock");
 
 /** Connect timeout for the fire-and-forget write. */
 const CONNECT_TIMEOUT_MS = 500;
@@ -52,7 +52,7 @@ function head(s: string | undefined): string {
 
 /** Pure: build the JSONL request body for a notification. */
 export function buildNotifyPayload(input: NotifyInput): NotifyRequest {
-	const label = input.name?.trim() || basename(input.cwd) || input.cwd || "session";
+	const label = input.name?.trim() || path.basename(input.cwd) || input.cwd || "session";
 	let text: string;
 	if (input.kind === "ask_pending") {
 		text = `❓ waiting on input: ${head(input.question)}`;
@@ -70,31 +70,31 @@ export function buildNotifyPayload(input: NotifyInput): NotifyRequest {
  */
 export function sendNotify(sockPath: string, payload: NotifyRequest): Promise<boolean> {
 	const line = `${JSON.stringify(payload)}\n`;
-	return new Promise<boolean>(resolve => {
-		let settled = false;
-		const done = (v: boolean) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			resolve(v);
-		};
-		const timer = setTimeout(() => done(false), CONNECT_TIMEOUT_MS);
-		Bun.connect({
-			unix: sockPath,
-			socket: {
-				open(sock) {
-					sock.write(line);
-					sock.end();
-					done(true);
-				},
-				data() {},
-				error() {
-					done(false);
-				},
-				close() {},
+	const { promise, resolve } = Promise.withResolvers<boolean>();
+	let settled = false;
+	const done = (v: boolean) => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timer);
+		resolve(v);
+	};
+	const timer = setTimeout(() => done(false), CONNECT_TIMEOUT_MS);
+	Bun.connect({
+		unix: sockPath,
+		socket: {
+			open(sock) {
+				sock.write(line);
+				sock.end();
+				done(true);
 			},
-		}).catch(() => done(false));
-	});
+			data() {},
+			error() {
+				done(false);
+			},
+			close() {},
+		},
+	}).catch(() => done(false));
+	return promise;
 }
 
 // ponytail: debounce records the timestamp on the check itself, so a notify

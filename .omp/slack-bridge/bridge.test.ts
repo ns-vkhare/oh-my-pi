@@ -670,3 +670,56 @@ describe("ask host tool", () => {
 		expect(rpc.hostToolResults).toHaveLength(0);
 	});
 });
+
+describe("control plane park/steer (regression)", () => {
+	async function liveTask(h: Harness): Promise<{ rpc: FakeRpc; sessionPath: string }> {
+		await h.slack.inject(dm("run omp do work"));
+		const rpc = h.rpcs[0]!;
+		return { rpc, sessionPath: rpc.state.sessionFile! };
+	}
+
+	test("park fails CLOSED when the subagent probe errors", async () => {
+		// F1: getSubagents() failure must NOT park (a session may still have live
+		// subagents); it returns {parked:false, reason:"subagent state unknown"}.
+		const h = await makeHarness(makeConfig());
+		const { rpc, sessionPath } = await liveTask(h);
+		await settle();
+		rpc.getSubagents = () => Promise.reject(new Error("rpc down"));
+		const res = await h.bridge.controlHost().park(sessionPath);
+		expect(res).toEqual({ parked: false, reason: "subagent state unknown" });
+		expect(rpc.commands).not.toContain("stop"); // never stopped an unknown-state session
+	});
+
+	test("a park in progress refuses a concurrent steer (TOCTOU lock)", async () => {
+		// F2: park claims the task synchronously (parking=true) before its first
+		// await, so a steer landing in the quiescence→stop window is rejected.
+		const h = await makeHarness(makeConfig());
+		const { rpc, sessionPath } = await liveTask(h);
+		await settle();
+		const gate = Promise.withResolvers<number>();
+		rpc.getSubagents = () => gate.promise; // park blocks inside the window
+		const parkP = h.bridge.controlHost().park(sessionPath); // sets parking=true now
+		await expect(h.bridge.controlHost().steer(sessionPath, "hi")).rejects.toThrow(/being parked/);
+		gate.resolve(0); // quiescent → park completes
+		expect(await parkP).toEqual({ parked: true });
+	});
+
+	test("resume <sessionPath> dedups against an existing registry record", async () => {
+		// F4: the raw-path form used to bypass the bySessionPath dedup that the
+		// numeric form had, spawning a second thread for the same session.
+		const sessionPath = `${HOME}/.omp/agent/sessions/dedup.jsonl`;
+		const seed: TaskRecord = {
+			threadTs: "T-existing",
+			channel: "D1",
+			cwd: `${HOME}/oh-my-pi-src`,
+			name: "slack:existing",
+			sessionPath,
+			createdAt: 1,
+			lastActivityAt: 1,
+		};
+		const h = await makeHarness(makeConfig(), [seed]);
+		await h.slack.inject(dm(`resume ${sessionPath}`));
+		expect(h.rpcs).toHaveLength(0); // no second RPC spawned
+		expect(h.slack.posted.some((p) => p.args.text?.includes("Already attached"))).toBe(true);
+	});
+});

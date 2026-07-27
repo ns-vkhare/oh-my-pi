@@ -15,42 +15,105 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { matchesKey, ProcessTerminal, TUI } from "@oh-my-pi/pi-tui";
+import { matchesKey, ProcessTerminal, replaceTabs, TUI, truncateToWidth } from "@oh-my-pi/pi-tui";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
-import { bridgeStatus, interruptBridgeSession, parkBridgeSession, steerBridgeSession } from "../hub/bridge-client";
+import {
+	bridgeStatus,
+	interruptBridgeSession,
+	type ParkOutcome,
+	parkBridgeSession,
+	steerBridgeSession,
+} from "../hub/bridge-client";
 import { selfInvocation } from "../hub/tmux";
 import { AgentRegistry } from "../registry/agent-registry";
+import { TRUNCATE_LENGTHS } from "../tools/render-utils";
 import { AgentTranscriptViewer } from "./components/agent-transcript-viewer";
 import { theme } from "./theme/theme";
 
 /** How long to wait between park retries while the Slack side finishes its turn. */
 const PARK_RETRY_MS = 2000;
 
-/** A bridge `reason` is untrusted text on a one-row header line. */
-const MAX_REASON_CHARS = 60;
+/**
+ * Fit bridge-delivered text (Slack task name, park refusal reason) into a single
+ * header row. Both arrive over the control socket as arbitrary remote strings —
+ * `bridgeStatus` validates the wire *shape*, never the content — so a newline
+ * would silently cost the frame a row it never accounted for, a tab would drift
+ * the columns, and a raw ESC would reach the terminal verbatim. Same contract as
+ * the viewer's own `sanitizeErrorLine`; see AGENTS.md "TUI Sanitization".
+ */
+export function headerCell(text: string): string {
+	return truncateToWidth(replaceTabs(sanitizeText(text)).replace(/[\r\n]+/g, " "), TRUNCATE_LENGTHS.TITLE);
+}
 
 /** Resolved `--watch` target, or the message to print instead. */
 export type WatchTarget = { file: string; name: string } | { error: string };
 
-/** What {@link parkBridgeSession} can answer. */
-export type ParkOutcome = { parked: boolean; reason?: string } | null;
-
 export type PromoteDecision = { promote: true } | { promote: false; reason: string };
 
 /**
- * Whether a park response clears the way to resume the session in this terminal.
- * Only a *reasoned* refusal means "wait" — same reading as the resume-path
- * handshake in `main.ts`:
+ * Whether a park answer clears the way to resume the session in this terminal.
+ * Mirrors `checkSlackBridgeConflict` in `main.ts` so the two ownership paths
+ * cannot drift:
  *
- * - `null` — bridge unreachable. Nothing is holding the session, and this is
- *   the only way to reach one orphaned by a dead daemon.
- * - `{ parked: true }` — the bridge released it.
- * - `{ parked: false }` with no reason — the bridge does not own this session.
- * - `{ parked: false, reason }` — the Slack side is busy; retry.
+ * - `absent` — no daemon exists, so nothing is holding the session. This is
+ *   also the only way to reach one orphaned by a dead bridge.
+ * - `parked` — the bridge stopped its child for us.
+ * - `not-owned` — the bridge answered and does not drive this session.
+ * - `busy` — the Slack side is mid-flight; retry with its reason.
+ * - `indeterminate` — ownership UNKNOWN. Fails closed and retries: the daemon
+ *   may be alive and halfway through parking, and attaching on a guess puts two
+ *   agents on one session file.
  */
 export function decidePromotion(outcome: ParkOutcome): PromoteDecision {
-	if (outcome === null || outcome.parked || !outcome.reason) return { promote: true };
-	return { promote: false, reason: outcome.reason.slice(0, MAX_REASON_CHARS) };
+	switch (outcome.kind) {
+		case "absent":
+		case "parked":
+		case "not-owned":
+			return { promote: true };
+		case "busy":
+			return { promote: false, reason: outcome.reason };
+		case "indeterminate":
+			return { promote: false, reason: "bridge unresponsive" };
+	}
+}
+
+/** Whether a take-over attempt ended with the session in this terminal's hands. */
+export type OwnershipResult = "promote" | "cancelled";
+
+/** Injected so the retry protocol can be driven without a TUI or a real clock. */
+export interface OwnershipDeps {
+	/** True once the spectator no longer wants the session. Re-checked after every await. */
+	cancelled: () => boolean;
+	/** Surface a retry reason between attempts. */
+	onWait: (reason: string) => void;
+	sleep: (ms: number) => Promise<void>;
+}
+
+/**
+ * Retry `park` until the session is ours or the user gives up.
+ *
+ * The ordering here is the whole point. `park` is not a query: when it answers
+ * `parked` the bridge has ALREADY stopped its RPC child and told the Slack
+ * thread a terminal picked the session up. That cannot be undone, so a landed
+ * park is honoured even when Esc arrived while it was in flight — reporting
+ * "cancelled" there would leave a stopped session with no owner. Cancellation
+ * is only ever reported when nothing was parked.
+ */
+export async function acquireOwnership(
+	park: () => Promise<ParkOutcome>,
+	deps: OwnershipDeps,
+): Promise<OwnershipResult> {
+	for (;;) {
+		const outcome = await park();
+		if (outcome.kind === "parked") return "promote";
+		if (deps.cancelled()) return "cancelled";
+		const decision = decidePromotion(outcome);
+		if (decision.promote) return "promote";
+		deps.onWait(decision.reason);
+		await deps.sleep(PARK_RETRY_MS);
+		if (deps.cancelled()) return "cancelled";
+	}
 }
 
 /**
@@ -122,7 +185,7 @@ function spectate(file: string, name: string): Promise<boolean> {
 			sessionFile: file,
 			header: () => {
 				const lines = [
-					`${theme.bold(name)}  ${theme.fg("warning", "SPECTATING")} ${theme.fg("dim", "— owned by Slack")}`,
+					`${theme.bold(headerCell(name))}  ${theme.fg("warning", "SPECTATING")} ${theme.fg("dim", "— owned by Slack")}`,
 					theme.fg("dim", "Enter: steer · Ctrl+T: take over · Ctrl+X: interrupt · Esc: quit"),
 				];
 				if (status) lines.push(status);
@@ -189,18 +252,14 @@ function spectate(file: string, name: string): Promise<boolean> {
 		if (waiting) return;
 		waiting = true;
 		setStatus(theme.fg("dim", "taking over…"));
-		// ponytail: re-poll on a fixed sleep rather than track a cancellable timer —
-		// Esc clears `waiting`, so the loop exits at the next checkpoint.
-		while (waiting && !finished) {
-			const decision = decidePromotion(await parkBridgeSession(file));
-			if (!waiting || finished) return;
-			if (decision.promote) {
-				finish(true);
-				return;
-			}
-			setStatus(theme.fg("warning", `waiting: ${decision.reason} — Esc to cancel`));
-			await Bun.sleep(PARK_RETRY_MS);
-		}
+		const result = await acquireOwnership(() => parkBridgeSession(file), {
+			cancelled: () => finished || !waiting,
+			onWait: reason => setStatus(theme.fg("warning", `waiting: ${headerCell(reason)} — Esc to cancel`)),
+			// ponytail: a plain sleep, not a cancellable timer — `cancelled` is
+			// re-checked the moment it returns, so Esc costs at most one interval.
+			sleep: ms => Bun.sleep(ms),
+		});
+		if (result === "promote") finish(true);
 	};
 
 	ui.showOverlay(viewer, { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0, fullscreen: true });

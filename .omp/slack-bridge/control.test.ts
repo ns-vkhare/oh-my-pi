@@ -179,3 +179,111 @@ test("controlRequest times out when the server never responds", async () => {
 		silent.stop(true);
 	}
 });
+
+test("single-instance: a slow-but-live server is detected, not displaced", async () => {
+	// A live listener that answers ping slower than the probe window: must NOT be
+	// unlinked/rebound (regression — a busy bridge would otherwise be clobbered).
+	const p = sockPath();
+	const live = Bun.listen<{ b: string }>({
+		unix: p,
+		socket: {
+			open(s) {
+				s.data = { b: "" };
+			},
+			data(s, chunk) {
+				s.data.b += chunk.toString();
+				if (s.data.b.includes("\n")) {
+					// Real timer (rule exception): the probe under test uses a real
+					// setTimeout over live socket I/O; fake timers can't drive it. 800ms
+					// comfortably clears the 500ms PING_PROBE_MS window.
+					setTimeout(() => {
+						try {
+							s.write(`${JSON.stringify({ ok: true, pid: 9999 })}\n`);
+						} catch {
+							// peer gone
+						}
+					}, 800);
+				}
+			},
+		},
+	});
+	let caught: unknown;
+	try {
+		track(await startControlServer(p, new FakeHost()));
+	} catch (err) {
+		caught = err;
+	} finally {
+		live.stop(true);
+	}
+	expect(caught).toBeInstanceOf(BridgeAlreadyRunningError);
+});
+
+test("a multibyte char split across chunks reaches the host intact", async () => {
+	// Regression: per-chunk toString() mangled a 3-byte char split at a chunk
+	// boundary; streaming TextDecoder must hold the partial byte.
+	const p = sockPath();
+	const host = new FakeHost();
+	track(await startControlServer(p, host));
+	const req = { op: "notify", sessionPath: "/s.jsonl", cwd: "/c", kind: "turn_end", text: "cost 5€ done" };
+	const full = Buffer.from(`${JSON.stringify(req)}\n`, "utf8");
+	const euro = full.indexOf(0xe2); // first byte of the 3-byte "€"
+	const resp = await new Promise<Record<string, unknown>>((resolve) => {
+		let buf = "";
+		Bun.connect<undefined>({
+			unix: p,
+			socket: {
+				open(s) {
+					s.write(full.subarray(0, euro + 1)); // ends mid-€
+					// Real timer (rule exception): a tick gap forces the server to see
+					// two distinct `data` events — the split that triggered the bug.
+					setTimeout(() => s.write(full.subarray(euro + 1)), 20);
+				},
+				data(_s, chunk) {
+					buf += chunk.toString();
+					const nl = buf.indexOf("\n");
+					if (nl !== -1) resolve(JSON.parse(buf.slice(0, nl)));
+				},
+			},
+		});
+	});
+	expect(resp).toEqual({ ok: true });
+	expect(host.notifiedWith?.text).toBe("cost 5€ done");
+});
+
+test("pipelined requests answer in arrival order", async () => {
+	// Regression: `void handleLine` dispatched pipelined requests concurrently, so
+	// a fast 2nd request could answer before a slow 1st — positional correlation
+	// broken. park is delayed by a fixed microtask chain (deterministic, no wall
+	// clock); ping is instant. The per-connection queue must still emit park first.
+	const p = sockPath();
+	const host = new FakeHost();
+	host.park = async () => {
+		for (let i = 0; i < 50; i++) await Promise.resolve(); // slower than instant ping
+		return { parked: true };
+	};
+	track(await startControlServer(p, host));
+	const order = await new Promise<string[]>((resolve) => {
+		const seen: string[] = [];
+		let buf = "";
+		Bun.connect<undefined>({
+			unix: p,
+			socket: {
+				open(s) {
+					s.write(`${JSON.stringify({ op: "park", sessionPath: "/s" })}\n${JSON.stringify({ op: "ping" })}\n`);
+				},
+				data(_s, chunk) {
+					buf += chunk.toString();
+					let nl = buf.indexOf("\n");
+					while (nl !== -1) {
+						const line = buf.slice(0, nl);
+						seen.push(line.includes("parked") ? "park" : line.includes("pid") ? "ping" : "?");
+						buf = buf.slice(nl + 1);
+						nl = buf.indexOf("\n");
+						if (seen.length === 2) resolve(seen);
+					}
+				},
+			},
+		});
+	});
+	expect(order).toEqual(["park", "ping"]);
+});

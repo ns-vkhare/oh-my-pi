@@ -58,12 +58,20 @@ echo "next: create your Slack app from manifest.json (see README.md), then: cd $
 
 # Optional: keep the bridge alive across logins via a launchd user agent.
 install_launchd() {
-	local bun_bin plist label
+	local bun_bin omp_bin plist label bin_path
 	bun_bin="$(command -v bun || true)"
 	if [[ -z "$bun_bin" ]]; then
 		echo "cannot install launchd agent: bun not on PATH" >&2
 		return 1
 	fi
+	omp_bin="$(command -v omp || true)"
+	if [[ -z "$omp_bin" ]]; then
+		echo "cannot install launchd agent: omp not on PATH (bridge needs it to spawn agents)" >&2
+		return 1
+	fi
+	# launchd starts with a minimal PATH, so seed one covering the bun + omp
+	# dirs and pin OMP_BIN to the absolute omp resolved at install time.
+	bin_path="$(dirname "$bun_bin"):$(dirname "$omp_bin"):/usr/bin:/bin"
 	label="com.omp.slack-bridge"
 	plist="$HOME/Library/LaunchAgents/$label.plist"
 	mkdir -p "$HOME/Library/LaunchAgents"
@@ -79,7 +87,15 @@ install_launchd() {
     <string>bridge.ts</string>
   </array>
   <key>WorkingDirectory</key><string>$DEST</string>
-  <key>KeepAlive</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OMP_BIN</key><string>$omp_bin</string>
+    <key>PATH</key><string>$bin_path</string>
+  </dict>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$DEST/bridge.log</string>
   <key>StandardErrorPath</key><string>$DEST/bridge.log</string>

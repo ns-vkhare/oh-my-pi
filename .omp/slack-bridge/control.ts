@@ -10,7 +10,7 @@
  * {@link controlRequest}; served by the bridge daemon via {@link startControlServer}.
  */
 
-import { unlink } from "node:fs/promises";
+import * as fs from "node:fs/promises";
 import type { ControlRequest, ControlResponse, ControlTaskInfo } from "./types";
 
 /** Timeout for the startup ping probe (single-instance detection). */
@@ -91,6 +91,9 @@ async function dispatch(host: ControlHost, raw: unknown): Promise<ControlRespons
 /** Per-connection JSONL accumulation state. */
 interface ConnState {
 	buffer: string;
+	decoder: TextDecoder;
+	/** Serializes dispatch so pipelined requests answer in arrival order. */
+	queue: Promise<void>;
 }
 
 /**
@@ -120,17 +123,18 @@ export async function startControlServer(sockPath: string, host: ControlHost): P
 		unix: sockPath,
 		socket: {
 			open(socket) {
-				socket.data = { buffer: "" };
+				socket.data = { buffer: "", decoder: new TextDecoder(), queue: Promise.resolve() };
 			},
 			data(socket, chunk) {
-				// ponytail: chunk.toString() assumes JSONL lines don't split a multibyte
-				// char across chunks; control payloads are small localhost messages.
-				socket.data.buffer += chunk.toString();
+				// Streaming decode holds a multibyte char split across chunks.
+				socket.data.buffer += socket.data.decoder.decode(chunk, { stream: true });
 				let nl = socket.data.buffer.indexOf("\n");
 				while (nl !== -1) {
 					const line = socket.data.buffer.slice(0, nl);
 					socket.data.buffer = socket.data.buffer.slice(nl + 1);
-					void handleLine(socket, line);
+					// Chain onto the per-connection queue: one response per request,
+					// emitted in arrival order even when the host resolves out of order.
+					socket.data.queue = socket.data.queue.then(() => handleLine(socket, line));
 					nl = socket.data.buffer.indexOf("\n");
 				}
 			},
@@ -141,7 +145,7 @@ export async function startControlServer(sockPath: string, host: ControlHost): P
 		async stop() {
 			server.stop(true);
 			try {
-				await unlink(sockPath);
+				await fs.unlink(sockPath);
 			} catch {
 				// socket file already gone — nothing to do
 			}
@@ -156,6 +160,7 @@ export async function startControlServer(sockPath: string, host: ControlHost): P
 export function controlRequest(sockPath: string, req: ControlRequest, timeoutMs = 2000): Promise<ControlResponse> {
 	const { promise, resolve, reject } = Promise.withResolvers<ControlResponse>();
 	let buffer = "";
+	const decoder = new TextDecoder();
 	let settled = false;
 	let sock: Bun.Socket<undefined> | undefined;
 
@@ -186,7 +191,7 @@ export function controlRequest(sockPath: string, req: ControlRequest, timeoutMs 
 				}
 			},
 			data(_socket, chunk) {
-				buffer += chunk.toString();
+				buffer += decoder.decode(chunk, { stream: true });
 				const nl = buffer.indexOf("\n");
 				if (nl === -1) return;
 				const line = buffer.slice(0, nl);
@@ -205,6 +210,16 @@ export function controlRequest(sockPath: string, req: ControlRequest, timeoutMs 
 		},
 	})
 		.then((socket) => {
+			// The timeout may have already fired before connect resolved; close the
+			// now-orphaned socket instead of leaking it.
+			if (settled) {
+				try {
+					socket.end();
+				} catch {
+					// already closed
+				}
+				return;
+			}
 			sock = socket;
 		})
 		.catch((err) => {
@@ -220,18 +235,21 @@ export function controlRequest(sockPath: string, req: ControlRequest, timeoutMs 
  * stale, unlink it, and let the caller bind fresh.
  */
 async function assertSingleInstance(sockPath: string): Promise<void> {
-	let response: ControlResponse | undefined;
+	let response: ControlResponse;
 	try {
 		response = await controlRequest(sockPath, { op: "ping" }, PING_PROBE_MS);
-	} catch {
-		response = undefined;
+	} catch (err) {
+		// A connect failure (err.code set: ENOENT/ECONNREFUSED/…) means nothing is
+		// listening → the socket file is stale/absent, safe to unlink and rebind.
+		// A timeout or early close (plain Error, no code) means something IS
+		// listening but slow/foreign — never displace it.
+		if (err !== null && typeof err === "object" && "code" in err && typeof err.code === "string") {
+			await fs.unlink(sockPath).catch(() => {});
+			return;
+		}
+		throw new BridgeAlreadyRunningError(0);
 	}
-	if (response && response.ok && "pid" in response) {
-		throw new BridgeAlreadyRunningError(response.pid);
-	}
-	try {
-		await unlink(sockPath);
-	} catch {
-		// no stale file — first start
-	}
+	if (response.ok && "pid" in response) throw new BridgeAlreadyRunningError(response.pid);
+	// Connected and answered, but not our ping contract → occupied; refuse to clobber.
+	throw new BridgeAlreadyRunningError(0);
 }

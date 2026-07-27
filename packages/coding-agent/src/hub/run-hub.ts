@@ -181,7 +181,7 @@ async function buildRows(): Promise<HubRow[]> {
 		idleRows = recent
 			.filter(s => !livePaths.has(s.path))
 			// Stable sort: bridge-owned first, each group keeping its recency order.
-			// Sorted before the slice so a long-lived quiet bridge session is never cut.
+			// Before the slice, so a bridge row inside the fetch window is never cut.
 			.sort((a, b) => Number(bridgeByPath.has(b.path)) - Number(bridgeByPath.has(a.path)))
 			.slice(0, IDLE_SESSION_LIMIT)
 			// ponytail: a bridge row stays `live: false` (no tmux window of its own), so
@@ -198,6 +198,22 @@ async function buildRows(): Promise<HubRow[]> {
 					windowId: undefined,
 				};
 			});
+		// The fetch above truncates by recency (session-listing.ts:587), so a bridge
+		// session quieter than IDLE_SESSION_LIMIT other sessions never even reaches
+		// `recent` — the sort cannot rescue what was already dropped. Recover it from
+		// the bridge's own metadata; BridgeTaskInfo carries the name, so no disk read.
+		// Overshooting IDLE_SESSION_LIMIT is fine: HubView caps the rows it paints.
+		for (const [sessionPath, task] of bridgeByPath) {
+			if (livePaths.has(sessionPath) || idleRows.some(r => r.sessionPath === sessionPath)) continue;
+			idleRows.unshift({
+				key: sessionPath,
+				title: task.name,
+				meta: task.turnActive ? "live · slack · working" : "live · slack",
+				live: false,
+				sessionPath,
+				windowId: undefined,
+			});
+		}
 	} catch {
 		idleRows = [];
 	}

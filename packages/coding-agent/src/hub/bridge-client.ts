@@ -45,28 +45,44 @@ interface ControlResponse {
 const DEFAULT_SOCKET_PATH = path.join(os.homedir(), ".omp", "slack-bridge", "bridge.sock");
 
 /**
+ * Park deadline. Must clear the daemon's own worst case end to end — its
+ * bounded subagent query plus `rpc.stop()`'s SIGTERM→SIGKILL grace — or a park
+ * that is merely slow reports `indeterminate` and the caller refuses to attach
+ * to a session that did in fact get released.
+ */
+const PARK_TIMEOUT_MS = 10_000;
+
+/**
+ * Why a control request produced no usable answer. The distinction is
+ * load-bearing for ownership decisions: `absent` means no daemon exists to hold
+ * anything, while `indeterminate` means one may well be alive and mid-park —
+ * collapsing the two makes every caller fail *open* onto a session that is
+ * still owned. Display-only callers may still treat both as "no bridge".
+ */
+type ControlFailure = "absent" | "indeterminate";
+
+type ControlOutcome = { ok: ControlResponse } | { failed: ControlFailure };
+
+/**
  * One-shot JSONL round trip: connect, write the request, read the first line,
- * close. Resolves `null` on any failure (connect, timeout, close-before-reply,
- * unparseable line).
+ * close. Never throws. A refused connection or missing socket resolves
+ * `absent`; a timeout, an early close, or an unparseable line resolves
+ * `indeterminate` — the daemon may have received and acted on the request.
  *
  * ponytail: one connection per call — pooling only if hub polling ever matters.
  */
-async function controlRequest(
-	req: ControlRequest,
-	timeoutMs: number,
-	sockPath: string,
-): Promise<ControlResponse | null> {
-	const { promise, resolve } = Promise.withResolvers<string | null>();
+async function controlRequest(req: ControlRequest, timeoutMs: number, sockPath: string): Promise<ControlOutcome> {
+	const { promise, resolve } = Promise.withResolvers<{ line: string } | { failed: ControlFailure }>();
 	let settled = false;
-	const settle = (line: string | null): void => {
+	const settle = (result: { line: string } | { failed: ControlFailure }): void => {
 		if (settled) return;
 		settled = true;
-		resolve(line);
+		resolve(result);
 	};
 
 	let socket: Bun.Socket<undefined> | undefined;
 	let buffer = "";
-	const timer = setTimeout(() => settle(null), timeoutMs);
+	const timer = setTimeout(() => settle({ failed: "indeterminate" }), timeoutMs);
 
 	Bun.connect<undefined>({
 		unix: sockPath,
@@ -77,14 +93,16 @@ async function controlRequest(
 			data(_sock, chunk) {
 				buffer += chunk.toString();
 				const newline = buffer.indexOf("\n");
-				if (newline !== -1) settle(buffer.slice(0, newline));
+				if (newline !== -1) settle({ line: buffer.slice(0, newline) });
 			},
+			// Closed after the connection was established but before a full line:
+			// the daemon existed, so its handler may have run.
 			close() {
-				settle(null);
+				settle({ failed: "indeterminate" });
 			},
 			error(_sock, err) {
 				logger.debug("Slack bridge control socket error", { op: req.op, sockPath, error: err.message });
-				settle(null);
+				settle({ failed: "indeterminate" });
 			},
 		},
 	}).then(
@@ -94,71 +112,111 @@ async function controlRequest(
 			if (settled) sock.end();
 		},
 		(err: Error) => {
+			// Connect itself failed (no socket file, refused): nothing is listening.
 			logger.debug("Slack bridge unreachable", { op: req.op, sockPath, error: err.message });
-			settle(null);
+			settle({ failed: "absent" });
 		},
 	);
 
-	const line = await promise;
+	const result = await promise;
 	clearTimeout(timer);
 	socket?.end();
 
-	if (line === null) {
-		logger.debug("Slack bridge control request got no response", { op: req.op, sockPath, timeoutMs });
-		return null;
+	if ("failed" in result) {
+		logger.debug("Slack bridge control request got no response", {
+			op: req.op,
+			sockPath,
+			timeoutMs,
+			why: result.failed,
+		});
+		return result;
 	}
 	try {
-		return JSON.parse(line) as ControlResponse;
+		return { ok: JSON.parse(result.line) as ControlResponse };
 	} catch {
-		logger.debug("Slack bridge control response was not JSON", { op: req.op, sockPath, line });
-		return null;
+		logger.debug("Slack bridge control response was not JSON", { op: req.op, sockPath, line: result.line });
+		return { failed: "indeterminate" };
 	}
 }
 
 /**
- * Live Slack-owned tasks, or `null` when the bridge is unreachable.
+ * Live Slack-owned tasks, or `null` when the bridge produced no usable answer.
+ * A display path: an absent daemon and a wedged one look the same in a row list,
+ * so both collapse to `null` here.
  * @param timeoutMs Give up after this long (default 250ms — this runs on UI paths).
  * @param sockPath Override the control socket (tests / non-default state dirs).
  */
 export async function bridgeStatus(timeoutMs = 250, sockPath = DEFAULT_SOCKET_PATH): Promise<BridgeTaskInfo[] | null> {
-	const res = await controlRequest({ op: "status" }, timeoutMs, sockPath);
-	if (!res?.ok || !Array.isArray(res.tasks)) {
-		if (res?.error) logger.debug("Slack bridge status failed", { error: res.error });
+	const outcome = await controlRequest({ op: "status" }, timeoutMs, sockPath);
+	if (!("ok" in outcome)) return null;
+	const res = outcome.ok;
+	if (!res.ok || !Array.isArray(res.tasks)) {
+		if (res.error) logger.debug("Slack bridge status failed", { error: res.error });
 		return null;
 	}
 	return res.tasks;
 }
 
 /**
+ * The answer to "may this terminal take ownership of `sessionPath`?".
+ *
+ * Deliberately five states, not a boolean: three of them clear the way, and the
+ * two that do not are for opposite reasons. `indeterminate` is the one that
+ * used to hide inside `null` — the daemon may be alive and halfway through
+ * parking, so attaching on it races a live owner onto one session file.
+ */
+export type ParkOutcome =
+	/** No socket, or the connection was refused: no daemon exists to hold anything. */
+	| { kind: "absent" }
+	/** Timed out, closed early, or answered with garbage. Ownership is UNKNOWN — fail closed. */
+	| { kind: "indeterminate" }
+	/** The bridge stopped its RPC child; the session is now free. Irreversible. */
+	| { kind: "parked" }
+	/** The bridge answered and does not drive this session. */
+	| { kind: "not-owned" }
+	/** The Slack side is mid-flight and refused, with its reason. */
+	| { kind: "busy"; reason: string };
+
+/**
  * Ask the bridge to release the task owning `sessionPath` so a terminal can
- * attach to it. `{ parked: false, reason }` means the Slack side is busy;
- * `{ parked: false }` with no reason means the session simply is not
- * bridge-owned. `null` means the bridge is unreachable — proceed as usual.
- * @param timeoutMs Give up after this long (default 2000ms — parking stops an RPC child).
+ * attach to it. Parking stops the bridge's RPC child, posts a handoff note to
+ * the Slack thread, and drops the task from its live set — so a `parked` answer
+ * is a side effect that already happened, never a query result to discard.
+ *
+ * @param timeoutMs Give up after this long. The default clears the daemon's own
+ *   worst case: a bounded subagent query plus `stop()`'s SIGTERM→SIGKILL grace.
+ *   Below that, a slow-but-healthy park reads as `indeterminate`.
  * @param sockPath Override the control socket (tests / non-default state dirs).
  */
 export async function parkBridgeSession(
 	sessionPath: string,
-	timeoutMs = 2000,
+	timeoutMs = PARK_TIMEOUT_MS,
 	sockPath = DEFAULT_SOCKET_PATH,
-): Promise<{ parked: boolean; reason?: string } | null> {
-	const res = await controlRequest({ op: "park", sessionPath }, timeoutMs, sockPath);
-	if (!res?.ok || typeof res.parked !== "boolean") {
-		if (res?.error) logger.debug("Slack bridge park failed", { sessionPath, error: res.error });
-		return null;
+): Promise<ParkOutcome> {
+	const outcome = await controlRequest({ op: "park", sessionPath }, timeoutMs, sockPath);
+	if (!("ok" in outcome)) return { kind: outcome.failed };
+	const res = outcome.ok;
+	if (!res.ok || typeof res.parked !== "boolean") {
+		// The daemon is up but this request did not land cleanly; it may still
+		// have acted, so this is not "nothing owns the session".
+		logger.debug("Slack bridge park failed", { sessionPath, error: res.error });
+		return { kind: "indeterminate" };
 	}
-	return typeof res.reason === "string" ? { parked: res.parked, reason: res.reason } : { parked: res.parked };
+	if (res.parked) return { kind: "parked" };
+	return typeof res.reason === "string" && res.reason.length > 0
+		? { kind: "busy", reason: res.reason }
+		: { kind: "not-owned" };
 }
 
 /**
  * Collapse an ack-only response (`{ ok: true }`) to a tri-state: `true` when
  * the bridge accepted the op, `false` when it answered but refused (unknown
- * session, task already closed), `null` when it is unreachable.
+ * session, task already closed), `null` when it gave no usable answer.
  */
-function ack(res: ControlResponse | null, op: string, sessionPath: string): boolean | null {
-	if (!res) return null;
-	if (!res.ok) {
-		logger.debug("Slack bridge op refused", { op, sessionPath, error: res.error });
+function ack(outcome: ControlOutcome, op: string, sessionPath: string): boolean | null {
+	if (!("ok" in outcome)) return null;
+	if (!outcome.ok.ok) {
+		logger.debug("Slack bridge op refused", { op, sessionPath, error: outcome.ok.error });
 		return false;
 	}
 	return true;

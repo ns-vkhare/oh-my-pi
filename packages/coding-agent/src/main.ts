@@ -588,24 +588,37 @@ function exitWithSessionResolutionError(error: SessionResolutionError): never {
  *
  * The bridge daemon may already be driving `sessionPath` headlessly from Slack.
  * Ask it to park that task (stop its RPC child; the Slack thread survives) so
- * this terminal can take over. A busy task refuses with a reason and we bail
- * rather than pointing two agents at one session file. Returns the failure to
- * raise, or undefined to proceed: an unreachable bridge (null), a parked task,
- * and a session the bridge does not own all mean "carry on".
+ * this terminal can take over. Returns the failure to raise, or undefined to
+ * proceed.
+ *
+ * Three answers clear the way: no daemon at all, a task it parked for us, and a
+ * session it does not drive. A busy task refuses with a reason. An
+ * `indeterminate` answer — timeout, early close, garbage — fails CLOSED: the
+ * daemon may be alive and midway through parking, and guessing "free" there is
+ * how two agents end up appending to one session file.
  *
  * Skipped inside the bridge's own RPC children (`OMP_SLACK_BRIDGE`) and for
- * `--fork`, which copies the source session instead of attaching to it. Auto-resume
- * deliberately skips it too: a bare `omp` must never hard-fail just because Slack
- * happens to own the newest session.
+ * `--fork`, which copies the source session instead of attaching to it.
  */
 async function checkSlackBridgeConflict(sessionPath: string | undefined): Promise<SessionResolutionError | undefined> {
 	if (!sessionPath || $env.OMP_SLACK_BRIDGE) return undefined;
-	const result = await parkBridgeSession(path.resolve(sessionPath));
-	if (!result || result.parked || !result.reason) return undefined;
-	return new SessionResolutionError(
-		`Session is active on Slack (${result.reason}).`,
-		"Reply 'kill' or wait for it to finish, then retry.",
-	);
+	const outcome = await parkBridgeSession(path.resolve(sessionPath));
+	switch (outcome.kind) {
+		case "absent":
+		case "parked":
+		case "not-owned":
+			return undefined;
+		case "busy":
+			return new SessionResolutionError(
+				`Session is active on Slack (${outcome.reason}).`,
+				"Reply 'kill' or wait for it to finish, then retry.",
+			);
+		case "indeterminate":
+			return new SessionResolutionError(
+				"Slack bridge is unresponsive — cannot tell whether it still owns this session.",
+				"Retry in a moment, or stop the bridge daemon and try again.",
+			);
+	}
 }
 
 type MissingCwdMoveResult =
@@ -809,6 +822,15 @@ export async function createSessionManager(
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
 		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		// Same handshake as `--continue` (loading an existing file appends
+		// nothing, so it runs once continueRecent has picked the target). Unlike
+		// every other path this one must NOT hard-fail: a bare `omp` is not a
+		// request for that particular session, so a Slack-owned or unverifiable
+		// candidate just means "start fresh instead".
+		if (await checkSlackBridgeConflict(manager.getSessionFile())) {
+			writeStartupNotice(parsed, `${chalk.dim("Most recent session is busy on Slack — starting a new one.")}\n`);
+			return SessionManager.create(cwd, parsed.sessionDir);
+		}
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
 		}

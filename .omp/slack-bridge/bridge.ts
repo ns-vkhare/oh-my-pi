@@ -43,6 +43,8 @@ const REAPER_INTERVAL_MS = 60_000;
 /** Slack section text cap; longer final text is uploaded as a snippet. */
 const FINAL_INLINE_MAX = 2_900;
 const MINUTE_MS = 60_000;
+/** Park's subagent-count probe deadline; a slow/failed probe fails the park CLOSED. */
+const PARK_SUBAGENT_TIMEOUT_MS = 3_000;
 
 /** A UI request awaiting a Slack answer, plus the message showing it. */
 interface PendingUi {
@@ -79,6 +81,8 @@ interface LiveTask {
 	/** Throttle bookkeeping for status chat.update. */
 	lastStatusUpdate: number;
 	statusUpdateTimer?: ReturnType<typeof setTimeout>;
+	/** True while a park is stopping this task — refuses concurrent steer/prompt/park. */
+	parking?: boolean;
 	disposers: Array<() => void>;
 }
 
@@ -143,7 +147,7 @@ export function loadConfig(env: Record<string, string | undefined>, home: string
 		slackAppToken,
 		slackBotToken,
 		allowedUsers,
-		ompBin: env.OMP_BIN?.trim() || "omp",
+		ompBin: expandHome(env.OMP_BIN?.trim() || "omp", home),
 		repos,
 		defaultRepo: env.DEFAULT_REPO?.trim() || undefined,
 		maxTasks: Number.isFinite(maxTasksRaw) && maxTasksRaw > 0 ? maxTasksRaw : 4,
@@ -279,8 +283,8 @@ export class Bridge {
 	#shuttingDown = false;
 	/** Cached bot↔user DM channel for top-level notify posts (resolved lazily). */
 	#dmChannel: string | undefined;
-	/** index → session from the last `sessions` listing, consumed by `resume <n>`. */
-	#lastListing = new Map<number, { path: string; cwd: string }>();
+	/** channel → (index → session) from that channel's last `sessions` listing, consumed by `resume <n>`. */
+	#lastListing = new Map<string, Map<number, { path: string; cwd: string }>>();
 
 	constructor(deps: BridgeDeps) {
 		this.#config = deps.config;
@@ -347,29 +351,43 @@ export class Bridge {
 	async #controlPark(sessionPath: string): Promise<{ parked: boolean; reason?: string }> {
 		const task = this.#findLiveBySessionPath(sessionPath);
 		if (!task) return { parked: false }; // Not live under the bridge — caller may resume freely.
+		if (task.parking) return { parked: false, reason: "busy: park already in progress" };
 		if (task.turnActive) return { parked: false, reason: "busy: turn active" };
 		if (task.pendingUi.size > 0) return { parked: false, reason: "busy: pending UI request" };
 		if (task.pendingTextUi) return { parked: false, reason: "busy: pending input" };
 		if (task.pendingAsk) return { parked: false, reason: "busy: pending ask" };
-		const running = await task.rpc.getSubagents().catch(() => 0);
-		if (running > 0) return { parked: false, reason: `busy: ${running} subagents running` };
-		// Quiescent: stop the proc (registry entry + Slack thread survive; #onExit
-		// disposes and removes from #live). Post a handoff note to the thread.
-		await task.rpc.stop().catch(() => {});
-		await this.#slack
-			.postMessage({
-				channel: task.record.channel,
-				threadTs: task.record.threadTs,
-				text: "⏸ picked up in terminal — reply here to take back",
-			})
-			.catch(() => {});
-		this.#live.delete(task.record.threadTs);
-		return { parked: true };
+		// Claim the task synchronously (before any await) so a concurrent steer/park
+		// can't slip through the quiescence-check → stop() window (TOCTOU).
+		task.parking = true;
+		try {
+			// Fail CLOSED: an unknown subagent count must NOT park a session that may
+			// still have live subagents. Bound the probe so a hung RPC can't wedge park.
+			const running = await withTimeout(task.rpc.getSubagents(), PARK_SUBAGENT_TIMEOUT_MS).catch(() => undefined);
+			if (running === undefined) return { parked: false, reason: "subagent state unknown" };
+			if (running > 0) return { parked: false, reason: `busy: ${running} subagents running` };
+			// Quiescent: stop the proc and dispose listeners now (registry entry +
+			// Slack thread survive). Explicit dispose avoids the ~5s window where
+			// #onExit would otherwise still be pending during stop()'s grace period.
+			await task.rpc.stop().catch(() => {});
+			this.#disposeTask(task);
+			this.#live.delete(task.record.threadTs);
+			await this.#slack
+				.postMessage({
+					channel: task.record.channel,
+					threadTs: task.record.threadTs,
+					text: "⏸ picked up in terminal — reply here to take back",
+				})
+				.catch(() => {});
+			return { parked: true };
+		} finally {
+			task.parking = false;
+		}
 	}
 
 	async #controlSteer(sessionPath: string, text: string): Promise<void> {
 		const task = this.#findLiveBySessionPath(sessionPath);
 		if (!task) throw new Error("session not live under the bridge");
+		if (task.parking) throw new Error("session is being parked");
 		await task.rpc.prompt(text);
 		this.#registry.touch(task.record.threadTs);
 	}
@@ -538,7 +556,7 @@ export class Bridge {
 				lines.push(`${index}. ${this.#sessionBadges(session.path)}${sessionLine(session)}`);
 			}
 		}
-		this.#lastListing = listing;
+		this.#lastListing.set(msg.channel, listing);
 		await this.#slack.postMessage({ channel: msg.channel, text: `${lines.join("\n")}\n_\`resume <n>\` to attach one._` });
 	}
 
@@ -571,17 +589,9 @@ export class Bridge {
 		let sessionPath = token;
 		let listedCwd: string | undefined;
 		if (/^\d+$/.test(token)) {
-			const picked = this.#lastListing.get(Number.parseInt(token, 10));
+			const picked = this.#lastListing.get(msg.channel)?.get(Number.parseInt(token, 10));
 			if (!picked) {
 				await this.#slack.postMessage({ channel: msg.channel, text: `No session #${token} in the last listing — run \`sessions\` first.` });
-				return;
-			}
-			const attached = this.#registry.bySessionPath(picked.path);
-			if (attached) {
-				await this.#slack.postMessage({
-					channel: msg.channel,
-					text: `Already attached — continue in its thread: *${attached.name}* (thread \`${attached.threadTs}\`).`,
-				});
 				return;
 			}
 			sessionPath = picked.path;
@@ -597,10 +607,20 @@ export class Bridge {
 			await this.#slack.postMessage({ channel: msg.channel, text: `Already live under the bridge — steer it in its thread (*${live.record.name}*).` });
 			return;
 		}
+		// Dedup both `resume <n>` and `resume <sessionPath>`: an existing registry
+		// record (live or idle) means a thread already owns this session — never
+		// spawn a second thread for it.
+		const attached = this.#registry.bySessionPath(sessionPath);
+		if (attached) {
+			await this.#slack.postMessage({
+				channel: msg.channel,
+				text: `Already attached — continue in its thread: *${attached.name}* (thread \`${attached.threadTs}\`).`,
+			});
+			return;
+		}
 
-		const existing = this.#registry.bySessionPath(sessionPath);
-		const name = existing?.name ?? `${this.#config.sessionNamePrefix}${basename(sessionPath)}`;
-		const cwd = listedCwd ?? existing?.cwd ?? this.#home();
+		const name = `${this.#config.sessionNamePrefix}${basename(sessionPath)}`;
+		const cwd = listedCwd ?? this.#home();
 		const headerTs = await this.#slack.postMessage({
 			channel: msg.channel,
 			text: name,
@@ -612,7 +632,7 @@ export class Bridge {
 			cwd,
 			name,
 			sessionPath,
-			createdAt: existing?.createdAt ?? Date.now(),
+			createdAt: Date.now(),
 			lastActivityAt: Date.now(),
 		};
 		this.#registry.upsert(record);
@@ -675,6 +695,10 @@ export class Bridge {
 		}
 		if (command === "status") {
 			await this.#postState(task);
+			return;
+		}
+		if (task.parking) {
+			await this.#note(task, "parking in progress — reply again once it settles");
 			return;
 		}
 		await task.rpc.prompt(text).catch((err) => this.#note(task!, `prompt failed: ${String(err)}`));
@@ -1228,6 +1252,23 @@ function toolLabel(toolName: string | undefined, args: Record<string, unknown> |
 	return `⏵ ${name}${detail}`;
 }
 
+/** Reject with a timeout error if `promise` doesn't settle within `ms`. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+		promise.then(
+			(value) => {
+				clearTimeout(timer);
+				resolve(value);
+			},
+			(err) => {
+				clearTimeout(timer);
+				reject(err instanceof Error ? err : new Error(String(err)));
+			},
+		);
+	});
+}
+
 function headOf(prompt: string): string {
 	const oneLine = prompt.replace(/\s+/g, " ").trim();
 	return oneLine.length > 60 ? `${oneLine.slice(0, 59)}…` : oneLine;
@@ -1277,20 +1318,24 @@ export async function main(): Promise<void> {
 	const slack = createSlackTransport({ appToken: config.slackAppToken, botToken: config.slackBotToken });
 	const bridge = new Bridge({ config, slack, registry, createRpc: createOmpRpc });
 
-	await slack.start();
-	bridge.start();
-
+	// Acquire the single-instance lock BEFORE connecting to Slack, so a second
+	// instance exits without ever subscribing to (and double-processing) events.
 	const sockPath = `${config.stateDir}/bridge.sock`;
 	let control: { stop(): Promise<void> };
 	try {
 		control = await startControlServer(sockPath, bridge.controlHost());
 	} catch (err) {
 		if (err instanceof BridgeAlreadyRunningError) {
-			console.error(`bridge: ${err.message} — another instance owns ${sockPath}`);
-			process.exit(1);
+			// Clean exit: a peer instance owns the socket. exit(1) triggers a
+			// launchd KeepAlive churn loop, so this is a no-op success.
+			console.log(`bridge: already running (pid ${err.pid}), exiting cleanly`);
+			process.exit(0);
 		}
 		throw err;
 	}
+
+	await slack.start();
+	bridge.start();
 
 	const shutdown = () => {
 		void control

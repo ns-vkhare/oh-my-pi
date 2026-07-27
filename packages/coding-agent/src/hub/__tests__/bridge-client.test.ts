@@ -90,12 +90,17 @@ describe("bridgeStatus", () => {
 describe("parkBridgeSession", () => {
 	it("reports a busy Slack session with its reason", async () => {
 		const sock = startServer("park-busy", () => ({ ok: true, parked: false, reason: "turn in progress" }));
-		expect(await parkBridgeSession("/s/a.jsonl", 2000, sock)).toEqual({ parked: false, reason: "turn in progress" });
+		expect(await parkBridgeSession("/s/a.jsonl", 2000, sock)).toEqual({ kind: "busy", reason: "turn in progress" });
 	});
 
-	it("reports a successful park without a reason", async () => {
+	it("reports a successful park", async () => {
 		const sock = startServer("park-ok", () => ({ ok: true, parked: true }));
-		expect(await parkBridgeSession("/s/a.jsonl", 2000, sock)).toEqual({ parked: true });
+		expect(await parkBridgeSession("/s/a.jsonl", 2000, sock)).toEqual({ kind: "parked" });
+	});
+
+	it("reports a reasonless refusal as a session the bridge does not drive", async () => {
+		const sock = startServer("park-unowned", () => ({ ok: true, parked: false }));
+		expect(await parkBridgeSession("/s/a.jsonl", 2000, sock)).toEqual({ kind: "not-owned" });
 	});
 
 	it("sends the session path the caller asked to park", async () => {
@@ -111,11 +116,37 @@ describe("parkBridgeSession", () => {
 	});
 });
 
+/**
+ * The distinction the ownership paths depend on: a daemon that is *gone* frees
+ * the session, a daemon that merely failed to answer does not. Collapsing them
+ * is how `omp --resume` used to attach on top of a live Slack task.
+ */
+describe("parkBridgeSession failure modes", () => {
+	it("reports `absent` when the socket file does not exist", async () => {
+		const missing = path.join(sockDir, "absent.sock");
+		expect(await parkBridgeSession("/s/a.jsonl", 2000, missing)).toEqual({ kind: "absent" });
+	});
+
+	it("reports `indeterminate` when a live daemon never answers", async () => {
+		const sock = startServer("park-silent", () => undefined);
+		expect(await parkBridgeSession("/s/a.jsonl", 50, sock)).toEqual({ kind: "indeterminate" });
+	});
+
+	it("reports `indeterminate` on a garbage response line", async () => {
+		const sock = startServer("park-garbage", () => "not json at all");
+		expect(await parkBridgeSession("/s/a.jsonl", 2000, sock)).toEqual({ kind: "indeterminate" });
+	});
+
+	it("reports `indeterminate` when the daemon answers with an error", async () => {
+		const sock = startServer("park-error", () => ({ ok: false, error: "boom" }));
+		expect(await parkBridgeSession("/s/a.jsonl", 2000, sock)).toEqual({ kind: "indeterminate" });
+	});
+});
+
 describe("unreachable bridge", () => {
-	it("returns null when the socket file does not exist", async () => {
+	it("returns null from bridgeStatus when the socket file does not exist", async () => {
 		const missing = path.join(sockDir, "absent.sock");
 		expect(await bridgeStatus(2000, missing)).toBeNull();
-		expect(await parkBridgeSession("/s/a.jsonl", 2000, missing)).toBeNull();
 	});
 
 	it("returns null within the timeout when the daemon accepts but never replies", async () => {
