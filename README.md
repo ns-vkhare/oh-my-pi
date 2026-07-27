@@ -31,6 +31,30 @@ A tmux-supervised session multiplexer (Claude-Code "agent view" model). One back
 - **`omp hub list`** — enumerate every active hub across projects: session name, supervised directory, live-session count, attach state, and last activity, with the current project's hub marked.
 - **Auto-reap** — a backgrounded session idle > 24h has its window killed and reverts to an idle row; returning to it respawns fresh via `omp --resume`.
 
+### Slack bridge — drive omp from Slack
+
+A local Socket-Mode daemon ([`.omp/slack-bridge/`](.omp/slack-bridge/README.md)) that turns a Slack DM into a full omp remote: dispatch tasks, answer the agent's questions via buttons, steer running turns, and resume any session — one Slack thread per session. Terminal sessions ping you when they finish or need input (via a fail-soft `slack-notify` extension), and ownership moves cleanly between surfaces: `omp hub` badges bridge-owned sessions `live · slack`, `omp --watch <sessionPath>` spectates one read-only (Enter steers, Ctrl+T takes over), and `omp --resume` parks the Slack task with a handoff note before the terminal attaches. Setup: [`.omp/slack-bridge/README.md`](.omp/slack-bridge/README.md) (`install.sh` runs as part of `bun run setup`; `--daemon` installs a launchd agent).
+
+**Top-level DM commands:**
+
+| Command | What it does |
+|---|---|
+| `run <alias\|path> <prompt…>` | Start a new omp task in that repo (`run <prompt>` alone targets `DEFAULT_REPO`); a thread opens for the task |
+| `sessions [alias]` | Browse every omp session on disk, newest 8 per repo, numbered — ⚡ `live·slack`, 🔗 attached |
+| `resume <n\|sessionPath>` | Attach a listed (or explicit) session to a new thread with full context |
+| `status` | Bridge health: live tasks, registry size |
+| `help` | Command list |
+
+**Inside a task thread:**
+
+| Message | What it does |
+|---|---|
+| any text | Steer the running turn, continue an idle task, or answer a free-text question; parked tasks auto-resume |
+| *(button click)* | Answer the agent's multiple-choice question |
+| `abort` | Abort the current turn (running subagents keep going) |
+| `kill` | Stop the task's process; the session survives — reply later to resume |
+| `status` | Task state: model, streaming, context usage, session file |
+
 ### Auto worktree detection & isolation
 
 Parallel hub sessions must not stomp each other in the same working tree, so the fork makes worktree isolation the default:
