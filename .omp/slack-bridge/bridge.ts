@@ -8,10 +8,12 @@
  */
 
 import * as os from "node:os";
+import { ORCHESTRATE_FALLBACK_MODEL, resolveAgentModel } from "./agent-model";
 import {
 	answeredBlocks,
 	askAnsweredBlocks,
 	askQuestionBlocks,
+	escapeMrkdwn,
 	finalTextBlocks,
 	notifyText,
 	statusText,
@@ -23,6 +25,7 @@ import { BridgeAlreadyRunningError, type ControlHost, startControlServer } from 
 import { createOmpRpc } from "./omp-rpc";
 import { createSlackTransport, LruSet } from "./slack";
 import { TaskRegistry } from "./registry";
+import { createRouter } from "./router";
 import type {
 	AskToolArgs,
 	BridgeConfig,
@@ -34,6 +37,8 @@ import type {
 	OmpRpc,
 	OmpRpcOptions,
 	OmpUiRequest,
+	RouteMessage,
+	RouterDecision,
 	SlackBlockAction,
 	ControlTaskInfo,
 	SlackInbound,
@@ -58,6 +63,12 @@ const CATCHUP_INTERVAL_MS = 120_000;
 const ATTACHMENT_MAX_BYTES = 32 * 1024 * 1024;
 /** Remembered inbound message ts values (live + replayed), for dedup. */
 const SEEN_MESSAGE_CAP = 500;
+/**
+ * Default `router/route.sh`: resolved relative to the running bridge module, so
+ * a deployed copy (`~/.omp/slack-bridge`) runs its own script rather than the
+ * repo's. ROUTER_SCRIPT overrides it.
+ */
+const DEFAULT_ROUTER_SCRIPT = new URL("./router/route.sh", import.meta.url).pathname;
 
 /** A UI request awaiting a Slack answer, plus the message showing it. */
 interface PendingUi {
@@ -161,6 +172,8 @@ export function loadConfig(env: Record<string, string | undefined>, home: string
 	const maxTasksRaw = Number.parseInt(env.MAX_TASKS ?? "", 10);
 	const idleTtlRaw = Number.parseInt(env.IDLE_TTL_MIN ?? "", 10);
 	const catchupRaw = Number.parseInt(env.CATCHUP_WINDOW_MIN ?? "", 10);
+	const routerTimeoutRaw = Number.parseInt(env.ROUTER_TIMEOUT_MS ?? "", 10);
+	const routerScript = env.ROUTER_SCRIPT?.trim();
 
 	return {
 		slackAppToken,
@@ -173,6 +186,10 @@ export function loadConfig(env: Record<string, string | undefined>, home: string
 		idleTtlMin: Number.isFinite(idleTtlRaw) && idleTtlRaw > 0 ? idleTtlRaw : 30,
 		sessionNamePrefix: env.SESSION_NAME_PREFIX ?? "slack:",
 		catchupWindowMin: Number.isFinite(catchupRaw) && catchupRaw >= 0 ? catchupRaw : 60,
+		routerModel: env.ROUTER_MODEL?.trim() ?? "",
+		routerTimeoutMs: Number.isFinite(routerTimeoutRaw) && routerTimeoutRaw > 0 ? routerTimeoutRaw : 60_000,
+		routerScript: routerScript ? expandHome(routerScript, home) : DEFAULT_ROUTER_SCRIPT,
+		orchestrateModel: env.ORCHESTRATE_MODEL?.trim() ?? "",
 		stateDir: `${home}/.omp/slack-bridge`,
 	};
 }
@@ -237,11 +254,14 @@ export interface BridgeDeps {
 	createRpc: (opts: OmpRpcOptions) => OmpRpc;
 	/** Session-store lister; defaults to shelling out to `omp sessions --json`. */
 	listSessions?: ListSessions;
+	/** Front-door intent router; defaults to the local-model router (fails open). */
+	route?: RouteMessage;
 }
 
 const HELP_TEXT = [
 	"*omp slack bridge*",
 	"• `run <alias|path> <prompt…>` — start a new task",
+	"• `orchestrate <alias|path> <prompt…>` — new task on the orchestrator agent (parallel subagents)",
 	"• `sessions [alias]` — browse omp sessions (⚡ live·slack, 🔗 attached)",
 	"• `resume <n|sessionPath>` — attach a listed or on-disk session",
 	"• `status` — bridge status",
@@ -296,6 +316,7 @@ export class Bridge {
 	readonly #registry: TaskRegistry;
 	readonly #createRpc: (opts: OmpRpcOptions) => OmpRpc;
 	readonly #listSessions: ListSessions;
+	readonly #route: RouteMessage;
 	readonly #live = new Map<string, LiveTask>();
 	readonly #startedAt = Date.now();
 	#reaperTimer: ReturnType<typeof setInterval> | undefined;
@@ -317,6 +338,7 @@ export class Bridge {
 		this.#registry = deps.registry;
 		this.#createRpc = deps.createRpc;
 		this.#listSessions = deps.listSessions ?? spawnSessionLister(deps.config.ompBin);
+		this.#route = deps.route ?? createRouter(deps.config);
 	}
 
 	start(): void {
@@ -597,20 +619,93 @@ export class Bridge {
 		const command = (first ?? "").toLowerCase();
 		const rest = text.slice((first ?? "").length).trim();
 
-		if (command === "run") {
-			await this.#cmdRun(msg, rest);
-		} else if (command === "sessions") {
-			await this.#cmdSessions(msg, restTokens[0]);
-		} else if (command === "resume") {
-			await this.#cmdResume(msg, restTokens[0]);
-		} else if (command === "status") {
-			await this.#cmdStatus(msg);
-		} else {
-			await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: HELP_TEXT });
+		// An explicit command is never routed: `run …` behaves byte-for-byte as it
+		// always has, at zero added latency, no matter what the local model is doing.
+		switch (command) {
+			case "run":
+				await this.#cmdRun(msg, rest);
+				return;
+			case "orchestrate":
+				await this.#cmdOrchestrate(msg, rest);
+				return;
+			case "sessions":
+				await this.#cmdSessions(msg, restTokens[0]);
+				return;
+			case "resume":
+				await this.#cmdResume(msg, restTokens[0]);
+				return;
+			case "status":
+				await this.#cmdStatus(msg);
+				return;
+			case "help":
+				await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: HELP_TEXT });
+				return;
+		}
+
+		// Free-form: let the router say what was meant. It fails open — disabled,
+		// unreachable, slow or unparseable all resolve undefined, and a dead local
+		// model must never swallow a Slack message.
+		const decision = await this.#route(text, { repos: this.#config.repos, defaultRepo: this.#config.defaultRepo });
+		if (decision) {
+			await this.#dispatchDecision(msg, decision);
+			return;
+		}
+		await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: HELP_TEXT });
+	}
+
+	/**
+	 * Execute one router decision by handing it to the very command method the
+	 * literal parser would have called. Nothing here trusts the model: `#cmdRun`
+	 * re-resolves `dir` and falls back to DEFAULT_REPO when it names neither an
+	 * alias nor a path, so a hallucinated field degrades instead of escaping.
+	 */
+	async #dispatchDecision(msg: SlackInboundMessage, decision: RouterDecision): Promise<void> {
+		// Breadcrumb first: the routing decision is visible before its effects.
+		await this.#slack
+			.postMessage({
+				channel: msg.channel,
+				threadTs: this.#replyThread(msg),
+				text: `_routed → \`${escapeMrkdwn(decision.command)}\`_`,
+			})
+			.catch(() => {});
+
+		switch (decision.command) {
+			case "run":
+				await this.#cmdRun(msg, [decision.dir, decision.prompt].filter(Boolean).join(" "));
+				return;
+			case "orchestrate":
+				await this.#cmdOrchestrate(msg, [decision.dir, decision.prompt].filter(Boolean).join(" "));
+				return;
+			case "sessions":
+				await this.#cmdSessions(msg, decision.alias);
+				return;
+			case "resume":
+				await this.#cmdResume(msg, decision.target);
+				return;
+			case "status":
+				await this.#cmdStatus(msg);
+				return;
+			case "help":
+				await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: HELP_TEXT });
+				return;
 		}
 	}
 
 	async #cmdRun(msg: SlackInboundMessage, rest: string): Promise<void> {
+		await this.#startTask(msg, rest, { orchestrate: false });
+	}
+
+	/**
+	 * `run` on the orchestrator agent. Two deltas, both applied in `#startTask`:
+	 * the prompt is prefixed so omp's `orchestrator-identity` skill triggers, and
+	 * the child is pinned to the orchestrator's model instead of omp's default.
+	 */
+	async #cmdOrchestrate(msg: SlackInboundMessage, rest: string): Promise<void> {
+		await this.#startTask(msg, rest, { orchestrate: true });
+	}
+
+	async #startTask(msg: SlackInboundMessage, rest: string, opts: { orchestrate: boolean }): Promise<void> {
+		const verb = opts.orchestrate ? "orchestrate" : "run";
 		const sp = rest.indexOf(" ");
 		let dirToken = (sp === -1 ? rest : rest.slice(0, sp)).trim();
 		let prompt = (sp === -1 ? "" : rest.slice(sp + 1)).trim();
@@ -628,7 +723,7 @@ export class Bridge {
 			}
 		}
 		if (!prompt) {
-			await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: "Usage: `run <alias|path> <prompt…>`" });
+			await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: `Usage: \`${verb} <alias|path> <prompt…>\`` });
 			return;
 		}
 		if (!cwd) {
@@ -669,7 +764,14 @@ export class Bridge {
 			lastActivityAt: Date.now(),
 		};
 		this.#registry.upsert(record);
-		await this.#spawn({ record, isNew: true, prompt: prompt + (await this.#attachmentNote(msg)), sessionName: name });
+		// Resolved once per task: the config override, else the agent definition on
+		// disk, else the pin the orchestrator agent ships with.
+		const model = opts.orchestrate
+			? this.#config.orchestrateModel || (await resolveAgentModel("orchestrate", record.cwd, this.#home())) || ORCHESTRATE_FALLBACK_MODEL
+			: undefined;
+		// The skill keys on the word "orchestrate", so the prompt must carry it.
+		const message = opts.orchestrate ? `orchestrate: ${prompt}` : prompt;
+		await this.#spawn({ record, isNew: true, prompt: message + (await this.#attachmentNote(msg)), sessionName: name, model });
 	}
 
 	async #cmdSessions(msg: SlackInboundMessage, alias: string | undefined): Promise<void> {
@@ -972,7 +1074,15 @@ export class Bridge {
 
 	// --- Task lifecycle -----------------------------------------------------
 
-	async #spawn(args: { record: TaskRecord; isNew: boolean; prompt?: string; resumeSessionPath?: string; sessionName?: string }): Promise<void> {
+	async #spawn(args: {
+		record: TaskRecord;
+		isNew: boolean;
+		prompt?: string;
+		resumeSessionPath?: string;
+		sessionName?: string;
+		/** Pin the child to a model spec (`omp --model <spec>`); omp's default when absent. */
+		model?: string;
+	}): Promise<void> {
 		const { record, isNew } = args;
 		const rpc = this.#createRpc({
 			ompBin: this.#config.ompBin,
@@ -981,7 +1091,7 @@ export class Bridge {
 			// OMP_SLACK_BRIDGE marks bridge-owned children: the slack-notify
 			// extension and omp's resume park hook skip themselves under it.
 			env: isNew ? { OMP_SLACK_BRIDGE: "1", OMP_HUB_NEW_SESSION: "1" } : { OMP_SLACK_BRIDGE: "1" },
-			extraArgs: [],
+			extraArgs: args.model ? ["--model", args.model] : [],
 		});
 
 		const task: LiveTask = {

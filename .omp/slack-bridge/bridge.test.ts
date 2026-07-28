@@ -6,9 +6,13 @@
  * and registry persistence.
  */
 
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, type Mock, spyOn, test } from "bun:test";
 import { Bridge, loadConfig, type ListSessions, type StoreSession } from "./bridge";
 import { TaskRegistry } from "./registry";
+import { ORCHESTRATE_FALLBACK_MODEL } from "./agent-model";
 import type {
 	BridgeConfig,
 	OmpAgentEvent,
@@ -21,6 +25,9 @@ import type {
 	OmpSessionState,
 	OmpUiRequest,
 	OmpUiResponse,
+	RouteMessage,
+	RouterContext,
+	RouterDecision,
 	SlackBlock,
 	SlackBlockAction,
 	SlackFileRef,
@@ -233,6 +240,10 @@ function makeConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
 		sessionNamePrefix: "slack:",
 		// Off by default: only the catch-up tests want a sweep on start().
 		catchupWindowMin: 0,
+		routerModel: "",
+		routerTimeoutMs: 60_000,
+		routerScript: "/nonexistent/route.sh",
+		orchestrateModel: "",
 		stateDir: `${HOME}/.omp/slack-bridge`,
 		...overrides,
 	};
@@ -243,6 +254,13 @@ interface Harness {
 	registry: TaskRegistry;
 	bridge: Bridge;
 	rpcs: FakeRpc[];
+	/**
+	 * Resolves with the next RPC the bridge spawns. `settle()` only drains
+	 * microtasks, so a spawn gated on real filesystem I/O — the `orchestrate`
+	 * model lookup reads agent definitions from disk — needs the actual signal
+	 * rather than a wall-clock wait.
+	 */
+	nextRpc: () => Promise<FakeRpc>;
 }
 
 /** Bridges created via makeHarness; shut down after each test to clear timers. */
@@ -251,24 +269,38 @@ afterEach(async () => {
 	while (liveHarnesses.length > 0) await liveHarnesses.pop()!.shutdown();
 });
 
-async function makeHarness(config: BridgeConfig, seed: TaskRecord[] = [], listSessions?: ListSessions): Promise<Harness> {
+async function makeHarness(
+	config: BridgeConfig,
+	seed: TaskRecord[] = [],
+	listSessions?: ListSessions,
+	route?: RouteMessage,
+): Promise<Harness> {
 	const slack = new FakeSlack();
 	const dir = `/tmp/bridge-test-${Math.random().toString(36).slice(2)}`;
 	const registry = await TaskRegistry.load(dir);
 	for (const rec of seed) registry.upsert(rec);
 	const rpcs: FakeRpc[] = [];
+	const waiters: Array<(rpc: FakeRpc) => void> = [];
 	const createRpc = (opts: OmpRpcOptions): OmpRpc => {
 		const rpc = new FakeRpc(opts);
 		rpcs.push(rpc);
+		waiters.splice(0).forEach((resolve) => resolve(rpc));
 		return rpc;
 	};
-	const bridge = new Bridge({ config, slack, registry, createRpc, listSessions });
+	const bridge = new Bridge({ config, slack, registry, createRpc, listSessions, route });
 	bridge.start();
 	// start() kicks a catch-up sweep; drain it so a test's own sweep is not
 	// swallowed by the overlap guard.
 	await settle();
 	liveHarnesses.push(bridge);
-	return { slack, registry, bridge, rpcs };
+	const nextRpc = (): Promise<FakeRpc> => {
+		const pending = rpcs.at(-1);
+		if (pending) return Promise.resolve(pending);
+		const { promise, resolve } = Promise.withResolvers<FakeRpc>();
+		waiters.push(resolve);
+		return promise;
+	};
+	return { slack, registry, bridge, rpcs, nextRpc };
 }
 
 let dmSeq = 0;
@@ -1043,5 +1075,126 @@ describe("control plane park/steer (regression)", () => {
 		await h.slack.inject(dm(`resume ${sessionPath}`));
 		expect(h.rpcs).toHaveLength(0); // no second RPC spawned
 		expect(h.slack.posted.some((p) => p.args.text?.includes("Already attached"))).toBe(true);
+	});
+});
+
+/**
+ * The front door: an explicit command still parses literally and never pays for
+ * the model, a free-form message goes through the router, and a router that
+ * declines for any reason (disabled, down, slow, unparseable) falls back to
+ * help rather than swallowing the message.
+ */
+describe("front-door router", () => {
+	/** A `RouteMessage` fake that records its calls, like the RPC/Slack fakes. */
+	function fakeRoute(decision?: RouterDecision): RouteMessage & { calls: Array<{ text: string; ctx: RouterContext }> } {
+		const calls: Array<{ text: string; ctx: RouterContext }> = [];
+		return Object.assign(async (text: string, ctx: RouterContext) => {
+			calls.push({ text, ctx });
+			return decision;
+		}, { calls });
+	}
+
+	const REPO = `${HOME}/oh-my-pi-src`;
+	const lister: ListSessions = async () => [{ path: `${REPO}/.omp/a.jsonl`, title: "alpha work", modified: new Date().toISOString() }];
+
+	test("an explicit `run` dispatches literally and never consults the router", async () => {
+		const route = fakeRoute({ command: "status" });
+		const h = await makeHarness(makeConfig(), [], undefined, route);
+		await h.slack.inject(dm("run omp do a thing"));
+
+		expect(route.calls).toHaveLength(0);
+		expect(h.rpcs).toHaveLength(1);
+		expect(h.rpcs[0]!.prompts).toEqual(["do a thing"]);
+	});
+
+	test("a free-form DM routed to `sessions` renders the listing", async () => {
+		const route = fakeRoute({ command: "sessions" });
+		const h = await makeHarness(makeConfig(), [], lister, route);
+		const msg = dm("what have I been working on lately?");
+		await h.slack.inject(msg);
+
+		expect(route.calls).toHaveLength(1);
+		expect(route.calls[0]!.text).toBe("what have I been working on lately?");
+		expect(route.calls[0]!.ctx.repos).toEqual({ omp: REPO });
+		expect(h.slack.posted.at(-1)!.args.text).toContain(`*omp* · \`${REPO}\``);
+		expect(h.slack.posted.at(-1)!.args.text).toContain("1. alpha work");
+	});
+
+	test("a router that declines falls back to help (fail-open)", async () => {
+		const route = fakeRoute(undefined);
+		const h = await makeHarness(makeConfig(), [], undefined, route);
+		await h.slack.inject(dm("hey, are you around?"));
+
+		expect(route.calls).toHaveLength(1);
+		expect(h.slack.posted).toHaveLength(1);
+		expect(h.slack.posted[0]!.args.text).toContain("*omp slack bridge*");
+		expect(h.rpcs).toHaveLength(0);
+	});
+
+	test("a `run` decision spawns one rpc in the alias cwd, with omp's default model", async () => {
+		const route = fakeRoute({ command: "run", dir: "omp", prompt: "fix the thing" });
+		const h = await makeHarness(makeConfig(), [], undefined, route);
+		await h.slack.inject(dm("could you please fix the thing over in omp"));
+
+		// The breadcrumb lands before the task header so the routing is visible.
+		expect(h.slack.posted[0]!.args.text).toBe("_routed → `run`_");
+		expect(h.rpcs).toHaveLength(1);
+		expect(h.rpcs[0]!.opts.cwd).toBe(REPO);
+		expect(h.rpcs[0]!.opts.extraArgs).toEqual([]);
+		expect(h.rpcs[0]!.prompts).toEqual(["fix the thing"]);
+	});
+
+	test("`orchestrate` pins the orchestrator model and prefixes the prompt", async () => {
+		// orchestrateModel is set explicitly so the assertion never depends on the
+		// developer's ~/.omp/agent/agents/orchestrate.md.
+		const h = await makeHarness(makeConfig({ orchestrateModel: "anthropic/claude-fable-5" }));
+		await h.slack.inject(dm("orchestrate omp fix the thing"));
+
+		expect(h.rpcs).toHaveLength(1);
+		expect(h.rpcs[0]!.opts.cwd).toBe(REPO);
+		expect(h.rpcs[0]!.opts.extraArgs).toEqual(["--model", "anthropic/claude-fable-5"]);
+		expect(h.rpcs[0]!.prompts[0]!.startsWith("orchestrate: fix the thing")).toBe(true);
+	});
+
+	test("`orchestrate` with no prompt posts its own usage line", async () => {
+		const h = await makeHarness(makeConfig({ orchestrateModel: "anthropic/claude-fable-5" }));
+		await h.slack.inject(dm("orchestrate"));
+
+		expect(h.rpcs).toHaveLength(0);
+		expect(h.slack.posted.at(-1)!.args.text).toBe("Usage: `orchestrate <alias|path> <prompt…>`");
+	});
+
+	// The production path: ORCHESTRATE_MODEL unset, so the model comes from the
+	// `orchestrate` agent definition on disk. #home() is derived from stateDir,
+	// so a temp stateDir gives the lookup a temp home to read.
+	test("`orchestrate` with no ORCHESTRATE_MODEL reads the model from the agent definition", async () => {
+		const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bridge-agentdef-"));
+		try {
+			await Bun.write(
+				path.join(tmpHome, ".omp/agent/agents/orchestrate.md"),
+				"---\nname: orchestrate\nmodel: anthropic/claude-fable-5\nthinkingLevel: high\n---\n\nbody\n",
+			);
+			const h = await makeHarness(makeConfig({ orchestrateModel: "", stateDir: path.join(tmpHome, ".omp/slack-bridge") }));
+			await h.slack.inject(dm("orchestrate omp fix the thing"));
+			const rpc = await h.nextRpc();
+
+			expect(rpc.opts.extraArgs).toEqual(["--model", "anthropic/claude-fable-5"]);
+		} finally {
+			await fs.rm(tmpHome, { recursive: true, force: true });
+		}
+	});
+
+	// No agent file anywhere → the last-resort constant, never omp's default model.
+	test("`orchestrate` falls back to the pinned constant when no agent definition exists", async () => {
+		const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bridge-nodef-"));
+		try {
+			const h = await makeHarness(makeConfig({ orchestrateModel: "", stateDir: path.join(tmpHome, ".omp/slack-bridge") }));
+			await h.slack.inject(dm("orchestrate omp fix the thing"));
+			const rpc = await h.nextRpc();
+
+			expect(rpc.opts.extraArgs).toEqual(["--model", ORCHESTRATE_FALLBACK_MODEL]);
+		} finally {
+			await fs.rm(tmpHome, { recursive: true, force: true });
+		}
 	});
 });
