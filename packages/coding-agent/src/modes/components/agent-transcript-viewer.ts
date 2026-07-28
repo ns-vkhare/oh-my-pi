@@ -43,8 +43,8 @@ import { formatContextUsage } from "./status-line/context-thresholds";
  * bottom editor is always mounted, and submits/keys route to the caller.
  */
 export interface SpectateOverride {
-	/** The `.jsonl` to tail, resolved by the caller. */
-	sessionFile: string;
+	/** The `.jsonl` to tail, resolved by the caller on every poll so the target can change. */
+	sessionFile: () => string;
 	/** Replaces the agent header rows. Called every frame, so it may show live status. */
 	header: () => string[];
 	/** Replaces the footer key hint. */
@@ -114,6 +114,8 @@ interface LocalTranscriptState {
 	sentinels: LocalTranscriptSentinel[];
 }
 
+type LocalUnavailableReason = "" | "none" | "missing" | "unavailable";
+
 function readFileRangeSync(file: string, offset: number, length: number): Buffer {
 	if (length <= 0) return Buffer.alloc(0);
 	const fd = fs.openSync(file, "r");
@@ -168,7 +170,7 @@ export class AgentTranscriptViewer implements Component {
 	#expanded = false;
 
 	#localState: LocalTranscriptState | undefined;
-	#localUnavailable = "";
+	#localUnavailable: LocalUnavailableReason = "";
 	// Remote transcript state (incremental; the host caps each read).
 	#remoteBytes = 0;
 	#remoteFetchInFlight = false;
@@ -232,6 +234,10 @@ export class AgentTranscriptViewer implements Component {
 	// Transcript loading
 	// ========================================================================
 
+	refreshNow(): void {
+		this.#refresh();
+	}
+
 	/** Refresh the transcript from a local file or remote host. */
 	#refresh(): void {
 		if (this.#disposed) return;
@@ -239,7 +245,7 @@ export class AgentTranscriptViewer implements Component {
 			this.#fetchRemote();
 			return;
 		}
-		const sessionFile = this.deps.spectate?.sessionFile ?? this.deps.registry.get(this.deps.agentId)?.sessionFile;
+		const sessionFile = this.deps.spectate?.sessionFile() ?? this.deps.registry.get(this.deps.agentId)?.sessionFile;
 		if (!sessionFile) {
 			this.#clearLocal("none");
 			return;
@@ -262,7 +268,7 @@ export class AgentTranscriptViewer implements Component {
 		this.#loadLocalFull(sessionFile, stat);
 	}
 
-	#clearLocal(reason: string): void {
+	#clearLocal(reason: LocalUnavailableReason): void {
 		if (!this.#localState && this.#localUnavailable === reason) return;
 		this.#localState = undefined;
 		this.#localUnavailable = reason;
@@ -289,12 +295,17 @@ export class AgentTranscriptViewer implements Component {
 	}
 
 	#loadLocalFull(sessionFile: string, stat: fs.Stats): void {
+		const pathChanged = this.#localState?.path !== sessionFile;
 		let data: Buffer;
 		try {
 			data = fs.readFileSync(sessionFile);
 		} catch (err) {
 			// Leave #localState unchanged so a transient read error retries next poll.
 			logger.debug("transcript viewer: read failed", { err: String(err) });
+			if (pathChanged) {
+				this.#followBottom = true;
+				this.#clearLocal("unavailable");
+			}
 			return;
 		}
 		// The file may have grown between the earlier `statSync` and this read.
@@ -326,6 +337,7 @@ export class AgentTranscriptViewer implements Component {
 			pending,
 			sentinels: sentinelsFromBuffer(data),
 		};
+		if (pathChanged) this.#followBottom = true;
 		this.#model = undefined;
 		this.#rebuild(this.#extractMessages(parseSessionEntries(complete)));
 	}
@@ -683,8 +695,11 @@ export class AgentTranscriptViewer implements Component {
 			if (this.#remoteUnavailable) return "Transcript lives on the host — not available.";
 			return this.#hasRemoteData ? "No messages yet." : "Loading transcript from host…";
 		}
-		if (this.deps.spectate)
-			return this.#localUnavailable === "missing" ? "Session file is gone." : "No messages yet.";
+		if (this.deps.spectate) {
+			if (this.#localUnavailable === "missing") return "Session file is gone.";
+			if (this.#localUnavailable === "unavailable") return "Session file is unavailable.";
+			return "No messages yet.";
+		}
 		if (!this.deps.registry.get(this.deps.agentId)?.sessionFile) return "No session file available yet.";
 		return "No messages yet.";
 	}

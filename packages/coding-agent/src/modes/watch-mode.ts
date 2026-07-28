@@ -15,11 +15,13 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { matchesKey, ProcessTerminal, replaceTabs, TUI, truncateToWidth } from "@oh-my-pi/pi-tui";
-import { sanitizeText } from "@oh-my-pi/pi-utils";
+import { matchesKey, type OverlayHandle, ProcessTerminal, replaceTabs, TUI, truncateToWidth } from "@oh-my-pi/pi-tui";
+import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import {
+	type BridgeSubagentInfo,
 	bridgeStatus,
+	bridgeSubagents,
 	interruptBridgeSession,
 	type ParkOutcome,
 	parkBridgeSession,
@@ -27,12 +29,17 @@ import {
 } from "../hub/bridge-client";
 import { selfInvocation } from "../hub/tmux";
 import { AgentRegistry } from "../registry/agent-registry";
+import { type SubagentTranscript, scanSubagentTranscripts } from "../registry/subagent-transcripts";
 import { TRUNCATE_LENGTHS } from "../tools/render-utils";
 import { AgentTranscriptViewer } from "./components/agent-transcript-viewer";
+import { buildSubagentRows, SubagentPicker, type SubagentPickerRow } from "./components/subagent-picker";
 import { theme } from "./theme/theme";
 
 /** How long to wait between park retries while the Slack side finishes its turn. */
 const PARK_RETRY_MS = 2000;
+
+/** How often the spectator re-scans the session's subagent transcripts. */
+const SUBAGENT_REFRESH_MS = 2000;
 
 /**
  * Fit bridge-delivered text (Slack task name, park refusal reason) into a single
@@ -169,6 +176,82 @@ function spectate(file: string, name: string): Promise<boolean> {
 		ui.requestRender();
 	};
 
+	const mainTarget = { id: name, sessionFile: file };
+	let target = mainTarget;
+	let scanned: SubagentTranscript[] = [];
+	let rows: SubagentPickerRow[] = buildSubagentRows({ main: mainTarget, scanned, live: null, now: Date.now() });
+	let picker: SubagentPicker | undefined;
+	let pickerHandle: OverlayHandle | undefined;
+	let refreshTimer: NodeJS.Timeout | undefined;
+	let refreshing = false;
+	let refreshQueued = false;
+
+	const runRefresh = async (): Promise<void> => {
+		try {
+			scanned = await scanSubagentTranscripts(file);
+		} catch (err) {
+			logger.debug("spectate: subagent scan failed", { err: String(err) });
+		}
+		let live: BridgeSubagentInfo[] | null = null;
+		if (pickerHandle) {
+			try {
+				live = await bridgeSubagents(file);
+			} catch (err) {
+				logger.debug("spectate: bridge subagent query failed", { err: String(err) });
+			}
+		}
+		if (finished) return;
+		rows = buildSubagentRows({ main: mainTarget, scanned, live, now: Date.now() });
+		if (pickerHandle) picker?.setRows(rows, target.sessionFile);
+		ui.requestRender();
+	};
+
+	const refreshSubagents = async (): Promise<void> => {
+		if (refreshing) {
+			refreshQueued = true;
+			return;
+		}
+		refreshing = true;
+		try {
+			do {
+				refreshQueued = false;
+				await runRefresh();
+			} while (refreshQueued && !finished);
+		} finally {
+			refreshing = false;
+		}
+	};
+
+	const closePicker = (): void => {
+		if (!pickerHandle) return;
+		pickerHandle.hide();
+		pickerHandle = undefined;
+		ui.requestRender();
+	};
+
+	const pickTarget = (row: SubagentPickerRow): void => {
+		target = row.sessionFile === file ? mainTarget : { id: row.id, sessionFile: row.sessionFile };
+		viewer.refreshNow();
+		closePicker();
+	};
+
+	const openPicker = (): void => {
+		if (pickerHandle) return;
+		if (picker) {
+			picker.setRows(rows, target.sessionFile);
+		} else {
+			picker = new SubagentPicker({
+				rows,
+				selected: target.sessionFile,
+				onPick: pickTarget,
+				onCancel: closePicker,
+				requestRender: () => ui.requestRender(),
+			});
+		}
+		pickerHandle = ui.showOverlay(picker, { anchor: "center", width: "70%", maxHeight: "70%", fullscreen: true });
+		void refreshSubagents();
+	};
+
 	const viewer = new AgentTranscriptViewer({
 		agentId: name,
 		// This process owns no agents; the spectate override supplies the file.
@@ -182,11 +265,19 @@ function spectate(file: string, name: string): Promise<boolean> {
 		onClose: () => finish(false),
 		onHubClose: () => finish(false),
 		spectate: {
-			sessionFile: file,
+			sessionFile: () => target.sessionFile,
 			header: () => {
+				const onMain = target.sessionFile === file;
+				const title = onMain
+					? theme.bold(headerCell(name))
+					: `${theme.bold(headerCell(name))} ${theme.fg("dim", "▸")} ${theme.bold(headerCell(target.id))}`;
+				const count = scanned.length > 0 ? ` · ${headerCell(`${scanned.length} subagents`)}` : "";
+				const hints = onMain
+					? `alt+a: subagents · Enter: steer · Ctrl+T: take over · Ctrl+X: interrupt · Esc: quit${count}`
+					: "alt+a: subagents · Enter: steer Main · Ctrl+T: take over · Ctrl+X: interrupt · Esc: back to Main";
 				const lines = [
-					`${theme.bold(headerCell(name))}  ${theme.fg("warning", "SPECTATING")} ${theme.fg("dim", "— owned by Slack")}`,
-					theme.fg("dim", "Enter: steer · Ctrl+T: take over · Ctrl+X: interrupt · Esc: quit"),
+					`${title}  ${theme.fg("warning", "SPECTATING")} ${theme.fg("dim", "— owned by Slack")}`,
+					theme.fg("dim", hints),
 				];
 				if (status) lines.push(status);
 				return lines;
@@ -194,6 +285,10 @@ function spectate(file: string, name: string): Promise<boolean> {
 			hint: "empty input → j/k:scroll  g/G:top/bottom  ctrl+o:expand",
 			onSubmit: text => void steer(text),
 			onKey: data => {
+				if (matchesKey(data, "alt+a")) {
+					openPicker();
+					return true;
+				}
 				if (matchesKey(data, "ctrl+t")) {
 					void takeOver();
 					return true;
@@ -202,11 +297,18 @@ function spectate(file: string, name: string): Promise<boolean> {
 					void interrupt();
 					return true;
 				}
-				// Only swallow Esc while a take-over is pending; otherwise it quits.
-				if (waiting && matchesKey(data, "escape")) {
-					waiting = false;
-					setStatus(theme.fg("dim", "take over cancelled"));
-					return true;
+				if (matchesKey(data, "escape")) {
+					if (waiting) {
+						waiting = false;
+						setStatus(theme.fg("dim", "take over cancelled"));
+						return true;
+					}
+					if (target !== mainTarget) {
+						target = mainTarget;
+						viewer.refreshNow();
+						ui.requestRender();
+						return true;
+					}
 				}
 				return false;
 			},
@@ -217,6 +319,9 @@ function spectate(file: string, name: string): Promise<boolean> {
 		if (finished) return;
 		finished = true;
 		waiting = false;
+		clearInterval(refreshTimer);
+		refreshTimer = undefined;
+		closePicker();
 		viewer.dispose();
 		ui.stop();
 		resolve(promoted);
@@ -264,6 +369,9 @@ function spectate(file: string, name: string): Promise<boolean> {
 
 	ui.showOverlay(viewer, { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0, fullscreen: true });
 	ui.setFocus(viewer);
+	refreshTimer = setInterval(() => void refreshSubagents(), SUBAGENT_REFRESH_MS);
+	refreshTimer.unref?.();
+	void refreshSubagents();
 	ui.start();
 	return promise;
 }

@@ -99,7 +99,10 @@ happens in that thread.
 Sessions are standard omp sessions — they also appear in `omp hub` (badged
 `live · slack` while the bridge owns them), can be watched read-only with
 `omp --watch <sessionPath>`, and taken over in the terminal with `omp --resume`
-(the bridge parks its task and posts a handoff note to the thread).
+(the bridge parks its task and posts a handoff note to the thread). Inside the
+watcher, `alt+a` lists the task's subagents — live status and current task come
+from the bridge — and Enter switches the tail to one of them; Esc returns to the
+main transcript.
 
 ### Example: dispatch, answer a question, get the result
 
