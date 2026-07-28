@@ -10,6 +10,8 @@ Choose orchestrate instead of run when the message asks you to orchestrate, to p
 
 Use sessions when the user asks what exists, what is running, or what they were working on; pass `alias` only when they named one repo. Use resume when they point back at earlier work, with `target` copied exactly as they wrote it — the number from the last sessions listing, or an absolute .jsonl path. Use status when they ask whether the bridge is up or healthy.
 
+A message may list `Attachments on this message:` above the text. That is an inventory of what the user sent along — a screenshot, a log, a PDF — and it is a strong signal they want work done on it, so prefer run over help even when the text is as short as "what's wrong here?" or "have a look". Never copy the attachment line into `prompt`, never invent a filename, and never put a filename in `dir`: the bridge attaches the real files itself, and the agent downstream receives them whatever you pass.
+
 Use help when the message is a greeting, small talk, thanks, a question about the bridge itself, or too ambiguous to act on. A help call is always better than guessing a command the user did not ask for.
 
 After the tool call, reply with at most one short sentence.

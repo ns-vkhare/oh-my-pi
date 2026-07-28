@@ -15,6 +15,7 @@ import { TaskRegistry } from "./registry";
 import { ORCHESTRATE_FALLBACK_MODEL } from "./agent-model";
 import type {
 	BridgeConfig,
+	ImageContent,
 	OmpAgentEvent,
 	OmpHostToolCall,
 	OmpHostToolCancel,
@@ -68,6 +69,7 @@ class FakeSlack implements SlackTransport {
 	reconnects = 0;
 	#listeners = new Set<(inbound: SlackInbound) => void>();
 	#counter = 0;
+	#postWaiters: Array<(args: SlackPostArgs) => void> = [];
 
 	async start(): Promise<void> {}
 	async stop(): Promise<void> {}
@@ -80,7 +82,17 @@ class FakeSlack implements SlackTransport {
 	async postMessage(args: SlackPostArgs): Promise<string> {
 		const ts = `ts${++this.#counter}`;
 		this.posted.push({ ts, args });
+		this.#postWaiters.splice(0).forEach((resolve) => resolve(args));
 		return ts;
+	}
+
+	/** The newest posted message, awaiting one when none has been posted yet. */
+	nextPost(): Promise<SlackPostArgs> {
+		const last = this.posted.at(-1);
+		if (last) return Promise.resolve(last.args);
+		const { promise, resolve } = Promise.withResolvers<SlackPostArgs>();
+		this.#postWaiters.push(resolve);
+		return promise;
 	}
 
 	async updateMessage(args: { channel: string; ts: string; text: string; blocks?: SlackBlock[] }): Promise<void> {
@@ -123,12 +135,14 @@ class FakeRpc implements OmpRpc {
 	readonly commands: string[] = [];
 	readonly uiResponses: OmpUiResponse[] = [];
 	readonly prompts: string[] = [];
+	/** Images sent with the same-index entry of {@link prompts}. */
+	readonly promptImages: Array<ImageContent[] | undefined> = [];
 	readonly hostTools: OmpHostToolDefinition[][] = [];
 	readonly hostToolResults: OmpHostToolResult[] = [];
 	lastAssistantText: string | null = "done";
 	state: OmpSessionState = { isStreaming: false, sessionFile: `${HOME}/.omp/agent/sessions/x.jsonl`, sessionName: "sess" };
 	startError?: Error;
-
+	#promptWaiters: Array<(prompt: SentPrompt) => void> = [];
 	#eventListeners = new Set<(e: OmpAgentEvent) => void>();
 	#uiListeners = new Set<(r: OmpUiRequest) => void>();
 	#hostCallListeners = new Set<(c: OmpHostToolCall) => void>();
@@ -164,9 +178,26 @@ class FakeRpc implements OmpRpc {
 		if (this.startError) throw this.startError;
 		this.alive = true;
 	}
-	async prompt(message: string): Promise<void> {
+	async prompt(message: string, images?: ImageContent[]): Promise<void> {
 		this.commands.push("prompt");
 		this.prompts.push(message);
+		this.promptImages.push(images);
+		this.#promptWaiters.splice(0).forEach((resolve) => resolve({ text: message, images }));
+	}
+
+	/**
+	 * The newest prompt, awaiting one when it has not arrived yet.
+	 *
+	 * Same idiom as {@link Harness.nextRpc}: an inbound chain that materializes
+	 * attachments suspends on real disk writes, which a microtask drain cannot
+	 * flush, so tests await the effect itself rather than a wall-clock guess.
+	 */
+	nextPrompt(): Promise<SentPrompt> {
+		const last = this.prompts.length - 1;
+		if (last >= 0) return Promise.resolve({ text: this.prompts[last]!, images: this.promptImages[last] });
+		const { promise, resolve } = Promise.withResolvers<SentPrompt>();
+		this.#promptWaiters.push(resolve);
+		return promise;
 	}
 	async abort(): Promise<void> {
 		this.commands.push("abort");
@@ -226,6 +257,12 @@ class FakeRpc implements OmpRpc {
  */
 async function settle(): Promise<void> {
 	for (let i = 0; i < 50; i++) await Promise.resolve();
+}
+
+/** One prompt as the agent received it. */
+interface SentPrompt {
+	text: string;
+	images?: ImageContent[];
 }
 
 function makeConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
@@ -1143,6 +1180,18 @@ describe("control plane park/steer (regression)", () => {
 	});
 });
 
+/** A `RouteMessage` fake that records its calls, like the RPC/Slack fakes. */
+function fakeRoute(decision?: RouterDecision): RouteMessage & { calls: Array<{ text: string; ctx: RouterContext }> } {
+	const calls: Array<{ text: string; ctx: RouterContext }> = [];
+	return Object.assign(
+		async (text: string, ctx: RouterContext) => {
+			calls.push({ text, ctx });
+			return decision;
+		},
+		{ calls },
+	);
+}
+
 /**
  * The front door: an explicit command still parses literally and never pays for
  * the model, a free-form message goes through the router, and a router that
@@ -1150,15 +1199,6 @@ describe("control plane park/steer (regression)", () => {
  * help rather than swallowing the message.
  */
 describe("front-door router", () => {
-	/** A `RouteMessage` fake that records its calls, like the RPC/Slack fakes. */
-	function fakeRoute(decision?: RouterDecision): RouteMessage & { calls: Array<{ text: string; ctx: RouterContext }> } {
-		const calls: Array<{ text: string; ctx: RouterContext }> = [];
-		return Object.assign(async (text: string, ctx: RouterContext) => {
-			calls.push({ text, ctx });
-			return decision;
-		}, { calls });
-	}
-
 	const REPO = `${HOME}/oh-my-pi-src`;
 	const lister: ListSessions = async () => [{ path: `${REPO}/.omp/a.jsonl`, title: "alpha work", modified: new Date().toISOString() }];
 
@@ -1261,5 +1301,129 @@ describe("front-door router", () => {
 		} finally {
 			await fs.rm(tmpHome, { recursive: true, force: true });
 		}
+	});
+});
+
+/**
+ * How a Slack attachment reaches the agent. An image rides the prompt frame as a
+ * decoded block *and* is named by path; anything else — or an image the vision
+ * models cannot take — is path-only with the reason stated. The router is told
+ * what was attached but never sees bytes or paths, because the local model
+ * serving it has no vision.
+ */
+describe("attachments", () => {
+	const PNG_URL = "https://files.slack.test/FIMG";
+	const PNG_BYTES = new Uint8Array([137, 80, 78, 71]);
+	/** base64("\x89PNG"), the block the agent must receive. */
+	const PNG_BASE64 = "iVBORw==";
+
+	function fileDm(text: string, files: SlackFileRef[], threadTs?: string): SlackInboundMessage {
+		return { kind: "message", channel: "D1", user: "UALICE", text, ts: `a${++dmSeq}`, files, threadTs };
+	}
+
+	function png(name = "screenshot 2026.png", mimetype = "image/png"): SlackFileRef {
+		return { id: "FIMG", name, mimetype, size: PNG_BYTES.byteLength, downloadUrl: PNG_URL, permalink: "https://slack.test/FIMG" };
+	}
+
+	test("an attached image rides the prompt frame as a block and is still named by path", async () => {
+		const h = await makeHarness(makeConfig());
+		h.slack.downloads.set(PNG_URL, PNG_BYTES);
+
+		await h.slack.inject(fileDm("run omp why does this look wrong", [png()]));
+		const sent = await (await h.nextRpc()).nextPrompt();
+
+		expect(sent.images).toEqual([{ type: "image", data: PNG_BASE64, mimeType: "image/png" }]);
+		// The path stays in the prompt: inspect_image and re-reads need a file.
+		expect(sent.text).toContain("omp-slack-attachments/");
+		expect(sent.text).toContain("screenshot 2026.png (image/png, 4 bytes)");
+	});
+
+	test("a non-vision image format stays path-only and says why", async () => {
+		const h = await makeHarness(makeConfig());
+		h.slack.downloads.set(PNG_URL, PNG_BYTES);
+
+		await h.slack.inject(fileDm("run omp read my photo", [png("IMG_0042.heic", "image/heic")]));
+		const sent = await (await h.nextRpc()).nextPrompt();
+
+		expect(sent.images).toEqual([]);
+		expect(sent.text).toContain("not shown inline: image/heic is not a vision-model format");
+		expect(sent.text).toContain("IMG_0042.heic (image/heic, 4 bytes)");
+	});
+
+	test("a non-image attachment gets no inline note at all", async () => {
+		const h = await makeHarness(makeConfig());
+		h.slack.downloads.set(PNG_URL, PNG_BYTES);
+
+		await h.slack.inject(fileDm("run omp summarize this", [png("notes.pdf", "application/pdf")]));
+		const sent = await (await h.nextRpc()).nextPrompt();
+
+		expect(sent.images).toEqual([]);
+		expect(sent.text).not.toContain("not shown inline");
+		expect(sent.text).toContain("notes.pdf (application/pdf, 4 bytes)");
+	});
+
+	test("an image replied into a live task thread rides that steer", async () => {
+		const h = await makeHarness(makeConfig(), [
+			{
+				threadTs: "threadIMG",
+				channel: "D1",
+				cwd: `${HOME}/oh-my-pi-src`,
+				sessionPath: `${HOME}/.omp/agent/sessions/live.jsonl`,
+				name: "slack:live",
+				createdAt: Date.now(),
+				lastActivityAt: Date.now(),
+			},
+		]);
+		h.slack.downloads.set(PNG_URL, PNG_BYTES);
+
+		await h.slack.inject(fileDm("here, look", [png()], "threadIMG"));
+		const sent = await (await h.nextRpc()).nextPrompt();
+
+		expect(sent.text).toContain("here, look");
+		expect(sent.images).toEqual([{ type: "image", data: PNG_BASE64, mimeType: "image/png" }]);
+	});
+
+	test("the router is told what was attached, by name and type only", async () => {
+		const route = fakeRoute({ command: "run", dir: "omp", prompt: "what is wrong here" });
+		const h = await makeHarness(makeConfig({ routerModel: "shuttle/gemma-4-26b" }), [], undefined, route);
+		h.slack.downloads.set(PNG_URL, PNG_BYTES);
+
+		await h.slack.inject(fileDm("what is wrong here", [png()]));
+		await settle();
+
+		expect(route.calls).toHaveLength(1);
+		expect(route.calls[0]!.ctx.attachments).toBe("screenshot 2026.png (image/png)");
+		// Bytes and local paths are the agent's business, never the router's.
+		expect(route.calls[0]!.text).toBe("what is wrong here");
+	});
+
+	test("a caption-less attachment starts a task instead of answering with help", async () => {
+		const route = fakeRoute({ command: "help" });
+		const h = await makeHarness(makeConfig({ defaultRepo: "omp", routerModel: "shuttle/gemma-4-26b" }), [], undefined, route);
+		h.slack.downloads.set(PNG_URL, PNG_BYTES);
+
+		await h.slack.inject(fileDm("", [png()]));
+		const rpc = await h.nextRpc();
+		const sent = await rpc.nextPrompt();
+
+		// Nothing to classify, so the router is not consulted at all.
+		expect(route.calls).toHaveLength(0);
+		expect(rpc.opts.cwd).toBe(`${HOME}/oh-my-pi-src`);
+		expect(sent.text).toContain("arrived from Slack with no accompanying message");
+		expect(sent.images).toEqual([{ type: "image", data: PNG_BASE64, mimeType: "image/png" }]);
+	});
+
+	test("a caption-less attachment with no DEFAULT_REPO is answered with its local path", async () => {
+		const h = await makeHarness(makeConfig());
+		h.slack.downloads.set(PNG_URL, PNG_BYTES);
+
+		await h.slack.inject(fileDm("", [png()]));
+		const posted = await h.slack.nextPost();
+
+		expect(h.rpcs).toHaveLength(0);
+		// Named, and its path handed back: a later reply carries only its own files.
+		expect(posted.text).toContain("screenshot 2026.png (image/png)");
+		expect(posted.text).toContain("omp-slack-attachments/");
+		expect(posted.text).not.toContain("*omp slack bridge*");
 	});
 });

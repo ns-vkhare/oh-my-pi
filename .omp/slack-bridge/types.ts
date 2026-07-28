@@ -10,9 +10,27 @@
 // omp RPC protocol frames (subset the bridge uses)
 // ============================================================================
 
+/**
+ * A vision-model image block, exactly as omp's RPC `prompt` frame accepts it
+ * (`docs/rpc.md`: `images?: ImageContent[]`). `data` is base64 with no data-URL
+ * prefix. omp resizes these for the active model and drops them entirely for a
+ * text-only one, so the bridge never has to reason about model capability.
+ */
+export interface ImageContent {
+	type: "image";
+	data: string;
+	mimeType: string;
+}
+
 /** Commands written to the RPC child's stdin (one JSON object per line). */
 export type OmpRpcCommand =
-	| { id: string; type: "prompt"; message: string; streamingBehavior?: "steer" | "followUp" }
+	| {
+			id: string;
+			type: "prompt";
+			message: string;
+			images?: ImageContent[];
+			streamingBehavior?: "steer" | "followUp";
+	  }
 	| { id: string; type: "abort" }
 	| { id: string; type: "get_state" }
 	| { id: string; type: "get_last_assistant_text" }
@@ -215,7 +233,8 @@ export interface OmpRpcEvents {
  * - Commands auto-assign ids and resolve/reject on the correlated response
  *   (reject when success:false, message = error field).
  * - prompt(): ALWAYS sends streamingBehavior:"steer". Immediate ack; turn
- *   completion is observed via onEvent agent_end.
+ *   completion is observed via onEvent agent_end. `images` ride the same frame,
+ *   so a Slack screenshot reaches the model without a `read` round trip.
  * - respondUi(): fire-and-forget stdin write (no response frame exists).
  * - stop(): SIGTERM, then SIGKILL after 5s if still alive; pending requests
  *   reject; onExit fires exactly once.
@@ -224,7 +243,7 @@ export interface OmpRpcEvents {
 export interface OmpRpc extends OmpRpcEvents {
 	readonly alive: boolean;
 	start(): Promise<void>;
-	prompt(message: string): Promise<void>;
+	prompt(message: string, images?: ImageContent[]): Promise<void>;
 	abort(): Promise<void>;
 	getState(): Promise<OmpSessionState>;
 	getLastAssistantText(): Promise<string | null>;
@@ -462,11 +481,20 @@ export type RouterDecision =
 	| { command: "status" }
 	| { command: "help" };
 
-/** Repo choices handed to the router so it can pick a `dir` that exists. */
+/** What the router is told about the message besides its text. */
 export interface RouterContext {
 	/** alias → absolute path, from `REPOS`. */
 	repos: Record<string, string>;
 	defaultRepo?: string;
+	/**
+	 * One-line inventory of the message's attachments (`screenshot.png
+	 * (image/png)`), or absent when it carries none. The router model gets the
+	 * *names and types only* — never bytes, never paths: a local model served by
+	 * Shuttle has no vision, and its only job is picking a command. Without this
+	 * a bare "what's wrong here?" plus a screenshot reads as pure ambiguity and
+	 * routes to `help`.
+	 */
+	attachments?: string;
 }
 
 /**

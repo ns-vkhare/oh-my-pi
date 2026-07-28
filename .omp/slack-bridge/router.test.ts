@@ -191,4 +191,35 @@ describe("createRouter", () => {
 			"5",
 		]);
 	});
+
+	test("--attachments is passed only when the context carries an inventory", async () => {
+		const withFiles = await makeStub(RECORDING_STUB);
+		const routeA = createRouter(makeConfig({ routerScript: withFiles.script }));
+		expect(await routeA("what is wrong here", { repos: { omp: "/src/omp" }, attachments: "shot.png (image/png)" })).toEqual({
+			command: "help",
+		});
+		expect((await Bun.file(withFiles.argv).text()).trim().split("\n")).toEqual([
+			"--model",
+			MODEL,
+			"--repos",
+			"omp=/src/omp",
+			"--attachments",
+			"shot.png (image/png)",
+			"--timeout",
+			"5",
+		]);
+
+		// A blank inventory is the same as none: no empty flag value reaches the script.
+		const blank = await makeStub(RECORDING_STUB);
+		const routeB = createRouter(makeConfig({ routerScript: blank.script }));
+		expect(await routeB("hi", { repos: { omp: "/src/omp" }, attachments: "  " })).toEqual({ command: "help" });
+		expect((await Bun.file(blank.argv).text()).trim().split("\n")).toEqual([
+			"--model",
+			MODEL,
+			"--repos",
+			"omp=/src/omp",
+			"--timeout",
+			"5",
+		]);
+	});
 });

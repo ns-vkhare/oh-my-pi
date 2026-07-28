@@ -15,7 +15,7 @@
 #   empty extraction) goes to stderr. The caller parses stdout blindly and
 #   falls back to its literal parser on any non-zero exit, so a dead or
 #   confused model can never swallow a Slack message.
-# arguments: "--model <spec> [--repos \"a=p,b=q\"] [--default-repo <alias>] [--timeout <sec>]  # message on stdin"
+# arguments: "--model <spec> [--repos \"a=p,b=q\"] [--default-repo <alias>] [--attachments \"a.png (image/png)\"] [--timeout <sec>]  # message on stdin"
 # ---
 #
 # Usage:
@@ -28,6 +28,9 @@
 #   --repos <list>        Comma-separated alias=path pairs offered to the model
 #                         as the legal values for `dir`. May be empty.
 #   --default-repo <a>    Alias the bridge falls back to when `dir` is omitted.
+#   --attachments <list>  One-line inventory of the message's attachments (names
+#                         and types only — the model never sees bytes or paths).
+#                         Without it an uncaptioned screenshot reads as ambiguity.
 #   --timeout <seconds>   Kill the worker after N seconds (default: 60).
 #
 # Notes:
@@ -41,6 +44,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL=""
 REPOS=""
 DEFAULT_REPO=""
+ATTACHMENTS=""
 TIMEOUT=60
 SHUTTLE_ENDPOINT="${SHUTTLE_ENDPOINT:-http://127.0.0.1:8780}"
 
@@ -53,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --model)        MODEL="$2"; shift 2 ;;
     --repos)        REPOS="$2"; shift 2 ;;
     --default-repo) DEFAULT_REPO="$2"; shift 2 ;;
+    --attachments)  ATTACHMENTS="$2"; shift 2 ;;
     --timeout)      TIMEOUT="$2"; shift 2 ;;
     *)              echo "route.sh: unknown option: $1" >&2; exit 1 ;;
   esac
@@ -107,8 +112,8 @@ if ! curl -sf "$SHUTTLE_ENDPOINT/healthz" >/dev/null 2>&1 \
   exit 1
 fi
 
-# The user turn: the aliases the model may legally put in `dir`, then the
-# verbatim message.
+# The user turn: the aliases the model may legally put in `dir`, what the message
+# carried alongside its text, then the verbatim message.
 if [[ -n "$REPOS" ]]; then
   USER_TURN="Repo aliases: ${REPOS//,/, }"
 else
@@ -116,6 +121,9 @@ else
 fi
 if [[ -n "$DEFAULT_REPO" ]]; then
   USER_TURN="$USER_TURN"$'\n'"Default repo alias: $DEFAULT_REPO"
+fi
+if [[ -n "$ATTACHMENTS" ]]; then
+  USER_TURN="$USER_TURN"$'\n'"Attachments on this message: $ATTACHMENTS"
 fi
 USER_TURN="$USER_TURN"$'\n\n'"$MESSAGE"
 

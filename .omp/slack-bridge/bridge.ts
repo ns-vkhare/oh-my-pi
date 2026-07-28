@@ -29,6 +29,7 @@ import { createRouter } from "./router";
 import type {
 	AskToolArgs,
 	BridgeConfig,
+	ImageContent,
 	OmpAgentEvent,
 	OmpAssistantMessageEvent,
 	OmpHostToolCall,
@@ -64,6 +65,26 @@ const TERMINAL_SUBAGENT_STATUSES: Record<string, true> = { completed: true, fail
 const CATCHUP_INTERVAL_MS = 120_000;
 /** Per-file ceiling for attachments materialized to disk. */
 const ATTACHMENT_MAX_BYTES = 32 * 1024 * 1024;
+/**
+ * What omp can hand a vision model (`SUPPORTED_IMAGE_MIME_TYPES` in
+ * `packages/utils/src/mime.ts`). Anything else — HEIC off an iPhone, SVG, TIFF —
+ * stays path-only: `read` reports an unsupported format cleanly, whereas an
+ * undecodable block reaches the provider and fails the whole turn.
+ */
+const INLINE_IMAGE_MIME_TYPES: Record<string, true> = {
+	"image/png": true,
+	"image/jpeg": true,
+	"image/gif": true,
+	"image/webp": true,
+};
+/**
+ * Ceiling for an image sent inline, well under omp's own 20MB input cap. Base64
+ * inflates by a third and the frame is a single JSONL line, so a phone-camera
+ * dump stays a path the agent can open on demand instead of an 11MB stdin write.
+ */
+const INLINE_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+/** Ceiling on the attachment inventory handed to the router, in characters. */
+const ATTACHMENT_SUMMARY_MAX_CHARS = 200;
 /** Remembered inbound message ts values (live + replayed), for dedup. */
 const SEEN_MESSAGE_CAP = 500;
 /**
@@ -80,6 +101,19 @@ function countActiveSubagents(list: readonly OmpSubagentSnapshot[]): number {
 	}
 	return active;
 }
+
+/**
+ * A message's attachments, ready to hand to the agent: the prompt note naming
+ * every file (paths for the fetched ones, a reason for the rest) and the image
+ * blocks that ride the prompt frame alongside it.
+ */
+interface AttachmentPayload {
+	note: string;
+	images: ImageContent[];
+}
+
+/** Shared no-attachment result — the overwhelmingly common case. */
+const EMPTY_ATTACHMENTS: AttachmentPayload = { note: "", images: [] };
 
 /** A UI request awaiting a Slack answer, plus the message showing it. */
 interface PendingUi {
@@ -278,6 +312,15 @@ const HELP_TEXT = [
 	"• `status` — bridge status",
 	"Reply inside a task thread to steer it, or `abort` / `kill` / `status`.",
 ].join("\n");
+
+/**
+ * Prompt used when a DM is nothing but attachments. Deliberately does no work:
+ * the user said nothing, so the agent describes what it was handed and waits.
+ * That single turn is enough to bind the thread, and every reply after it is a
+ * normal steer.
+ */
+const ATTACHMENT_ONLY_PROMPT =
+	"The attachments below arrived from Slack with no accompanying message. Describe what each one is, then stop and wait for instructions — do not start any work yet.";
 
 /** The bridge-owned `ask` host tool (see DESIGN.md §omp RPC protocol). */
 const ASK_HOST_TOOL: OmpHostToolDefinition = {
@@ -588,21 +631,29 @@ export class Bridge {
 	}
 
 	/**
-	 * Materialize a message's Slack attachments and describe them for the agent.
+	 * Materialize a message's Slack attachments: local copies, a prompt note
+	 * describing them, and decoded blocks for the ones the model can see directly.
 	 *
-	 * Slack files are not reachable by path from a repo checkout, so the only way
-	 * an attachment can inform a run is a local copy plus a line in the prompt.
+	 * Slack files are not reachable by path from a repo checkout, so an attachment
+	 * informs a run two ways. Every fetched file lands on disk and is named with
+	 * its path, which is what makes a PDF or a log readable via `read`. An image
+	 * additionally rides the prompt frame as an {@link ImageContent} block, so the
+	 * model sees the screenshot in the same turn instead of having to guess that a
+	 * path is worth opening. Both are emitted for an image on purpose: the block
+	 * is what it looks at, the path is what `inspect_image` and re-reads need.
+	 *
 	 * Files that cannot be fetched (external hosts, oversized, missing scope) are
 	 * still named — the agent must know something was attached and why it is not
 	 * readable rather than silently answering without it.
 	 */
-	async #attachmentNote(msg: SlackInboundMessage): Promise<string> {
+	async #attachmentNote(msg: SlackInboundMessage): Promise<AttachmentPayload> {
 		const files = msg.files ?? [];
 		const links = msg.links ?? [];
-		if (files.length === 0 && links.length === 0) return "";
+		if (files.length === 0 && links.length === 0) return EMPTY_ATTACHMENTS;
 
 		const dir = `${os.tmpdir()}/omp-slack-attachments/${msg.ts}`;
 		const lines: string[] = [];
+		const images: ImageContent[] = [];
 		for (const file of files) {
 			if (!file.downloadUrl) {
 				lines.push(`- ${file.name} — hosted outside Slack, no local copy${file.permalink ? ` (${file.permalink})` : ""}`);
@@ -617,13 +668,16 @@ export class Bridge {
 				const path = `${dir}/${safeFilename(file.name)}`;
 				await Bun.write(path, bytes);
 				lines.push(`- ${path} (${file.mimetype}, ${bytes.byteLength} bytes)`);
+				const inline = inlineImageOf(file.mimetype, bytes);
+				if (inline?.image) images.push(inline.image);
+				else if (inline?.refusal) lines.push(`  (not shown inline: ${inline.refusal} — read the path above)`);
 			} catch (err) {
 				console.error(`bridge: attachment ${file.name} failed: ${String(err)}`);
 				lines.push(`- ${file.name} — download failed: ${String(err)}`);
 			}
 		}
 		for (const link of links) lines.push(`- ${link} — linked, not downloaded`);
-		return `\n\nAttached in Slack:\n${lines.join("\n")}`;
+		return { note: `\n\nAttached in Slack:\n${lines.join("\n")}`, images };
 	}
 
 	/**
@@ -665,10 +719,39 @@ export class Bridge {
 				return;
 		}
 
+		const attachments = attachmentSummary(msg);
+
+		// A bare attachment with no words: there is nothing to classify, and the
+		// router rejects an empty message anyway. Dropping it here is what made a
+		// pasted screenshot vanish into the help text, so it starts a task instead
+		// — which also puts the user in a live thread, where every later reply is
+		// an ordinary steer and carries its own attachments.
+		if (text.length === 0 && attachments !== undefined) {
+			// No DEFAULT_REPO means no repo to start in and no `run` line to imitate.
+			// The files are still materialized and their paths handed back, so the
+			// follow-up (`run omp look at /tmp/…/shot.png`) can name them — a reply
+			// carries only its own attachments, so an unnamed file would be lost.
+			if (!this.#config.defaultRepo) {
+				const attached = await this.#attachmentNote(msg);
+				await this.#slack.postMessage({
+					channel: msg.channel,
+					threadTs: this.#replyThread(msg),
+					text: `Got ${escapeMrkdwn(attachments)} with no message — say what to do with it, e.g. \`run <alias|path> review this\`.${attached.note}`,
+				});
+				return;
+			}
+			await this.#cmdRun(msg, `${this.#config.defaultRepo} ${ATTACHMENT_ONLY_PROMPT}`);
+			return;
+		}
+
 		// Free-form: let the router say what was meant. It fails open — disabled,
 		// unreachable, slow or unparseable all resolve undefined, and a dead local
 		// model must never swallow a Slack message.
-		const decision = await this.#route(text, { repos: this.#config.repos, defaultRepo: this.#config.defaultRepo });
+		const decision = await this.#route(text, {
+			repos: this.#config.repos,
+			defaultRepo: this.#config.defaultRepo,
+			attachments,
+		});
 		if (decision) {
 			await this.#dispatchDecision(msg, decision);
 			return;
@@ -794,7 +877,15 @@ export class Bridge {
 			: undefined;
 		// The skill keys on the word "orchestrate", so the prompt must carry it.
 		const message = opts.orchestrate ? `orchestrate: ${prompt}` : prompt;
-		await this.#spawn({ record, isNew: true, prompt: message + (await this.#attachmentNote(msg)), sessionName: name, model });
+		const attached = await this.#attachmentNote(msg);
+		await this.#spawn({
+			record,
+			isNew: true,
+			prompt: message + attached.note,
+			images: attached.images,
+			sessionName: name,
+			model,
+		});
 	}
 
 	async #cmdSessions(msg: SlackInboundMessage, alias: string | undefined): Promise<void> {
@@ -1005,8 +1096,10 @@ export class Bridge {
 			await this.#note(task, "parking in progress — reply again once it settles");
 			return;
 		}
-		const steer = text + (await this.#attachmentNote(msg));
-		await task.rpc.prompt(steer).catch((err) => this.#note(task!, `prompt failed: ${String(err)}`));
+		const attached = await this.#attachmentNote(msg);
+		await task.rpc
+			.prompt(text + attached.note, attached.images)
+			.catch((err) => this.#note(task!, `prompt failed: ${String(err)}`));
 		this.#registry.touch(threadTs);
 	}
 
@@ -1101,6 +1194,8 @@ export class Bridge {
 		record: TaskRecord;
 		isNew: boolean;
 		prompt?: string;
+		/** Image blocks delivered with `prompt` (Slack screenshots); ignored without one. */
+		images?: ImageContent[];
 		resumeSessionPath?: string;
 		sessionName?: string;
 		/** Pin the child to a model spec (`omp --model <spec>`); omp's default when absent. */
@@ -1159,7 +1254,7 @@ export class Bridge {
 		await rpc.setHostTools([ASK_HOST_TOOL]).catch((err) => console.error(`bridge: set_host_tools failed: ${String(err)}`));
 
 		if (isNew && args.prompt) {
-			await rpc.prompt(args.prompt).catch((err) => this.#note(task, `prompt failed: ${String(err)}`));
+			await rpc.prompt(args.prompt, args.images).catch((err) => this.#note(task, `prompt failed: ${String(err)}`));
 		}
 	}
 
@@ -1633,6 +1728,44 @@ function basename(path: string): string {
 function safeFilename(name: string): string {
 	const flat = name.replace(/[/\\]/g, "_").replace(/^\.+/, "").trim();
 	return flat || "attachment";
+}
+
+/**
+ * The decoded block for an attachment the model can look at directly, or the
+ * reason it stays path-only.
+ *
+ * `undefined` means "not an image at all" — a PDF or a log needs no explanation,
+ * its path already says everything. A `refusal` is only ever produced for a real
+ * `image/*`, because there a silent omission would read as "the screenshot was
+ * ignored".
+ */
+function inlineImageOf(mimetype: string, bytes: Uint8Array): { image?: ImageContent; refusal?: string } | undefined {
+	if (!mimetype.startsWith("image/")) return undefined;
+	if (INLINE_IMAGE_MIME_TYPES[mimetype] !== true) return { refusal: `${mimetype} is not a vision-model format` };
+	if (bytes.byteLength > INLINE_IMAGE_MAX_BYTES) {
+		return { refusal: `${bytes.byteLength} bytes exceeds the ${INLINE_IMAGE_MAX_BYTES} byte inline cap` };
+	}
+	return { image: { type: "image", data: Buffer.from(bytes).toBase64(), mimeType: mimetype } };
+}
+
+/**
+ * `screenshot.png (image/png), notes.pdf (application/pdf), 1 link` — the
+ * inventory the router model is given so an uncaptioned or terse message is not
+ * mistaken for small talk. Names and types only: no bytes, no local paths.
+ *
+ * One line, bounded: the name is user-controlled, and this value becomes an argv
+ * word and then a line of the routing prompt. A newline would forge prompt
+ * structure and forty files would crowd out the message itself.
+ */
+function attachmentSummary(msg: SlackInboundMessage): string | undefined {
+	const parts = (msg.files ?? []).map(
+		(file) => `${file.name.replace(/\s+/g, " ").trim()} (${file.mimetype.replace(/\s+/g, " ").trim()})`,
+	);
+	const links = msg.links?.length ?? 0;
+	if (links > 0) parts.push(links === 1 ? "1 link" : `${links} links`);
+	if (parts.length === 0) return undefined;
+	const joined = parts.join(", ");
+	return joined.length > ATTACHMENT_SUMMARY_MAX_CHARS ? `${joined.slice(0, ATTACHMENT_SUMMARY_MAX_CHARS - 1)}…` : joined;
 }
 
 function ageOf(ts: number): string {

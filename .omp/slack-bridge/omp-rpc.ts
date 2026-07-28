@@ -6,6 +6,7 @@
  */
 
 import type {
+	ImageContent,
 	OmpAgentEvent,
 	OmpHostToolCall,
 	OmpHostToolCancel,
@@ -57,7 +58,7 @@ interface Pending {
 
 /** Command shape written to stdin; `id` is injected by {@link OmpRpcClient.send}. */
 type OutboundCommand =
-	| { type: "prompt"; message: string; streamingBehavior: "steer" }
+	| { type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior: "steer" }
 	| { type: "abort" }
 	| { type: "get_state" }
 	| { type: "get_last_assistant_text" }
@@ -143,8 +144,12 @@ class OmpRpcClient implements OmpRpc {
 		}
 	}
 
-	async prompt(message: string): Promise<void> {
-		await this.#send({ type: "prompt", message, streamingBehavior: "steer" });
+	async prompt(message: string, images?: ImageContent[]): Promise<void> {
+		// The field is omitted rather than sent empty: an absent `images` is the
+		// documented "text only" frame, and it keeps the session transcript clean.
+		const frame: OutboundCommand = { type: "prompt", message, streamingBehavior: "steer" };
+		if (images && images.length > 0) frame.images = images;
+		await this.#send(frame);
 	}
 
 	async abort(): Promise<void> {

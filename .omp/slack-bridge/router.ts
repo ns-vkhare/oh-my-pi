@@ -89,6 +89,11 @@ export function createRouter(config: BridgeConfig): RouteMessage {
 			const args = [config.routerScript, "--model", model, "--repos", formatRepos(ctx.repos)];
 			const defaultRepo = nonEmpty(ctx.defaultRepo);
 			if (defaultRepo !== undefined) args.push("--default-repo", defaultRepo);
+			// Names and types only, and already collapsed to one line by the caller:
+			// argv is safe here (no shell between us and the script) and it keeps the
+			// inventory out of the message the model must restate verbatim.
+			const attachments = nonEmpty(ctx.attachments);
+			if (attachments !== undefined) args.push("--attachments", attachments);
 			args.push("--timeout", String(Math.ceil(config.routerTimeoutMs / 1000)));
 
 			const child = Bun.spawn(args, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
