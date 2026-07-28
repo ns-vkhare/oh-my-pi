@@ -79,6 +79,7 @@ happens in that thread.
 | Command | What it does |
 |---|---|
 | `run <alias\|path> <prompt…>` | Start a new omp task in the repo mapped to `<alias>` (see `REPOS` in `.env`) or an absolute path under `$HOME`. The bot threads its reply under your message — everything about the task happens in that thread. With `DEFAULT_REPO` set, `run <prompt>` alone targets it. |
+| `orchestrate <alias\|path> <prompt…>` | Like `run`, but the agent takes omp's **orchestrator** identity (decompose the work, fan out subagents) and runs on the orchestrator's pinned model instead of omp's default. Same dir rules as `run`. |
 | `sessions [alias]` | Browse **every** omp session on disk — newest 8 per configured repo (or just `<alias>`), numbered. Badges: ⚡ `live·slack` (running under the bridge), 🔗 (already has a thread). |
 | `resume <n>` | Attach session `n` from the last `sessions` listing to a new thread, with full context. |
 | `resume <sessionPath>` | Same, by explicit `.jsonl` path. Already-attached sessions link back to their existing thread instead of double-attaching. |
@@ -169,6 +170,40 @@ bot   ✅ oh-my-pi-src: turn finished — "Refactored the hub reaper; ready for 
 you   (reply) run the full test suite before I look
 bot   (session resumes under Slack, runs it, replies in the same thread)
 ```
+
+## Router (optional)
+
+Talk to the bridge in plain English instead of remembering the command list:
+"start a task in omp to fix the flaky watcher test" is classified into
+`run omp fix the flaky watcher test` by a **local** model — the message never
+leaves your machine.
+
+Prerequisites:
+
+- Shuttle running on `127.0.0.1:8780`, serving the model.
+- `pi` and `jq` on `PATH`.
+- a `shuttle` provider in `~/.pi/agent/models.json` with that model id
+  registered under it.
+
+Turn it on in `.env` (then restart the bridge):
+
+```sh
+ROUTER_MODEL=shuttle/gemma-4-26b
+```
+
+Test it by hand — this prints exactly one JSON line:
+
+```sh
+echo "start a task in omp to fix the flaky test" \
+  | .omp/slack-bridge/router/route.sh --model shuttle/gemma-4-26b --repos "omp=$HOME/oh-my-pi-src"
+```
+
+Turn it off by unsetting `ROUTER_MODEL` — empty is the default. Two things stay
+true either way: a message whose first token is already a command (`run`,
+`orchestrate`, `sessions`, `resume`, `status`, `help`) is dispatched literally
+and never reaches the model, and a router that is off, down, slow, or confused
+falls back to that same literal parser. A dead local model can never swallow a
+message. Replies inside a task thread are steers and skip the router entirely.
 
 ## Terminal session notifications
 

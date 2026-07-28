@@ -36,6 +36,11 @@ flowchart LR
 | `bridge.ts` | BridgeCore | Daemon entry: routing, registry, task lifecycle, ask relay. |
 | `blocks.ts` | BridgeCore | Block Kit / mrkdwn rendering helpers. |
 | `registry.ts` | BridgeCore | Thread↔session registry with JSON persistence. |
+| `router.ts` | Router | `createRouter` — bridge-side client: spawns `router/route.sh`, enforces `routerTimeoutMs`, parses the single JSON line. Fails open (`undefined`). |
+| `agent-model.ts` | Router | `resolveAgentModel` — reads the `orchestrate` agent definition (`<repo>/.omp/agents/`, then `~/.omp/agent/agents/`) for its pinned `model:`. |
+| `router/route.sh` | Router | pi harness invocation: message on stdin, one compact `RouterDecision` JSON line on stdout, exit 0 = decision. |
+| `router/prompts/entry.md` | Router | System prompt for the routing model. |
+| `router/tools/commands.ts` | Router | pi extension registering the six commands as tools; each returns `ROUTE <json>` in its result. |
 | `omp-rpc.test.ts` | RpcCore | Unit tests against a fake child (`bun test`). |
 | `slack.test.ts` | SlackTransport | Unit tests against a local mock WS server (`bun test`). |
 | `bridge.test.ts` | BridgeCore | Unit tests for command parsing + registry (`bun test`). |
@@ -108,6 +113,7 @@ thread hangs under what the user asked for:
 | Command | Behavior |
 |---|---|
 | `run <alias\|path> <prompt…>` | New task: resolve dir (alias from `REPOS` config, else absolute path under `$HOME`), spawn RPC proc, `set_session_name` from prompt, post the task header as the first reply under the user's message — that message's `ts` is the thread id, register thread. |
+| `orchestrate <alias\|path> <prompt…>` | Same as `run`, except the prompt is prefixed `orchestrate: ` (so omp's `orchestrator-identity` skill triggers) and omp is spawned with `--model <orchestrator model>`, resolved from the `orchestrate` agent definition. |
 | `sessions` | List registry entries (live ⏵ / idle ⏸, dir, name, age) + how to continue (`reply in thread`) . |
 | `resume <sessionPath>` | Attach an existing on-disk session (e.g. one started in terminal): spawn `--resume`, post header, register thread. |
 | `status` | Bridge status: live procs / registry size / uptime. |
@@ -127,6 +133,71 @@ Agent → Slack rendering:
 - `extension_ui_request select/confirm` → Block Kit message: question + option descriptions; ≤5 options → buttons, else `static_select`; `action_id` = `ui:<requestId>`, value = option label. Click → `extension_ui_response` + edit the ask message to show the choice (`✅ label — answered by @user`). `cancel` request (`targetId`) → edit ask message to `⌛ cancelled` and drop pending state.
 - `notify` → small thread message (info/warn/error prefix). `setStatus`/`open_url` → thread message (URL as link). Everything user-visible passes through `blocks.ts` sanitizers (mrkdwn-escape `&<>`, truncate).
 
+## Front-door router (local model via Shuttle)
+
+A free-form DM ("start a task in omp to fix the flaky watcher test") is
+classified into exactly one top-level command by a **local** model — default
+target `shuttle/gemma-4-26b`, served by Shuttle on `127.0.0.1:8780` and driven
+through the `pi` CLI harness by `router/route.sh`. `router/prompts/entry.md` is
+the system prompt; `router/tools/commands.ts` is a pi extension registering the
+six commands (`run`, `orchestrate`, `sessions`, `resume`, `status`, `help`) as
+tools, so the model *calls* a command instead of describing one. The
+bridge-side client is `router.ts` (`createRouter`).
+
+```mermaid
+flowchart LR
+  D[Slack DM] --> L{literal first token?}
+  L -->|yes| C[command]
+  L -->|no| R[router/route.sh]
+  R --> P[pi] --> G[gemma-4-26b @ Shuttle :8780]
+  G -->|ROUTE json| C
+  R -.->|no decision| F[literal parser]
+```
+
+- An **explicit** first-token command (`run`, `orchestrate`, `sessions`,
+  `resume`, `status`, `help`) is dispatched literally and **never** reaches the
+  model — zero added latency for power users.
+- Anything else that reaches the top-level command surface goes to the model,
+  which calls exactly one command tool. The tool returns `ROUTE <json>` in its
+  result; `route.sh` extracts that with `jq` from pi's `--mode json` event
+  stream and prints one JSON line on stdout.
+- **Steers are never routed.** A reply inside a live task thread still goes
+  straight to the agent as a prompt; the router only sees true top-level DMs
+  plus thread replies whose thread has no bound session.
+- **Fail-open.** Router disabled, Shuttle down, `jq`/`pi` missing, timeout, or
+  an unparseable answer → the bridge falls back to the literal parser (which
+  posts the help text). A dead local model can never swallow a message.
+- The model's `dir` is re-validated through the existing alias/`$HOME` check: a
+  hallucinated path is rejected or falls back to `DEFAULT_REPO`, never trusted.
+
+`route.sh` contract:
+
+```
+router/route.sh --model <pi-model-spec> --repos "alias=path,alias=path" \
+                [--default-repo <alias>] [--timeout <seconds>]
+```
+
+- The Slack message text arrives on **stdin**, never as an argv word (it is
+  untrusted user text).
+- stdout: **exactly one line** — the `RouterDecision` as compact JSON — or
+  nothing at all. stderr: diagnostics only.
+- Exit 0 = a decision line was printed. Any non-zero exit = no decision, and
+  the caller falls back.
+
+### `orchestrate`
+
+`orchestrate <alias|path> <prompt…>` starts a task exactly like `run`, with two
+differences: the prompt is prefixed `orchestrate: ` so omp's
+`orchestrator-identity` skill triggers, and omp is spawned with
+`--model <orchestrator model>`. That model is resolved at spawn time from the
+`orchestrate` **agent definition**, in omp's own precedence order —
+`<repo>/.omp/agents/orchestrate.md`, then `~/.omp/agent/agents/orchestrate.md`
+(the `agent` path segment matters; `~/.omp/agents` is not an omp scan root) —
+which pins `model: anthropic/claude-fable-5`. `ORCHESTRATE_MODEL` in `.env`
+overrides the lookup, and `anthropic/claude-fable-5` is the last-resort
+fallback. This shape exists because omp has **no `--agent` flag**: the
+orchestrator identity comes from the skill, the model from `--model`.
+
 ## Security
 
 - Allowlist: ignore every event whose `user` ∉ `SLACK_ALLOWED_USERS` (comma-separated member IDs). No allowlist configured → refuse to start.
@@ -139,7 +210,13 @@ Agent → Slack rendering:
 `OMP_BIN` (default `omp`), `REPOS` (`alias=path,alias=path`),
 `DEFAULT_REPO` (alias used when `run` gets no dir), `MAX_TASKS` (default 4),
 `IDLE_TTL_MIN` (default 30), `SESSION_NAME_PREFIX` (default `slack:`),
-`CATCHUP_WINDOW_MIN` (default 60, 0 disables the missed-DM sweep).
+`CATCHUP_WINDOW_MIN` (default 60, 0 disables the missed-DM sweep),
+`ROUTER_MODEL` (pi model spec for the router, e.g. `shuttle/gemma-4-26b`;
+empty — the default — disables the router), `ROUTER_TIMEOUT_MS` (per-message
+routing deadline, default 60000), `ROUTER_SCRIPT` (override the path to
+`route.sh`; defaults to the `router/route.sh` beside the installed bridge),
+`ORCHESTRATE_MODEL` (override the orchestrator model; empty — the default —
+resolves it from the `orchestrate` agent file).
 
 ## Lifecycle invariants
 
@@ -149,6 +226,11 @@ Agent → Slack rendering:
 4. Bridge shutdown (SIGINT/SIGTERM): SIGTERM all children, flush registry, close WS.
 5. A top-level DM is answered at most once: the catch-up sweep skips anything with thread replies, a task record on its ts, or a ts already routed this process, and its per-channel watermark in `state.json` only moves forward.
 6. Every pending UI request belongs to exactly one thread; answering twice is a no-op (second click edits message to current state).
+7. The router is **advisory**: a routing failure (disabled, unreachable, slow,
+   unparseable) degrades to the literal first-token parser, never to a dropped
+   message.
+8. An explicit first-token command is never sent to the model — literal
+   dispatch wins before the router is consulted.
 
 ## Verification gates (run by orchestrator, not implementers)
 

@@ -20,7 +20,9 @@ DEST="${DEST:-$HOME/.omp/slack-bridge}"
 
 FILES=(
 	types.ts omp-rpc.ts slack.ts blocks.ts registry.ts bridge.ts smoke.ts
+	router.ts agent-model.ts
 	omp-rpc.test.ts slack.test.ts bridge.test.ts blocks.test.ts
+	router.test.ts agent-model.test.ts
 	slack-notify.extension.ts slack-notify.test.ts
 	control.ts control.test.ts
 	manifest.json .env.example README.md DESIGN.md TEAM-SETUP.md
@@ -31,6 +33,13 @@ mkdir -p "$DEST"
 for f in "${FILES[@]}"; do
 	cp "$SRC/$f" "$DEST/$f"
 done
+
+# Front-door router worker (pi harness assets). A subtree, not a flat file, and
+# route.sh must stay executable — bridge.ts defaults ROUTER_SCRIPT to the
+# router/route.sh sitting next to the installed bridge module.
+rm -rf "$DEST/router"
+cp -R "$SRC/router" "$DEST/router"
+chmod +x "$DEST/router/route.sh"
 
 # Terminal-session notifier: loads in EVERY omp session, pings this bridge when
 # a terminal turn ends / an agent asks. Code, not config — always overwrite.

@@ -423,6 +423,44 @@ export type ControlResponse =
 	| { ok: false; error: string };
 
 // ============================================================================
+// Front-door router (local model via Shuttle, driven by the `pi` harness)
+// ============================================================================
+
+/**
+ * One command the router resolved a free-form Slack message into.
+ *
+ * Mirrors the top-level command surface one-for-one: the router picks the
+ * command and its arguments, the bridge executes it. `dir` is a REPOS alias or
+ * an absolute path under $HOME — the bridge re-validates it via `#resolveDir`
+ * and never trusts the model's choice.
+ */
+export type RouterDecision =
+	| { command: "run"; dir?: string; prompt: string }
+	| { command: "orchestrate"; dir?: string; prompt: string }
+	| { command: "sessions"; alias?: string }
+	| { command: "resume"; target: string }
+	| { command: "status" }
+	| { command: "help" };
+
+/** Repo choices handed to the router so it can pick a `dir` that exists. */
+export interface RouterContext {
+	/** alias → absolute path, from `REPOS`. */
+	repos: Record<string, string>;
+	defaultRepo?: string;
+}
+
+/**
+ * Router seam — tests inject a fake, production spawns `router/route.sh`.
+ *
+ * FAIL-OPEN CONTRACT: resolves `undefined` whenever the router is disabled,
+ * unreachable, times out, or produces no parseable decision. `undefined` means
+ * "no opinion" and the caller MUST fall back to the literal first-token parser,
+ * so a dead local model can never swallow a Slack message. Implementations
+ * therefore never reject.
+ */
+export type RouteMessage = (text: string, ctx: RouterContext) => Promise<RouterDecision | undefined>;
+
+// ============================================================================
 // Bridge config
 // ============================================================================
 
@@ -443,6 +481,22 @@ export interface BridgeConfig {
 	 * was down (minutes). 0 disables catch-up entirely.
 	 */
 	catchupWindowMin: number;
+	/**
+	 * pi model spec for the front-door router (e.g. `shuttle/gemma-4-26b`).
+	 * Empty string disables the router: every message goes straight to the
+	 * literal first-token parser.
+	 */
+	routerModel: string;
+	/** Hard deadline for one routing call; on elapse the router fails open. */
+	routerTimeoutMs: number;
+	/** Absolute path to `router/route.sh`. */
+	routerScript: string;
+	/**
+	 * Model the `orchestrate` command spawns omp with. Empty means "resolve
+	 * from the `orchestrate` agent definition at spawn time" (see
+	 * `resolveAgentModel`), which is the normal path.
+	 */
+	orchestrateModel: string;
 	/** State/registry directory (default ~/.omp/slack-bridge). */
 	stateDir: string;
 }
