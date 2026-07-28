@@ -340,8 +340,11 @@ export interface SlackPostArgs {
  *   types, normalized. NO allowlist filtering here — bridge owns policy.
  * - Web API calls throw Error(`slack ${method}: ${error}`) on ok:false.
  * - postMessage returns the new message ts.
- * - uploadText: files.uploadV2 flow (getUploadURLExternal → POST bytes →
- *   completeUploadExternal) attaching a text snippet to the thread.
+ * - uploadFiles: files.uploadV2 flow (getUploadURLExternal → POST bytes →
+ *   completeUploadExternal) attaching one or more files to the thread. A single
+ *   finalize call means N files arrive as ONE Slack message, and Slack renders
+ *   image types inline — the only way a screenshot is actually visible.
+ *   uploadText is the text-snippet special case.
  * - A 30s client ping keeps the socket honest: a peer that vanished without a
  *   FIN (proxy/NAT drop) surfaces as a write error → close → reconnect.
  *   `connected` reports the live readyState; `reconnect()` forces a new socket.
@@ -355,6 +358,13 @@ export interface SlackTransport {
 	postMessage(args: SlackPostArgs): Promise<string>;
 	updateMessage(args: { channel: string; ts: string; text: string; blocks?: SlackBlock[] }): Promise<void>;
 	uploadText(args: { channel: string; threadTs: string; filename: string; content: string }): Promise<void>;
+	uploadFiles(args: {
+		channel: string;
+		threadTs: string;
+		files: Array<{ filename: string; bytes: Uint8Array }>;
+		/** Message text posted with the files (`initial_comment`). */
+		comment?: string;
+	}): Promise<void>;
 	/** Open (or fetch) the bot↔user DM channel; returns its channel id. */
 	openDm(userId: string): Promise<string>;
 	/**

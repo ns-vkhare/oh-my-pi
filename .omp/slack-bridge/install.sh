@@ -26,7 +26,7 @@ FILES=(
 	slack-notify.extension.ts slack-notify.test.ts
 	control.ts control.test.ts
 	manifest.json .env.example README.md DESIGN.md TEAM-SETUP.md
-	package.json tsconfig.json
+	package.json tsconfig.json assets.d.ts
 )
 
 mkdir -p "$DEST"
@@ -40,6 +40,12 @@ done
 rm -rf "$DEST/router"
 cp -R "$SRC/router" "$DEST/router"
 chmod +x "$DEST/router/route.sh"
+
+# Prompt assets bridge.ts imports as text. Missing here means the daemon fails to
+# start, which is the intended loud failure: a bridge that silently spawns agents
+# without the Slack reply guidance is the bug this directory exists to prevent.
+rm -rf "$DEST/prompts"
+cp -R "$SRC/prompts" "$DEST/prompts"
 
 # Terminal-session notifier: loads in EVERY omp session, pings this bridge when
 # a terminal turn ends / an agent asks. Code, not config — always overwrite.

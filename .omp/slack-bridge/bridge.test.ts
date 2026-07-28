@@ -56,11 +56,21 @@ interface UpdatedMessage {
 	blocks?: SlackBlock[];
 }
 
+/** One `uploadFiles` call: Slack turns each batch into a single thread message. */
+interface UploadedBatch {
+	threadTs: string;
+	files: Array<{ filename: string; text: string }>;
+	comment?: string;
+}
+
 class FakeSlack implements SlackTransport {
 	readonly botUserId = "UBOT";
 	readonly posted: PostedMessage[] = [];
 	readonly updated: UpdatedMessage[] = [];
 	readonly uploads: Array<{ threadTs: string; content: string }> = [];
+	/** One entry per uploadFiles batch — Slack posts each batch as one message. */
+	readonly uploadedFiles: UploadedBatch[] = [];
+	#uploadWaiters: Array<(batch: UploadedBatch) => void> = [];
 	/** channel → history rows the catch-up sweep will see (newest first). */
 	readonly history = new Map<string, SlackHistoryEntry[]>();
 	/** downloadUrl → bytes. Unknown urls throw, like a missing files:read scope. */
@@ -103,6 +113,30 @@ class FakeSlack implements SlackTransport {
 		this.uploads.push({ threadTs: args.threadTs, content: args.content });
 	}
 
+	async uploadFiles(args: {
+		channel: string;
+		threadTs: string;
+		files: Array<{ filename: string; bytes: Uint8Array }>;
+		comment?: string;
+	}): Promise<void> {
+		const batch = {
+			threadTs: args.threadTs,
+			files: args.files.map((f) => ({ filename: f.filename, text: new TextDecoder().decode(f.bytes) })),
+			comment: args.comment,
+		};
+		this.uploadedFiles.push(batch);
+		this.#uploadWaiters.splice(0).forEach((resolve) => resolve(batch));
+	}
+
+	/** The newest uploadFiles batch, awaiting one when it is still being read off disk. */
+	nextUpload(): Promise<UploadedBatch> {
+		const last = this.uploadedFiles.at(-1);
+		if (last) return Promise.resolve(last);
+		const { promise, resolve } = Promise.withResolvers<UploadedBatch>();
+		this.#uploadWaiters.push(resolve);
+		return promise;
+	}
+
 	async openDm(userId: string): Promise<string> {
 		return `D-${userId}`;
 	}
@@ -143,6 +177,7 @@ class FakeRpc implements OmpRpc {
 	state: OmpSessionState = { isStreaming: false, sessionFile: `${HOME}/.omp/agent/sessions/x.jsonl`, sessionName: "sess" };
 	startError?: Error;
 	#promptWaiters: Array<(prompt: SentPrompt) => void> = [];
+	#hostResultWaiters: Array<(result: OmpHostToolResult) => void> = [];
 	#eventListeners = new Set<(e: OmpAgentEvent) => void>();
 	#uiListeners = new Set<(r: OmpUiRequest) => void>();
 	#hostCallListeners = new Set<(c: OmpHostToolCall) => void>();
@@ -231,6 +266,16 @@ class FakeRpc implements OmpRpc {
 	}
 	respondHostTool(result: OmpHostToolResult): void {
 		this.hostToolResults.push(result);
+		this.#hostResultWaiters.splice(0).forEach((resolve) => resolve(result));
+	}
+
+	/** The newest host-tool result, awaiting one when the handler is still working. */
+	nextHostToolResult(): Promise<OmpHostToolResult> {
+		const last = this.hostToolResults.at(-1);
+		if (last) return Promise.resolve(last);
+		const { promise, resolve } = Promise.withResolvers<OmpHostToolResult>();
+		this.#hostResultWaiters.push(resolve);
+		return promise;
 	}
 
 	emitEvent(event: OmpAgentEvent): void {
@@ -1245,7 +1290,8 @@ describe("front-door router", () => {
 		expect(h.slack.posted[0]!.args.text).toBe("_routed → `run`_");
 		expect(h.rpcs).toHaveLength(1);
 		expect(h.rpcs[0]!.opts.cwd).toBe(REPO);
-		expect(h.rpcs[0]!.opts.extraArgs).toEqual([]);
+		// `run` pins no model; the trailing reply guidance is asserted in its own test.
+		expect(h.rpcs[0]!.opts.extraArgs?.[0]).not.toBe("--model");
 		expect(h.rpcs[0]!.prompts).toEqual(["fix the thing"]);
 	});
 
@@ -1257,7 +1303,7 @@ describe("front-door router", () => {
 
 		expect(h.rpcs).toHaveLength(1);
 		expect(h.rpcs[0]!.opts.cwd).toBe(REPO);
-		expect(h.rpcs[0]!.opts.extraArgs).toEqual(["--model", "anthropic/claude-fable-5"]);
+		expect(h.rpcs[0]!.opts.extraArgs?.slice(0, 2)).toEqual(["--model", "anthropic/claude-fable-5"]);
 		expect(h.rpcs[0]!.prompts[0]!.startsWith("orchestrate: fix the thing")).toBe(true);
 	});
 
@@ -1283,7 +1329,7 @@ describe("front-door router", () => {
 			await h.slack.inject(dm("orchestrate omp fix the thing"));
 			const rpc = await h.nextRpc();
 
-			expect(rpc.opts.extraArgs).toEqual(["--model", "anthropic/claude-fable-5"]);
+			expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--model", "anthropic/claude-fable-5"]);
 		} finally {
 			await fs.rm(tmpHome, { recursive: true, force: true });
 		}
@@ -1297,7 +1343,7 @@ describe("front-door router", () => {
 			await h.slack.inject(dm("orchestrate omp fix the thing"));
 			const rpc = await h.nextRpc();
 
-			expect(rpc.opts.extraArgs).toEqual(["--model", ORCHESTRATE_FALLBACK_MODEL]);
+			expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--model", ORCHESTRATE_FALLBACK_MODEL]);
 		} finally {
 			await fs.rm(tmpHome, { recursive: true, force: true });
 		}
@@ -1425,5 +1471,128 @@ describe("attachments", () => {
 		expect(posted.text).toContain("screenshot 2026.png (image/png)");
 		expect(posted.text).toContain("omp-slack-attachments/");
 		expect(posted.text).not.toContain("*omp slack bridge*");
+	});
+});
+
+/**
+ * Answering back into Slack. The agent reads Slack, not a terminal: a path in its
+ * reply is dead text, so `attach_file` is the only route for a screenshot, and
+ * every bridge-owned child is told as much through its system prompt.
+ */
+describe("replying with files", () => {
+	let tmp: string;
+
+	beforeEach(async () => {
+		tmp = await fs.mkdtemp(path.join(os.tmpdir(), "omp-attach-"));
+	});
+	afterEach(async () => {
+		await fs.rm(tmp, { recursive: true, force: true });
+	});
+
+	async function runningTask(h: Harness): Promise<{ rpc: FakeRpc; threadTs: string }> {
+		const msg = dm("run omp do work");
+		await h.slack.inject(msg);
+		return { rpc: h.rpcs[0]!, threadTs: msg.ts };
+	}
+
+	function attachCall(paths: string[], comment?: string): OmpHostToolCall {
+		return {
+			type: "host_tool_call",
+			id: "host_att",
+			toolCallId: "tc_att",
+			toolName: "attach_file",
+			arguments: comment === undefined ? { paths } : { paths, comment },
+		};
+	}
+
+	test("every bridge child is told how to answer into Slack, alongside its model pin", async () => {
+		const h = await makeHarness(makeConfig({ orchestrateModel: "anthropic/claude-fable-5" }));
+		await h.slack.inject(dm("orchestrate omp fix the thing"));
+		const rpc = await h.nextRpc();
+
+		const args = rpc.opts.extraArgs ?? [];
+		expect(args.slice(0, 2)).toEqual(["--model", "anthropic/claude-fable-5"]);
+		const flag = args.indexOf("--append-system-prompt");
+		expect(flag).toBeGreaterThan(-1);
+		const guidance = args[flag + 1] ?? "";
+		// The guidance must name the tool and the failure mode it exists to prevent.
+		expect(guidance).toContain("attach_file");
+		expect(guidance).toContain("response.md");
+		expect(guidance).toContain("absolute");
+	});
+
+	test("attach_file is registered next to ask", async () => {
+		const h = await makeHarness(makeConfig());
+		const { rpc } = await runningTask(h);
+		expect(rpc.hostTools.at(-1)?.map((t) => t.name)).toEqual(["ask", "attach_file"]);
+	});
+
+	test("attach_file uploads the files as one thread message and reports what landed", async () => {
+		const h = await makeHarness(makeConfig());
+		const { rpc, threadTs } = await runningTask(h);
+		const shot = path.join(tmp, "shot.png");
+		const chart = path.join(tmp, "chart.png");
+		await Bun.write(shot, "PNG-A");
+		await Bun.write(chart, "PNG-B");
+
+		rpc.emitHostToolCall(attachCall([shot, chart], "before and after"));
+		const batch = await h.slack.nextUpload();
+		const result = await rpc.nextHostToolResult();
+
+		// One batch: Slack renders a single message carrying both images.
+		expect(h.slack.uploadedFiles).toHaveLength(1);
+		expect(batch.threadTs).toBe(threadTs);
+		expect(batch.comment).toBe("before and after");
+		expect(batch.files).toEqual([
+			{ filename: "shot.png", text: "PNG-A" },
+			{ filename: "chart.png", text: "PNG-B" },
+		]);
+		expect(result.isError).toBe(false);
+		expect(result.result.content[0]!.text).toBe("Attached to the Slack thread: shot.png, chart.png.");
+	});
+
+	test("an unreadable path is named in the result without sinking the rest of the batch", async () => {
+		const h = await makeHarness(makeConfig());
+		const { rpc } = await runningTask(h);
+		const good = path.join(tmp, "good.png");
+		const missing = path.join(tmp, "gone.png");
+		await Bun.write(good, "PNG-A");
+
+		rpc.emitHostToolCall(attachCall([good, missing]));
+		const batch = await h.slack.nextUpload();
+		const result = await rpc.nextHostToolResult();
+
+		expect(batch.files.map((f) => f.filename)).toEqual(["good.png"]);
+		expect(result.isError).toBe(false);
+		expect(result.result.content[0]!.text).toContain("good.png");
+		expect(result.result.content[0]!.text).toContain(missing);
+	});
+
+	test("nothing readable is an error result and no Slack message", async () => {
+		const h = await makeHarness(makeConfig());
+		const { rpc } = await runningTask(h);
+
+		rpc.emitHostToolCall(attachCall([path.join(tmp, "nope.png")]));
+		const result = await rpc.nextHostToolResult();
+
+		expect(h.slack.uploadedFiles).toHaveLength(0);
+		expect(result.isError).toBe(true);
+		expect(result.result.content[0]!.text).toContain("Nothing was attached.");
+	});
+
+	test("malformed attach_file arguments are rejected", async () => {
+		const h = await makeHarness(makeConfig());
+		const { rpc } = await runningTask(h);
+
+		rpc.emitHostToolCall({
+			type: "host_tool_call",
+			id: "host_bad",
+			toolCallId: "tc_bad",
+			toolName: "attach_file",
+			arguments: { paths: "shot.png" },
+		});
+		const result = await rpc.nextHostToolResult();
+		expect(result.isError).toBe(true);
+		expect(result.result.content[0]!.text).toContain("expected paths: string[]");
 	});
 });

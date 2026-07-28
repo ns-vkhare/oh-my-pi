@@ -104,7 +104,7 @@ No decision printed, in order:
 3. is the model id registered under the `shuttle` provider in
    `~/.pi/agent/models.json`?
 
-## Attachments
+## Attachments in
 
 Downloaded with the bot token into `$TMPDIR/omp-slack-attachments/<ts>/` and
 named by path in the prompt. A `png`/`jpeg`/`gif`/`webp` under 8MB *also* rides
@@ -113,6 +113,25 @@ the `prompt` frame as an `ImageContent` block, so the model sees it without a
 A DM of nothing but attachments starts a task in `DEFAULT_REPO` (describe-and-
 wait prompt) instead of falling through to help; with no `DEFAULT_REPO` the
 bridge replies with the local paths.
+
+## Attachments out
+
+Agents answer into Slack, where a filesystem path is dead text. Two halves, both
+in `bridge.ts`:
+
+- the `attach_file` host tool (beside `ask` in `setHostTools`) — `paths[]` +
+  optional `comment`, ≤10 files, ≤32MB each, uploaded as ONE Slack message via
+  `slack.uploadFiles`. A bad path becomes a note in the tool result, never a
+  failed batch.
+- `prompts/slack-reply.md`, appended to every spawn's system prompt with
+  `--append-system-prompt` (so it covers steers too, and never shows up as
+  user text): attach images, keep the answer under `FINAL_INLINE_MAX` (2900) or
+  the bridge uploads it as `response.md`, never answer by pointing at a file,
+  absolute paths only.
+
+Editing that prompt is how you change agent reply behavior — it is a deployed
+asset, so `install.sh` copies the `prompts/` subtree and a missing file stops the
+daemon at startup rather than silently dropping the guidance.
 
 ## Adding a command
 

@@ -161,6 +161,26 @@ Drop a screenshot in with **no message at all** and it still starts a task: the
 agent describes what it was handed and waits for instructions (needs
 `DEFAULT_REPO`; without it the bridge replies with the file's local path).
 
+### Example: getting a screenshot back
+
+```
+you   run omp screenshot the settings page after the fix
+bot   └ ▶ slack:screenshot the settings page after the fix
+bot     ⏵ browser
+bot   📎 settings-after.png   the toggle now renders inside the card
+bot   Fixed — the toggle was escaping its container because …
+```
+
+Agents get an `attach_file` tool and a system-prompt reminder to use it, because a
+filesystem path in a Slack message is dead text. So a screenshot, chart, or
+diagram arrives as an inline image instead of a path you cannot open, several
+files land as one message, and the guidance also pushes the agent to keep its
+answer *in* the message rather than writing `summary.md` and pointing at it.
+
+A reply over 2900 characters cannot render as a Slack message and gets uploaded
+as a `response.md` file instead — the guidance tells agents to stay under that,
+which is why answers here read tighter than in a terminal session.
+
 ### Missed messages
 
 Slack keeps no backlog for Socket Mode apps, so a DM sent while the bridge is

@@ -8,6 +8,8 @@
  */
 
 import * as os from "node:os";
+import * as path from "node:path";
+import SLACK_REPLY_GUIDANCE from "./prompts/slack-reply.md" with { type: "text" };
 import { ORCHESTRATE_FALLBACK_MODEL, resolveAgentModel } from "./agent-model";
 import {
 	answeredBlocks,
@@ -85,6 +87,9 @@ const INLINE_IMAGE_MIME_TYPES: Record<string, true> = {
 const INLINE_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
 /** Ceiling on the attachment inventory handed to the router, in characters. */
 const ATTACHMENT_SUMMARY_MAX_CHARS = 200;
+/** Most files one `attach_file` call may upload, and the per-file byte ceiling. */
+const ATTACH_MAX_FILES = 10;
+const ATTACH_MAX_BYTES = 32 * 1024 * 1024;
 /** Remembered inbound message ts values (live + replayed), for dedup. */
 const SEEN_MESSAGE_CAP = 500;
 /**
@@ -359,6 +364,38 @@ const ASK_HOST_TOOL: OmpHostToolDefinition = {
 						recommended: { type: "number" },
 					},
 				},
+			},
+		},
+	},
+};
+
+/**
+ * The bridge-owned `attach_file` host tool.
+ *
+ * Slack renders an uploaded image inline; a filesystem path in the reply text is
+ * invisible to someone reading a DM. This is the only way a screenshot the agent
+ * produced actually reaches the user, so the description says so plainly — the
+ * model has no other signal that its usual "see /tmp/shot.png" habit fails here.
+ */
+const ATTACH_HOST_TOOL: OmpHostToolDefinition = {
+	name: "attach_file",
+	description:
+		"Upload local files into the Slack thread so the user can see them. Images (png, jpeg, gif, webp) render inline; anything else arrives as a downloadable file. Use this for every screenshot, chart, diagram, or rendered image that is part of your answer — the user reads Slack and cannot open a filesystem path or click a markdown link to a local file. Paths must be absolute.",
+	parameters: {
+		type: "object",
+		additionalProperties: false,
+		required: ["paths"],
+		properties: {
+			paths: {
+				type: "array",
+				minItems: 1,
+				maxItems: ATTACH_MAX_FILES,
+				items: { type: "string" },
+				description: "Absolute paths of the files to upload.",
+			},
+			comment: {
+				type: "string",
+				description: "One line posted with the files, e.g. what they show.",
 			},
 		},
 	},
@@ -1209,7 +1246,15 @@ export class Bridge {
 			// OMP_SLACK_BRIDGE marks bridge-owned children: the slack-notify
 			// extension and omp's resume park hook skip themselves under it.
 			env: isNew ? { OMP_SLACK_BRIDGE: "1", OMP_HUB_NEW_SESSION: "1" } : { OMP_SLACK_BRIDGE: "1" },
-			extraArgs: args.model ? ["--model", args.model] : [],
+			// Every bridge-owned turn — new session or resumed — is answered into
+			// Slack, so the reply guidance rides the system prompt rather than the
+			// first user message: it applies to later steers too, and never lands in
+			// the transcript as something the user appears to have said.
+			extraArgs: [
+				...(args.model ? ["--model", args.model] : []),
+				"--append-system-prompt",
+				SLACK_REPLY_GUIDANCE,
+			],
 		});
 
 		const task: LiveTask = {
@@ -1251,7 +1296,9 @@ export class Bridge {
 		record.lastActivityAt = Date.now();
 		this.#registry.upsert(record);
 
-		await rpc.setHostTools([ASK_HOST_TOOL]).catch((err) => console.error(`bridge: set_host_tools failed: ${String(err)}`));
+		await rpc
+			.setHostTools([ASK_HOST_TOOL, ATTACH_HOST_TOOL])
+			.catch((err) => console.error(`bridge: set_host_tools failed: ${String(err)}`));
 
 		if (isNew && args.prompt) {
 			await rpc.prompt(args.prompt, args.images).catch((err) => this.#note(task, `prompt failed: ${String(err)}`));
@@ -1456,9 +1503,81 @@ export class Bridge {
 		await this.#slack.updateMessage({ channel: task.record.channel, ts: pending.messageTs, text: "⌛ cancelled", blocks: [] }).catch(() => {});
 	}
 
-	// --- Ask host tool ------------------------------------------------------
+	/**
+	 * Upload the named files into the task's Slack thread.
+	 *
+	 * Every path is reported on individually and a bad one never fails the batch:
+	 * the tool result is the only thing the agent learns from, so "3 attached, 1
+	 * missing" has to survive as a sentence it can act on. A refusal is an
+	 * ordinary result rather than isError — the turn is fine, one file was not.
+	 */
+	async #onAttachFile(task: LiveTask, call: OmpHostToolCall): Promise<void> {
+		const paths = parseAttachPaths(call.arguments);
+		if (!paths) {
+			task.rpc.respondHostTool({
+				type: "host_tool_result",
+				id: call.id,
+				result: { content: [{ type: "text", text: "invalid attach_file arguments: expected paths: string[]" }] },
+				isError: true,
+			});
+			return;
+		}
+
+		const files: Array<{ filename: string; bytes: Uint8Array }> = [];
+		const notes: string[] = [];
+		for (const rawPath of paths.slice(0, ATTACH_MAX_FILES)) {
+			// Resolved against the task's cwd so a relative path still works, even
+			// though the tool asks for absolute ones.
+			const abs = path.resolve(task.record.cwd, rawPath);
+			try {
+				const file = Bun.file(abs);
+				const size = file.size;
+				if (size > ATTACH_MAX_BYTES) {
+					notes.push(`${abs}: ${size} bytes exceeds the ${ATTACH_MAX_BYTES} byte upload cap`);
+					continue;
+				}
+				files.push({ filename: basename(abs), bytes: new Uint8Array(await file.arrayBuffer()) });
+			} catch (err) {
+				notes.push(`${abs}: ${String(err)}`);
+			}
+		}
+		if (paths.length > ATTACH_MAX_FILES) {
+			notes.push(`only the first ${ATTACH_MAX_FILES} of ${paths.length} paths were uploaded`);
+		}
+
+		if (files.length > 0) {
+			const comment = nonEmptyString(call.arguments.comment);
+			try {
+				await this.#slack.uploadFiles({
+					channel: task.record.channel,
+					threadTs: task.record.threadTs,
+					files,
+					comment,
+				});
+				this.#registry.touch(task.record.threadTs);
+			} catch (err) {
+				notes.push(`upload failed: ${String(err)}`);
+				files.length = 0;
+			}
+		}
+
+		const attached = files.length > 0 ? `Attached to the Slack thread: ${files.map((f) => f.filename).join(", ")}.` : "Nothing was attached.";
+		const text = notes.length > 0 ? `${attached}\n${notes.join("\n")}` : attached;
+		task.rpc.respondHostTool({
+			type: "host_tool_result",
+			id: call.id,
+			result: { content: [{ type: "text", text }] },
+			isError: files.length === 0,
+		});
+	}
+
+	// --- Host tools ---------------------------------------------------------
 
 	async #onHostToolCall(task: LiveTask, call: OmpHostToolCall): Promise<void> {
+		if (call.toolName === "attach_file") {
+			await this.#onAttachFile(task, call);
+			return;
+		}
 		if (call.toolName !== "ask") {
 			task.rpc.respondHostTool({
 				type: "host_tool_result",
@@ -1676,6 +1795,31 @@ function parseAskQuestions(args: Record<string, unknown>): AskToolArgs["question
 		});
 	}
 	return questions;
+}
+
+/**
+ * Validate `attach_file` paths; undefined when malformed.
+ *
+ * Blank entries are dropped rather than rejected — a model that pads the array
+ * with an empty string still gets its real files uploaded.
+ */
+function parseAttachPaths(args: Record<string, unknown>): string[] | undefined {
+	const raw = args.paths;
+	if (!Array.isArray(raw)) return undefined;
+	const paths: string[] = [];
+	for (const item of raw) {
+		if (typeof item !== "string") return undefined;
+		const trimmed = item.trim();
+		if (trimmed.length > 0) paths.push(trimmed);
+	}
+	return paths.length > 0 ? paths : undefined;
+}
+
+/** The trimmed string, or undefined when absent, non-string, or blank. */
+function nonEmptyString(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const text = value.trim();
+	return text.length > 0 ? text : undefined;
 }
 
 /** Text summary of a fully-answered ask (single vs. multi-question form). */

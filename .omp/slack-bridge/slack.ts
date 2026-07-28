@@ -219,32 +219,48 @@ class SlackTransportImpl implements SlackTransport {
 	}
 
 	async uploadText(args: { channel: string; threadTs: string; filename: string; content: string }): Promise<void> {
-		const bytes = new TextEncoder().encode(args.content);
-		// 1. Reserve an upload URL. This method takes form-encoded params.
-		const reserve = await this.#apiForm(
-			"files.getUploadURLExternal",
-			{ filename: args.filename, length: String(bytes.byteLength) },
-			"bot",
-		);
-		const uploadUrl = String(reserve.upload_url ?? "");
-		const fileId = String(reserve.file_id ?? "");
-		// 2. POST the raw bytes to the reserved URL.
-		const uploadRes = await fetch(uploadUrl, { method: "POST", body: bytes });
-		if (!uploadRes.ok) {
-			throw new Error(`slack files upload: HTTP ${uploadRes.status}`);
+		await this.uploadFiles({
+			channel: args.channel,
+			threadTs: args.threadTs,
+			files: [{ filename: args.filename, bytes: new TextEncoder().encode(args.content) }],
+		});
+	}
+
+	async uploadFiles(args: {
+		channel: string;
+		threadTs: string;
+		files: Array<{ filename: string; bytes: Uint8Array }>;
+		comment?: string;
+	}): Promise<void> {
+		if (args.files.length === 0) return;
+		// 1. Reserve one upload URL per file. This method takes form-encoded params.
+		const reserved: Array<{ id: string; title: string }> = [];
+		for (const file of args.files) {
+			const reserve = await this.#apiForm(
+				"files.getUploadURLExternal",
+				{ filename: file.filename, length: String(file.bytes.byteLength) },
+				"bot",
+			);
+			const uploadUrl = String(reserve.upload_url ?? "");
+			const fileId = String(reserve.file_id ?? "");
+			// 2. POST the raw bytes to the reserved URL.
+			const uploadRes = await fetch(uploadUrl, { method: "POST", body: file.bytes });
+			if (!uploadRes.ok) {
+				throw new Error(`slack files upload: HTTP ${uploadRes.status}`);
+			}
+			// consume the body so the connection can be reused
+			await uploadRes.text();
+			reserved.push({ id: fileId, title: file.filename });
 		}
-		// consume the body so the connection can be reused
-		await uploadRes.text();
-		// 3. Finalize, attaching the snippet to the thread.
-		await this.#api(
-			"files.completeUploadExternal",
-			{
-				files: [{ id: fileId, title: args.filename }],
-				channel_id: args.channel,
-				thread_ts: args.threadTs,
-			},
-			"bot",
-		);
+		// 3. Finalize all of them at once: one thread message carrying every file,
+		// which is what makes several screenshots render as one answer.
+		const body: Record<string, unknown> = {
+			files: reserved,
+			channel_id: args.channel,
+			thread_ts: args.threadTs,
+		};
+		if (args.comment) body.initial_comment = args.comment;
+		await this.#api("files.completeUploadExternal", body, "bot");
 	}
 
 	async openDm(userId: string): Promise<string> {

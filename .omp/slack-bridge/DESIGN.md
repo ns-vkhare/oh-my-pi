@@ -41,6 +41,7 @@ flowchart LR
 | `router/route.sh` | Router | pi harness invocation: message on stdin, one compact `RouterDecision` JSON line on stdout, exit 0 = decision. |
 | `router/prompts/entry.md` | Router | System prompt for the routing model. |
 | `router/tools/commands.ts` | Router | pi extension registering the six commands as tools; each returns `ROUTE <json>` in its result. |
+| `prompts/slack-reply.md` | BridgeCore | Reply guidance appended to every spawned agent's system prompt: attach images, keep the answer in the message, absolute paths. |
 | `omp-rpc.test.ts` | RpcCore | Unit tests against a fake child (`bun test`). |
 | `slack.test.ts` | SlackTransport | Unit tests against a local mock WS server (`bun test`). |
 | `bridge.test.ts` | BridgeCore | Unit tests for command parsing + registry (`bun test`). |
@@ -57,6 +58,8 @@ Runtime: **Bun only, zero npm dependencies.** `fetch`, `WebSocket`, `Bun.file`,
 - Frames to route: `response` (by `id`); events `agent_start`, `agent_end`, `turn_start/end`, `tool_execution_start/update/end`, `message_update`; `extension_ui_request` (methods `select`, `confirm`, `input`, `editor`, `cancel`, `notify`, `setStatus`, `open_url` — others ignored); `host_tool_call` / `host_tool_cancel`; `extension_error`.
 - UI responses (stdin): `{type:"extension_ui_response", id, value:string}` (select → chosen **label**, input/editor → text), `{..., confirmed:boolean}`, `{..., cancelled:true}`.
 - **Ask questions**: the builtin `ask` tool does NOT register in RPC mode (`AskTool.createIf` requires interactive UI at tool-registry construction — verified empirically: `get_state.dumpTools` lacks `ask`). The bridge therefore registers its own `ask` **host tool** (`set_host_tools`, schema mirroring the builtin: `questions[]` with `id`/`question`/`options{label,description}`/`multi`/`recommended`). Agent calls → `host_tool_call` → bridge renders Slack blocks per question, collects answers (buttons or free-text thread reply), then sends `host_tool_result` with a text summary (`User answers:` lines). `host_tool_cancel` withdraws pending questions. The `extension_ui_request` select/confirm/input relay stays for extensions and login flows.
+- **Attaching files**: the bridge also registers an `attach_file` host tool (`paths[]` + optional `comment`). The agent calls it → the bridge reads each path (≤10 files, ≤32MB each), uploads them in one `files.completeUploadExternal` so Slack posts a single message, and answers with a sentence naming what landed and what did not. A bad path is a note in that sentence, never a failed batch; nothing readable is `isError`. This exists because Slack renders an *uploaded* image inline and renders a filesystem path as dead text — it is the only way a screenshot the agent produced reaches the user.
+- **Reply guidance**: every spawn passes `--append-system-prompt` with `prompts/slack-reply.md`. It rides the system prompt rather than the first user message so it applies to later steers too, never lands in the transcript as words the user appears to have said, and never pollutes the session name. Content: attach images instead of naming them, keep the answer under `FINAL_INLINE_MAX` or it becomes a `response.md` upload, never answer by pointing at a file, and make every path absolute.
 
 ## Slack app (Socket Mode — no public URL)
 
