@@ -522,14 +522,14 @@ The TUI works with any object implementing the `Terminal` interface:
 
 ```typescript
 interface Terminal {
-	start(onInput: (data: string) => void, onResize: () => void): void;
+	start(onInput: (data: string) => void, onResize: () => void, onDisconnect?: () => void): void;
 	stop(): void;
 	write(data: string): void;
 	get columns(): number;
 	get rows(): number;
 	moveBy(lines: number): void;
-	hideCursor(): void;
-	showCursor(): void;
+	hideCursor(force?: boolean): void;
+	showCursor(force?: boolean): void;
 	clearLine(): void;
 	clearFromCursor(): void;
 	clearScreen(): void;

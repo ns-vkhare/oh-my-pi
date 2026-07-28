@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+## [17.1.0] - 2026-07-24
+
+### Fixed
+
+- Fixed action metadata loss on xd://resolve, xd://reject, and xd://propose cards to ensure correct action badges are rendered.
+- Added proper rendering support for reject, propose, and hub-family aliases (irc, job, await, poll, cancel_job) to prevent them from falling back to generic JSON.
+
+## [17.0.8] - 2026-07-22
+
+### Fixed
+
+- Fixed an issue where IME composition (Korean, Japanese, and Chinese) duplicated the last character when pressing Enter to commit in the composer.
+
+## [17.0.1] - 2026-07-16
+
+### Fixed
+
+- Rendered user and host transcript messages as Markdown and separated adjacent assistant content blocks. ([#5559](https://github.com/can1357/oh-my-pi/issues/5559))
+
+## [17.0.0] - 2026-07-15
+
+### Changed
+
+- Consolidated the legacy irc and job tool renderers into a unified hub renderer for messaging, background jobs, and process supervision, while preserving existing visual styles.
+- Enhanced rendering for xd:// device dispatches to resolve through their inner tool's renderer, preserving generated-image thumbnails and MCP/autoresearch presentations under a unified xd://<tool> card label.
+
+### Removed
+
+- Removed custom visualization for the search_tool_bm25 tool, which now falls back to generic rendering.
+
 ## [16.5.1] - 2026-07-14
 
 ### Fixed

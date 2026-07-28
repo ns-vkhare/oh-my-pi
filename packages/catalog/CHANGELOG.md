@@ -2,6 +2,196 @@
 
 ## [Unreleased]
 
+## [17.1.8] - 2026-07-28
+
+### Added
+
+- Added `resolveVertexEndpointHost(location)` utility to resolve the correct Vertex AI API endpoint hostnames for global, multi-region, and regional locations.
+
+### Fixed
+
+- Fixed an issue where `calculateCost` under-reported Anthropic cache-write costs by honoring the `usage.cttl` breakdown to correctly price 1-hour retention writes at 2x the base input rate.
+
+## [17.1.7] - 2026-07-27
+
+### Added
+
+- Added support for moonshotai/Kimi-K3 and kimi-k3-fast models
+- Added umans-kimi-k3 prerelease model configuration
+
+### Changed
+
+- Updated pricing and token limits for selected models
+
+## [17.1.6] - 2026-07-27
+
+### Added
+
+- Added SiliconFlow providers (`siliconflow`, `siliconflow-cn`) with dynamic-only OpenAI-compatible model discovery: no bundled catalog — the model list is fetched live from each region's `/v1/models` endpoint, with non-chat entries (embedding, reranker, image, audio, video) filtered out. Discovery hydrates pricing, context/output limits, and reasoning metadata from the provider's models.dev catalog at runtime (with bundled upstream references as a reasoning-only fallback for ids models.dev has not indexed), so reasoning models keep thinking enabled and sessions compact against real context windows. `SILICONFLOW_API_KEY` / `SILICONFLOW_CN_API_KEY` environment variables are wired into `getEnvApiKey`.
+
+## [17.1.5] - 2026-07-27
+
+### Fixed
+
+- Fixed Kimi Code (`kimi-code`) reporting `maxTokens: 32000` for every model — its `/coding/v1/models` discovery mapper and the bundled catalog applied a blanket constant, truncating `k3`/`k3-256k` output at ~4x below their real 131072 ceiling and `kimi-for-coding`/`kimi-for-coding-highspeed` below their 32768 ceiling. Output caps are now derived per family, and the model cache is invalidated so upgrades drop the stale `maxTokens: 32000` rows (including the discovery-only `k3-256k`) instead of serving them until the next network refresh ([#6711](https://github.com/can1357/oh-my-pi/issues/6711)).
+- Fixed Anthropic model discovery 404ing when the registry derived the provider base URL from a bundled model without the `/v1` suffix (`https://api.anthropic.com/models` instead of `/v1/models`), which let a stale text-only cache row shadow fresh models.dev vision metadata — surfacing as snapcompact refusing to run on `claude-opus-5`. Discovery now always targets `/v1/models` while model rows keep the provider base URL ([#6563](https://github.com/can1357/oh-my-pi/issues/6563)).
+
+## [17.1.4] - 2026-07-26
+
+### Added
+
+- Added Claude Opus 5 model entries for Amazon Bedrock: `anthropic.claude-opus-5` plus its `us.`, `eu.`, `au.`, and `global.` regional/geo IDs.
+
+### Fixed
+
+- Fixed `alibaba-token-plan` locking out China (Beijing) 百炼 Token Plan subscribers: the provider hardcoded the international Singapore endpoint, so Beijing-issued `sk-sp-` keys got `401 invalid_api_key`. The wire credential now carries an optional region base URL, and model discovery targets the credential's region ([#6682](https://github.com/can1357/oh-my-pi/issues/6682)).
+- Fixed forced `tool_choice` 400s (`tool_choice 'specified' is incompatible with thinking enabled`) on Kimi Code's Anthropic-compatible endpoint for the `kimi-for-coding`, `kimi-for-coding-highspeed`, and `k3` aliases: the Anthropic-surface compat matcher only recognised Moonshot's native `kimi-k2.7-code*` ids, so thinking-locked kimi-code models kept `supportsForcedToolChoice: true` and the forced selector was sent to a host that always thinks. These models now resolve `requiresThinkingEnabled`, keeping thinking on and downgrading forced choices to `auto`.
+- Retried empty successful provider discovery responses after the short non-authoritative interval instead of caching them for the full catalog TTL ([#6620](https://github.com/can1357/oh-my-pi/issues/6620)).
+- Fixed GitHub Copilot Claude models with no bundled catalog reference (e.g. a freshly served `claude-opus-5`) discovering with `reasoning: false`/`thinking: null` and no effort dial, and disappearing along with their synthesized `-1m` sibling on offline reads: reference-less Copilot models on the anthropic-messages proxy now derive the adaptive reasoning ladder from the model id, and the cache restores their compile-time `COPILOT_API_HEADERS` by value instead of dropping them as unrestorable ([#6664](https://github.com/can1357/oh-my-pi/issues/6664)).
+
+## [17.1.3] - 2026-07-24
+
+### Fixed
+
+- Disabled the first-event watchdog for local OpenAI-compatible backends while retaining the 300-second inter-event watchdog, so long llama.cpp prompt prefill is not canceled and retried ([#6524](https://github.com/can1357/oh-my-pi/issues/6524)).
+
+## [17.1.1] - 2026-07-24
+
+### Added
+
+- Added catalog metadata for models that support native computer-use requests.
+- Added resolved Bedrock Converse prompt-cache compatibility limits, including explicit 5-minute checkpoint support for bundled Nova Lite, Micro, Pro, Premier, and Nova 2 Lite models plus their documented in-region, regional, and global IDs, and model-specific 1-hour Claude retention.
+- Added resolved Bedrock Converse prompt-cache compatibility limits, including explicit 5-minute checkpoint support for bundled Nova Lite, Micro, Pro, and Premier models plus Nova Premier's documented in-region model ID, and model-specific 1-hour Claude retention.
+- Added the native Meta Model API provider and Muse Spark 1.1 with Responses API reasoning replay, image input, and the full supported reasoning-effort ladder ([#4941](https://github.com/can1357/oh-my-pi/issues/4941)).
+- Added an opt-in Vercel AI Gateway automatic prompt-cache compatibility option alongside provider routing preferences.
+- Added Vercel AI Gateway Responses cache-anchor and cache-lifetime compatibility controls.
+- Added resolved OpenAI GPT-5.6 prompt-cache breakpoint capability metadata, keeping older models and compatible endpoints opt-in only.
+- Added the native `alibaba-token-plan` provider with QwenCloud Token Plan Individual discovery and a curated chat-model fallback catalog ([#6151](https://github.com/can1357/oh-my-pi/issues/6151)).
+
+## [17.1.0] - 2026-07-24
+
+### Added
+
+- Added Bedrock Converse prompt-cache compatibility limits, including 5-minute checkpoint support for Nova models (Lite, Micro, Pro, Premier, Nova 2 Lite) and 1-hour Claude retention.
+- Added native Meta Model API provider and Muse Spark 1.1 support, featuring Responses API reasoning replay, image input, and reasoning-effort controls.
+- Added Vercel AI Gateway integration features, including opt-in automatic prompt-cache compatibility, provider routing preferences, and Responses cache-anchor and cache-lifetime controls.
+- Added prompt-cache breakpoint capability metadata for OpenAI GPT-5.6, with opt-in support for older models and compatible endpoints.
+- Added native alibaba-token-plan provider with QwenCloud Token Plan Individual discovery and a curated chat-model fallback catalog.
+
+## [17.0.9] - 2026-07-23
+
+### Changed
+
+- Renamed `codex-auto-review` model to `GPT-5.3 Codex Spark` with updated pricing and capabilities
+- Removed image input support from GPT-5.3 Codex Spark (text-only)
+- Reduced GPT-5.3 Codex Spark context window from 272K to 128K tokens
+- Changed GPT-5.3 Codex Spark thinking efforts from `["minimal", "low", "medium", "high", "xhigh"]` to `["low", "medium", "high", "xhigh"]`
+- Updated pricing for multiple AI models across providers (costs adjusted in models.json)
+- Reduced max output tokens for an unspecified model from 16384 to 8192
+- Added image input support to Venice AI text model
+
+## [17.0.8] - 2026-07-22
+
+### Added
+
+- Added support for several new models across multiple providers, including MiniMax M3, Gemini 3.5 Flash Lite, Gemini 3.6 Flash (with thinking support), Hy3, Doubao-Seed-Character, LongCat 2.0, Laguna S 2.1 (free and paid tiers), Qwen 3.6 35B A3B, SWE-1.6 Slow (devin agent catalog), and XiaomiMiMo/MiMo-V2.5.
+
+### Changed
+
+- Updated Grok 4.5 API type to "openai-responses" and updated "o3-mini" to support thinking capabilities with the "kimi" thinking format.
+- Renamed OpenRouter-specific models and routers to include "OpenRouter" in their names (e.g., "OpenRouter Auto Router (Beta)", "OpenRouter Body Builder (beta)", and "OpenRouter Pareto Code Router").
+- Updated context window sizes, costs, and token limits for numerous models.
+
+### Fixed
+
+- Fixed an issue where GPT-5.6 Codex SKUs lost usable context window capacity due to dynamic discovery values overwriting bundled limits.
+- Fixed OpenAI Codex discovery dropping account-listed ChatGPT-only models (such as GPT-5.3 Codex Spark) when they are unavailable through the public API.
+- Fixed Codex catalog discovery hiding models when multiple OAuth accounts are configured by independently fetching and merging catalogs from all accounts.
+- Fixed cached models reusing a bundled request model (such as GitHub Copilot long-context variants) being incorrectly flagged as unrestorable and dropped after a restart.
+- Fixed LM Studio discovery reporting a model's theoretical maximum context length instead of the actual loaded context window size of the running instance.
+
+### Removed
+
+- Removed several deprecated model families from the devin catalog, including Claude Fable 5, Claude Opus 4.6/4.7, Claude Sonnet 4.6/5, DeepSeek V4 Pro, Gemini 3.1 Pro, Gemini 3.5 Flash, GLM-5.2, SWE-1.6, and Nemotron 3 Ultra.
+- Removed GPT-5 through GPT-5.3 Codex variants and GPT-5.4 nano from the openai-codex catalog.
+
+## [17.0.6] - 2026-07-20
+
+### Added
+
+- Added static fallback seed for Devin's `swe-1-7` model so it is bundled even when catalog generation runs without a Devin session token.
+
+### Fixed
+
+- Collapsed Devin's six GLM-5.2 variants into two logical entries (`glm-5-2` for 200K free, `glm-5-2-1m` for 1M paid). The 200K entry routes every thinking effort to the free `glm-5-2` wire UID — never to the quota-gated `glm-5-2-max` or `glm-5-2-none` — so GLM-5.2 works even when the weekly usage quota is exhausted.
+
+## [17.0.5] - 2026-07-18
+
+### Added
+
+- Added an Anthropic compatibility flag to allow non-official OAuth endpoints to opt into configured Claude Code fingerprint header overrides.
+
+### Fixed
+
+- Fixed a security issue where sensitive provider-defined request headers (such as API keys or credentials) were serialized in plaintext within the model cache (models.db). The cache now omits these headers, securely invalidates older cached rows, and restores or refetches them dynamically.
+- Fixed OpenAI Codex discovery to respect caller-supplied fetch configurations (such as proxies or custom CAs) and correctly replace stale bundled models with the authenticated account catalog.
+- Fixed stream timeouts and retry loops during long prefills on local loopback or RFC1918 backends (such as litellm proxies fronting local servers) by applying the local stream-timeout floor to these backends.
+- Fixed Kimi K3 models served through generic OpenAI-compatible routes exposing unsupported reasoning efforts instead of the mandatory low/high/max scale.
+
+## [17.0.4] - 2026-07-18
+
+### Changed
+
+- Kimi-family models now use MFJS tool schema on all hosts, including proxies like OpenRouter that forward schemas to Moonshot
+
+## [17.0.3] - 2026-07-17
+
+### Fixed
+
+- Logged LiteLLM rich-metadata endpoint failures once with their endpoint and status before falling back to incomplete `/v1/models` data ([#5801](https://github.com/can1357/oh-my-pi/issues/5801)).
+- Fixed authenticated Kimi Code discovery to preserve live effort levels, default effort, mandatory-thinking state, and per-model protocol metadata ([#5893](https://github.com/can1357/oh-my-pi/issues/5893)).
+- Fixed LiteLLM provider ignoring per-model pricing: `mapLiteLLMRichEntry` now reads `input_cost_per_token` / `output_cost_per_token` (plus cache costs) from LiteLLM rich metadata and maps them to `cost.input` / `cost.output`, falling back to the bundled reference only when LiteLLM omits cost, so proxied models no longer display as free ([#5818](https://github.com/can1357/oh-my-pi/issues/5818)).
+
+## [17.0.2] - 2026-07-17
+
+### Changed
+
+- Increased the maximum output tokens (maxTokens) from 32,768 to 65,536 for Kimi K2.7-Code models on Fireworks.
+
+### Fixed
+
+- Fixed a regression where the context window for openai-codex GPT-5.6 models (Luna, Sol, Terra) incorrectly fell back to 272,000 instead of preserving its 372,000 capacity.
+- Fixed Umans PAYG models incorrectly displaying as "Free" in /models by correctly sourcing their published per-token rates.
+- Fixed native moonshot/kimi-k3 capabilities and pricing, ensuring it correctly reflects its official pricing, 1M context window, image input support, reasoning capabilities, and 128k output token limit.
+
+## [17.0.1] - 2026-07-16
+
+### Added
+
+- Added GPT-5.6 Luna, Sol, and Terra entries for Amazon Bedrock, Azure, and Cloudflare
+- Added KAT-Coder Air/Pro V2.5 entries across Kilo, OpenRouter, NanoGPT, and Vercel
+- Added Inkling model entries for Baseten and Vercel AI Gateway
+- Added Umans DeepSeek V4 Pro DSpark as an experimental model listing
+- Added Claude Opus 4.7 Fast and 4.8 Fast on Vercel AI Gateway
+- Added Workers AI GLM-5.2, Muse Spark 1.1, Stealth GPT-5.6 Sol, and nano-gpt-help entries
+
+### Changed
+
+- Added image input and reasoning support to several existing Codeium and Kilo GPT-5.6 models
+- Enabled image input and reasoning for Gemini Flash Latest and Grok 4.5
+- Renamed many model labels for consistency, including Claude, Grok, DeepSeek, GLM, and Gemi­ni names
+- Updated pricing for many existing models, including input, output, and cache cost values
+- Updated context window and max token limits for many catalog models across providers
+
+### Fixed
+
+- Fixed Z.AI (GLM) coding-plan token costs all showing as "Free" in `/models`: the `zai` provider descriptor sourced the models.dev `zai-coding-plan` key (all-$0 subscription rates) instead of the `zai` pay-as-you-go key, which carries the real per-token rates for the identical GLM ids ([#5598](https://github.com/can1357/oh-my-pi/issues/5598)).
+- Fixed custom Anthropic endpoints receiving the first-party-only `eager_input_streaming` tool field by default ([#5572](https://github.com/can1357/oh-my-pi/issues/5572)).
+- Added resolved OpenAI sampling-parameter compatibility metadata for o-series and GPT-5+ models.
+- Fixed GitHub Copilot `mai-code-1-flash-picker` (and other `mai-*` models) to route through the `/responses` endpoint instead of `/chat/completions`, which rejected them with `400 unsupported_api_for_model` ([#5612](https://github.com/can1357/oh-my-pi/issues/5612)).
+- Extended the reasoning `streamIdleTimeoutMs` floor (300s) to native Kimi K2.7 Code (`kimi-k2.7-code` / `kimi-k2.7-code-highspeed`), which previously fell through to the 120s default and aborted on long reasoning turns ([#4836](https://github.com/can1357/oh-my-pi/issues/4836)).
+- Fixed GLM-5.x coding-plan streams via the OpenCode Go/Zen gateways (`opencode.ai/zen/…`) timing out with `OpenAI completions stream stalled while waiting for the next event` during slow plan-writing/reasoning phases. The 600s idle-timeout floor for GLM coding-plan SKUs was gated to the native Z.AI/Zhipu hosts only, so OpenCode-fronted GLM fell back to the 120s default watchdog. ([#4758](https://github.com/can1357/oh-my-pi/issues/4758))
+
 ## [16.5.2] - 2026-07-14
 
 ### Fixed

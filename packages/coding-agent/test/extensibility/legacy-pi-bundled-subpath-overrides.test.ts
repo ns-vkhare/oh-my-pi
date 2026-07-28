@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
+import * as url from "node:url";
 import { __buildLegacyPiPackageRootOverrides } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
-import { collectBundledPiEntries } from "../../scripts/legacy-pi-virtual-module";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { __renderLegacyPiVirtualModule, collectBundledPiEntries } from "../../scripts/legacy-pi-virtual-module";
 
 const bundledModuleKeys = new Set((await collectBundledPiEntries()).map(entry => entry.key));
 
@@ -14,6 +17,50 @@ const bundledModuleKeys = new Set((await collectBundledPiEntries()).map(entry =>
 // the same `omp-legacy-pi-bundled:` virtual namespace as package roots without
 // a generated registry or duplicate key list.
 describe("legacy pi compat compiled-mode subpath overrides (issue #3442)", () => {
+	it("does not evaluate unrelated host modules while loading the registry", async () => {
+		using tempDir = TempDir.createSync("@omp-legacy-pi-loaders-");
+		const alphaPath = path.join(tempDir.path(), "alpha.ts");
+		const betaPath = path.join(tempDir.path(), "beta.ts");
+		const registryPath = path.join(tempDir.path(), "registry.ts");
+		await Bun.write(alphaPath, 'Reflect.set(globalThis, "__alphaLoads", 1);\nexport const value = "alpha";\n');
+		await Bun.write(betaPath, 'Reflect.set(globalThis, "__betaLoads", 1);\nexport const value = "beta";\n');
+		const registry = __renderLegacyPiVirtualModule([
+			{ key: "alpha", binding: "bundledAlpha", importSpecifier: url.pathToFileURL(alphaPath).href },
+			{ key: "beta", binding: "bundledBeta", importSpecifier: url.pathToFileURL(betaPath).href },
+		]);
+		await Bun.write(
+			registryPath,
+			`${registry}
+const beforeAlpha = Reflect.get(globalThis, "__alphaLoads") ?? 0;
+const beforeBeta = Reflect.get(globalThis, "__betaLoads") ?? 0;
+await BUNDLED_PI_MODULE_LOADERS.alpha();
+const afterAlpha = Reflect.get(globalThis, "__alphaLoads") ?? 0;
+const betaAfterAlpha = Reflect.get(globalThis, "__betaLoads") ?? 0;
+await BUNDLED_PI_MODULE_LOADERS.beta();
+process.stdout.write(JSON.stringify([
+	beforeAlpha,
+	beforeBeta,
+	afterAlpha,
+	betaAfterAlpha,
+	Reflect.get(globalThis, "__alphaLoads") ?? 0,
+	Reflect.get(globalThis, "__betaLoads") ?? 0,
+]));
+`,
+		);
+		const proc = Bun.spawn([process.execPath, registryPath], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, stdout, stderr] = await Promise.all([
+			proc.exited,
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+		]);
+		expect(exitCode).toBe(0);
+		expect(stderr).toBe("");
+		expect(JSON.parse(stdout)).toEqual([0, 0, 1, 0, 1, 1]);
+	});
+
 	it("serves @oh-my-pi/pi-ai/oauth through the bundled virtual namespace in compiled mode", () => {
 		const overrides = __buildLegacyPiPackageRootOverrides(true, bundledModuleKeys);
 		expect(overrides["@oh-my-pi/pi-ai/oauth"]).toBe("omp-legacy-pi-bundled:@oh-my-pi/pi-ai/oauth");
@@ -73,10 +120,17 @@ describe("legacy pi compat compiled-mode subpath overrides (issue #3442)", () =>
 		const overrides = __buildLegacyPiPackageRootOverrides(true, bundledModuleKeys);
 		const missing: string[] = [];
 		for (const key of bundledModuleKeys) {
-			// pi-ai/pi-coding-agent roots intentionally use the legacy compat shims
-			// (they re-attach `Type`, `defineTool`, etc. dropped from the canonical
-			// package surface); typebox is served via TYPEBOX_SHIM_PATH.
-			if (key === "@oh-my-pi/pi-ai" || key === "@oh-my-pi/pi-coding-agent" || key === "typebox") continue;
+			// pi-ai/pi-coding-agent/pi-tui roots intentionally use the legacy compat
+			// shims (they re-attach `Type`, `defineTool`, `decodeKittyPrintable`, etc.
+			// dropped from the canonical package surfaces); typebox is served via
+			// TYPEBOX_SHIM_PATH.
+			if (
+				key === "@oh-my-pi/pi-ai" ||
+				key === "@oh-my-pi/pi-coding-agent" ||
+				key === "@oh-my-pi/pi-tui" ||
+				key === "typebox"
+			)
+				continue;
 			if (overrides[key] !== `omp-legacy-pi-bundled:${key}`) {
 				missing.push(key);
 			}
@@ -84,7 +138,7 @@ describe("legacy pi compat compiled-mode subpath overrides (issue #3442)", () =>
 		expect(missing).toEqual([]);
 	});
 
-	it("keeps pi-ai/pi-coding-agent roots routed to their compat shims in compiled mode", () => {
+	it("keeps pi-ai/pi-coding-agent/pi-tui roots routed to their compat shims in compiled mode", () => {
 		// The shim entries themselves resolve to virtual bundled specifiers in
 		// compiled mode (the shim files are bundled under their own registry
 		// keys); the test asserts only that the roots stay distinct from the
@@ -94,6 +148,7 @@ describe("legacy pi compat compiled-mode subpath overrides (issue #3442)", () =>
 		expect(overrides["@oh-my-pi/pi-ai"]).toBeDefined();
 		expect(overrides["@oh-my-pi/pi-ai"]).not.toBe("omp-legacy-pi-bundled:@oh-my-pi/pi-ai/oauth");
 		expect(overrides["@oh-my-pi/pi-coding-agent"]).toBeDefined();
+		expect(overrides["@oh-my-pi/pi-tui"]).toBeDefined();
 	});
 
 	it("does not register subpath overrides in dev/install mode", () => {

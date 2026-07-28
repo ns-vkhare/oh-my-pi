@@ -1,11 +1,20 @@
 import { type } from "arktype";
-import type { ModelSpec } from "../types";
+import { parseKnownModel, semverEqual } from "../identity/classify";
+import type { FetchImpl, ModelSpec } from "../types";
 import { discoveryFetch } from "../utils";
 import { CODEX_BASE_URL, CODEX_CLIENT_VERSION, OPENAI_HEADER_VALUES, OPENAI_HEADERS } from "../wire/codex";
 
 const DEFAULT_MODEL_LIST_PATHS = ["/codex/models", "/models"] as const;
 const DEFAULT_CONTEXT_WINDOW = 272_000;
 const DEFAULT_MAX_TOKENS = 128_000;
+/**
+ * GPT-5.6 luna/sol/terra hard context capacity. Codex discovery omits
+ * `context_window` for these SKUs, so the generic {@link DEFAULT_CONTEXT_WINDOW}
+ * (272000) would understate the real window — OpenAI's Codex model registry
+ * declares context_window = max_context_window = 372000 (#5705). Used as the
+ * fallback only when upstream reports no value.
+ */
+const GPT_5_6_CONTEXT_WINDOW = 372_000;
 const CODEX_REMOTE_COMPACTION = {
 	enabled: true,
 	api: "openai-codex-responses",
@@ -24,7 +33,7 @@ const codexModelEntrySchema = type({
 	"default_reasoning_level?": "unknown",
 	"supported_reasoning_levels?": "unknown",
 	"input_modalities?": "unknown",
-	"supported_in_api?": "unknown",
+	"visibility?": "unknown",
 	"priority?": "unknown",
 	"prefer_websockets?": "unknown",
 	"use_responses_lite?": "unknown",
@@ -60,7 +69,7 @@ export interface CodexModelDiscoveryOptions {
 	/** Abort signal for network request cancellation. */
 	signal?: AbortSignal;
 	/** Optional fetch implementation override for tests. */
-	fetchFn?: typeof fetch;
+	fetchFn?: FetchImpl;
 }
 
 /**
@@ -208,13 +217,20 @@ function normalizeCodexModelEntry(entry: unknown, baseUrl: string): NormalizedCo
 		return null;
 	}
 
-	const supportedInApi = toBoolean(payload.supported_in_api);
-	if (supportedInApi === false) {
+	const visibility = toNonEmptyString(payload.visibility)?.toLowerCase();
+	if (visibility === "hide" || visibility === "hidden") {
 		return null;
 	}
 
 	const name = toNonEmptyString(payload.display_name) ?? slug;
-	const contextWindow = toPositiveInt(payload.context_window) ?? DEFAULT_CONTEXT_WINDOW;
+	// Codex discovery omits `context_window` for GPT-5.6 luna/sol/terra; the
+	// generic 272000 fallback understates their real 372000 window (#5705).
+	const parsed = parseKnownModel(slug);
+	const fallbackContextWindow =
+		parsed.family === "openai" && semverEqual(parsed.version, "5.6")
+			? GPT_5_6_CONTEXT_WINDOW
+			: DEFAULT_CONTEXT_WINDOW;
+	const contextWindow = toPositiveInt(payload.context_window) ?? fallbackContextWindow;
 	const maxTokens = Math.min(DEFAULT_MAX_TOKENS, contextWindow);
 	const reasoning = supportsReasoning(payload.default_reasoning_level, payload.supported_reasoning_levels);
 	const input = normalizeInputModalities(payload.input_modalities);

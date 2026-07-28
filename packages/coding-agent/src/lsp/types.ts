@@ -1,5 +1,6 @@
 import type { ptree } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
+import { TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 
 // =============================================================================
 // Tool Schema
@@ -14,7 +15,10 @@ export const lspSchema = type({
 	query: "string?",
 	new_name: "string?",
 	apply: "boolean?",
-	timeout: "number?",
+	"timeout?": type.number
+		.atLeast(TOOL_TIMEOUTS.lsp.min)
+		.atMost(TOOL_TIMEOUTS.lsp.max)
+		.describe("Timeout in seconds (default 20; range 5–300)."),
 	payload: "string?",
 });
 
@@ -336,6 +340,8 @@ export interface ServerConfig {
 	command: string;
 	args?: string[];
 	fileTypes: string[];
+	/** LSP language identifier sent in didOpen; inferred from the file path when omitted. */
+	languageId?: string;
 	rootMarkers: string[];
 	initOptions?: Record<string, unknown>;
 	settings?: Record<string, unknown>;
@@ -387,6 +393,7 @@ export interface LspServerCapabilities {
 	referencesProvider?: boolean;
 	documentSymbolProvider?: boolean;
 	workspaceSymbolProvider?: boolean;
+	diagnosticProvider?: boolean | Record<string, unknown>;
 	[key: string]: unknown;
 }
 
@@ -398,6 +405,8 @@ export interface LspClient {
 	requestId: number;
 	diagnostics: Map<string, PublishedDiagnostics>;
 	diagnosticsVersion: number;
+	/** Dynamic capability registrations keyed by the server-provided registration ID. */
+	dynamicCapabilityRegistrations?: Map<string, string>;
 	openFiles: Map<string, OpenFile>;
 	pendingRequests: Map<number | string, PendingRequest>;
 	messageBuffer: Uint8Array;

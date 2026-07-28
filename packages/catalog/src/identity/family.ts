@@ -42,6 +42,16 @@ export const isKimiK26ModelId = memo((modelId: string): boolean => {
 });
 
 /**
+ * Kimi K3 in any namespace form (`kimi-k3`, `kimi-k3.1`, `kimi-k3-turbo`,
+ * `moonshotai/kimi-k3`). K3 always reasons and drives thinking via OpenAI-style
+ * `reasoning_effort: "max"`, not the K2.x binary `thinking: { type }` block —
+ * see the moonshot discovery mapper and `buildOpenAICompat`.
+ */
+export const isKimiK3ModelId = memo((modelId: string): boolean => {
+	return /(^|\/)kimi-k3(?:\.\d+)?(?:[-.:_]|$)/i.test(modelId);
+});
+
+/**
  * Claude ids in any namespace form: bare (`claude-*`), path-namespaced
  * (`anthropic/claude.x`), or dot-prefixed (`us.anthropic.claude-…`,
  * `global.anthropic.claude-…`, `au.anthropic.claude-…` — Bedrock cross-region
@@ -163,6 +173,32 @@ export const supportsAllTurnsReasoningContext = isOpenAIWireGen54Plus;
  */
 export const supportsCodexReasoningSummary = isOpenAIWireGen54Plus;
 
+/** OpenAI proprietary reasoning families keyed off the parsed gpt version (gpt-5+). */
+const isOpenAIWireGen5Plus = memo((modelId: string): boolean => {
+	const parsed = parseOpenAIModel(bareModelId(modelId));
+	if (!parsed) return false;
+	return semverGte(parsed.version, "5");
+});
+
+/** o-series reasoning ids (`o1`, `o1-pro`, `o3`, `o3-mini`, `o4-mini`, `openai/o3`, …). */
+const O_SERIES_REASONING_RE = /(^|\/)o[134](?:[-.]|$)/i;
+
+/**
+ * OpenAI proprietary models whose serving path rejects explicit sampling
+ * parameters (`temperature`, `top_p`, `top_k`, …) with
+ * `400 Unsupported parameter: 'temperature' is not supported with this model`.
+ * Covers the o-series and the entire gpt-5+ generation — base, `mini`, `nano`,
+ * `codex*`, the `luna`/`sol`/`terra` SKUs, and the `-chat-latest` variants,
+ * since even the non-reasoning gpt-5 chat models reject sampling params (see
+ * litellm#13781). Holds regardless of which OpenAI-serving host proxies the
+ * model (official, Azure, GitHub Copilot). Version floor (not an allowlist) so
+ * 6.x inherits automatically. Issue #5606.
+ */
+export const isOpenAISamplingRestrictedModelId = memo((modelId: string): boolean => {
+	const bare = bareModelId(modelId);
+	return isOpenAIWireGen5Plus(modelId) || O_SERIES_REASONING_RE.test(bare);
+});
+
 /**
  * Reasoning-capable GLM coding SKUs: glm-4.5 and up on the base / `-air` /
  * `-turbo` lines. Excludes the vision (`…v`) shape, the non-reasoning
@@ -223,6 +259,19 @@ export const modelFamilyToken = memo((modelId: string): string => {
 	if (isGemmaModelId(modelId)) return "gemma";
 	if (parseGlmModel(bareModelId(modelId))) return "glm";
 	return "";
+});
+
+/**
+ * True for Claude generations that support extended thinking: Sonnet/Opus 3.7+,
+ * every 4.x/5+ Opus/Sonnet, and the Fable/Mythos generation. Pre-thinking
+ * models (Claude 3.5 and older) are excluded so no thinking effort dial is
+ * fabricated for a model that rejects thinking parameters. Classifier-based, so
+ * dotted and dashed version forms both match; ids the classifier does not parse
+ * (e.g. Haiku, bare dated ids) return false.
+ */
+export const anthropicModelSupportsThinking = memo((modelId: string): boolean => {
+	const parsed = parseAnthropicModel(bareModelId(modelId));
+	return parsed !== null && semverGte(parsed.version, "3.7");
 });
 
 /**

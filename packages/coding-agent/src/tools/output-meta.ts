@@ -191,6 +191,13 @@ export class OutputMetaBuilder {
 
 	/** Add truncation info from OutputSummary. No-op if not truncated. */
 	truncationFromSummary(summary: OutputSummary, options: TruncationSummaryOptions): this {
+		// A per-line column cap only trims individual lines (with a `…` marker);
+		// it is not a window/byte truncation, so surface it as its own limit
+		// notice rather than a "Showing lines X-Y … limit" range. This runs even
+		// when the output is otherwise complete (`truncated === false`).
+		if (summary.columnMax != null && summary.columnMax > 0 && (summary.columnTruncatedLines ?? 0) > 0) {
+			this.columnTruncated(summary.columnMax);
+		}
 		if (!summary.truncated) return this;
 
 		const { direction, startLine = 1, totalFileLines } = options;
@@ -622,6 +629,26 @@ function getSpillConfig(s: Settings | undefined) {
  */
 export function resolveOutputSinkHeadBytes(s: Settings | undefined): number {
 	return getSpillConfig(s).headBytes;
+}
+
+/**
+ * Slack on top of the configured spill threshold before the final-defense
+ * inline byte cap fires. The OutputSink already bounds inline bodies to the
+ * threshold; only notice slop (wall time, exit code, elision marker,
+ * `[raw output: artifact://N]` footer) rides above it. The slack keeps the
+ * cap a genuine last resort for paths that bypass the sink (e.g. ACP
+ * client-bridge terminals) instead of re-truncating — and re-saving — every
+ * sink-elided result (the double-artifact `Artifact: N+1` vs `artifact://N`
+ * mismatch).
+ */
+const INLINE_CAP_SLACK_BYTES = 2 * 1024;
+
+/**
+ * Resolve the `enforceInlineByteCap` budget for streaming tools (bash/ssh)
+ * from session settings: the user's spill threshold plus notice slack.
+ */
+export function resolveInlineByteCapBudget(s: Settings | undefined): number {
+	return getSpillConfig(s).threshold + INLINE_CAP_SLACK_BYTES;
 }
 
 /**

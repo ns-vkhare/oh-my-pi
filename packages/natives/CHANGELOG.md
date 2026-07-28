@@ -2,6 +2,117 @@
 
 ## [Unreleased]
 
+## [17.1.8] - 2026-07-28
+
+### Fixed
+
+- Fixed an issue on macOS (darwin) where the native addon delivered zero AudioCapture callbacks, which prevented microphone audio from being captured.
+
+## [17.1.6] - 2026-07-27
+
+### Changed
+
+- CI now exports Bazel disk caches only after exact misses and reuses one native addon artifact across Linux test and release jobs. macOS release jobs now build only their own architecture.
+- Native addons now build with Bazel (rules_rust + hermetic zig cc toolchains for linux-gnu/musl, host Xcode for darwin, and a hermetic clang-cl + xwin toolchain for windows-msvc) instead of the napi CLI + cargo-zigbuild/cargo-xwin pipeline. `bun run build` drives `scripts/bazel-natives.ts`; TypeScript binding regeneration moved to `bun run build:bindings` (needed only when the Rust API surface changes). CI caches through a content-addressed bazel-remote action cache instead of sccache + target-directory snapshots, cutting warm native rebuilds from ~20 minutes to seconds and cold cache-hit builds to ~2.5 minutes.
+
+### Fixed
+
+- napi binding build failures now surface the exit code and the tail of stdout/stderr instead of a bare "napi build failed" message ([#6799](https://github.com/can1357/oh-my-pi/pull/6799)).
+- Silenced cross-platform Rust build warnings: dead-code on unix-only fields/helpers in `pi-uutils-ctx`, `pi-shell` (fd owner filters, coreutils argv), and vendored `uu-find`/`uu-stat` when compiling for Windows, and deprecated `libc::time_t` casts in `pi-iso` on musl. `pi-walker` now declares the `windows-sys` features it uses (`Win32_Foundation`, `Win32_Security`, `Win32_Storage_FileSystem`, `Win32_System_IO`) instead of relying on workspace-wide feature unification.
+
+## [17.1.5] - 2026-07-27
+
+### Fixed
+
+- Fixed the native `sort` builtin panicking with `SendError(..)` at `chunks.rs:248` when the chunk-channel receiver disconnected early (e.g. a consumer thread stopping after an error or closed output); the reader now stops gracefully instead of unwrapping the failed send, and a panicking external-sort worker thread is surfaced as an error instead of silently emitting truncated output ([#6736](https://github.com/can1357/oh-my-pi/issues/6736)).
+
+## [17.1.4] - 2026-07-26
+
+### Added
+
+- Added the `@oh-my-pi/pi-natives/desktop` factory entry, which defers native addon loading until a desktop worker initializes its session.
+
+### Fixed
+
+- Fixed Linux native audio over forwarded PulseAudio servers: capture now handles 125 ms Android fragments without stalling, and playback buffers enough audio to avoid TCP underruns and stuttering ([#6628](https://github.com/can1357/oh-my-pi/pull/6628) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
+- Fixed older running OMP versions deleting newer native addon cache directories during cleanup, which could race a new version's first-run extraction and crash with `ENOENT`.
+- Fixed macOS computer screenshots occasionally returning the pre-action frame instead of reflecting completed keyboard and pointer input ([#6595](https://github.com/can1357/oh-my-pi/pull/6595) by [@wolfiesch](https://github.com/wolfiesch)).
+
+## [17.1.3] - 2026-07-24
+
+### Changed
+
+- `astEdit` without an explicit `lang` now rewrites mixed-language paths per file (each file parsed in its own inferred language, patterns compiled per language) instead of erroring when the path/glob spans multiple languages. A pattern that parses in no discovered language is still reported (or fails the call under `failOnParseError`); files whose language cannot be inferred surface as per-file parse errors instead of aborting the whole call.
+
+## [17.1.2] - 2026-07-24
+
+### Fixed
+
+- Fixed native addon builds with CMake 4.x (bundled opus policy floor) and stopped passing `-C target-cpu=native` on darwin arm64, which baked build-host CPU features into shipped addons and broke `ring` compilation.
+
+## [17.1.1] - 2026-07-24
+
+### Added
+
+- Added native `AudioCapture`, `AudioPlayback`, and `LiveWebRtcPeer` classes for low-latency microphone capture, gapless speaker playback, and WebRTC offer/answer sessions with Opus media and `oai-events` data-channel delivery.
+- Added a macOS `deviceCheckGenerateToken` export that generates Apple DeviceCheck attestation tokens natively: it drives `DCDevice.generateToken` through raw Objective-C runtime FFI with a hand-built completion block literal and a bounded one-second wait, resolving `{ supported, tokenBase64, error, latencyMs }` to mirror the ChatGPT desktop app's `devicecheck.node` addon contract. Non-macOS builds resolve `supported: false` without touching the network.
+- Added a genuine native desktop backend for computer use, bundled in the core addon on every published platform: macOS Quartz/CGEvent, Windows Win32/`SendInput`, and a pure-Rust Linux X11 backend (`x11rb` capture over the display socket, XTest input with keysym mapping) that links no GUI system libraries — so Linux x64/arm64, glibc and musl are all supported and headless hosts are unaffected. Wayland sessions work through XWayland. Execute batches enforce a 60-second native deadline (`DESKTOP_DEADLINE_EXCEEDED`) and never emit input after it expires; unsupported pure-Wayland capture and out-of-XTest-range or negative-origin coordinate layouts fail closed.
+
+### Fixed
+
+- Fixed macOS computer screenshots taking roughly 30 seconds under Bun by replacing xcap's deprecated window-list capture with a bounded system capture path; direct screenshots now complete in under half a second on the verified host.
+
+## [17.0.8] - 2026-07-22
+
+### Added
+
+- Added jsdiff-compatible native diff exports: `diffLines`, `diffWords`, `diffLineRuns`, and `structuredPatchHunks`.
+- Added batch vector kernels for mnemopi recall paths: `cosineSimilarityPairs`, `vectorIndexTopK`, and `mmrRerankIndices`.
+
+### Changed
+
+- Updated diff functions (`diffLines`, `diffWords`, `diffLineRuns`, `structuredPatchHunks`) to process UTF-16 code units natively end to end via `Utf16String`, supporting ill-formed JS strings with unpaired surrogates without throwing or converting to UTF-8.
+
+### Fixed
+
+- Fixed a critical issue where the in-process `rm` builtin treated an empty path operand as the current working directory, causing `rm -rf ""` to recursively delete the current directory. Empty operands are now rejected, matching GNU `rm` behavior.
+
+### Removed
+
+- Removed unused `similar` crate dependency and dev-dependency on npm `diff`.
+
+## [17.0.5] - 2026-07-18
+
+### Added
+
+- Added optional PTY start callbacks that report the spawned child PID before command completion.
+
+## [17.0.3] - 2026-07-17
+
+### Fixed
+
+- Fixed `~` (tilde) not expanding for every element of a brace expansion in the bash tool, so `mkdir -p ~/project/{a,b}` now creates both `a` and `b` under `$HOME/project` instead of leaving a literal `~/project/b` in the working directory ([#5819](https://github.com/can1357/oh-my-pi/issues/5819)).
+- Fixed ANSI text wrapping to close and restore OSC 8 hyperlinks at physical line boundaries, preventing link targets from leaking into appended content ([#5885](https://github.com/can1357/oh-my-pi/issues/5885)).
+
+## [17.0.2] - 2026-07-17
+
+### Fixed
+
+- Fixed an issue where running `uv run --extra <package> pytest` bypassed native pytest minimization due to a wrapper parsing error.
+- Fixed a bug where timed-out shell pipelines dropped captured output and could cause Windows hosts to terminate during teardown. (#5316)
+
+## [17.0.1] - 2026-07-16
+
+### Fixed
+
+- Fixed the pi-natives version sentinel emitting "reinstall to re-sync" when a long-lived process survives an in-place upgrade: the loader now detects that the resident addon exposes a *prior* release's sentinel and reports "omp was upgraded while this session was running — restart to pick up the new version (disk is already consistent)" instead of misdiagnosing it as a stale on-disk file ([#4812](https://github.com/can1357/oh-my-pi/issues/4812)).
+
+## [17.0.0] - 2026-07-15
+
+### Fixed
+
+- Fixed the in-process grep builtin to correctly handle escaped alternation (\|) in default and -G (GNU basic-regex) searches, while preserving the correct regex dialects for -E, -F, and -P.
+
 ## [16.5.2] - 2026-07-14
 
 ### Fixed

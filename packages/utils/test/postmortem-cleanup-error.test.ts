@@ -20,8 +20,10 @@ async function runPostmortemProbe(
 			stderr: "pipe",
 			env: { ...process.env, OMP_AGENT_DIR: join(root, "agent") },
 		});
-		// Process-level regressions can hang the child; the watchdog bounds the fixture without slowing green runs.
-		const watchdog = Bun.sleep(2000).then(() => {
+		// Process-level regressions can hang the child; the watchdog bounds the fixture without slowing
+		// green runs (the race resolves on exit). Generous deadline: a cold bun spawn transpiling the
+		// pi-utils module graph can take multiple seconds on a loaded parallel CI runner (observed >2s).
+		const watchdog = Bun.sleep(15_000).then(() => {
 			proc.kill();
 			return -999;
 		});
@@ -119,6 +121,24 @@ describe("postmortem expected cleanup errors", () => {
 
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain("[Unhandled Rejection] Error: unexpected cleanup rejection");
+	});
+
+	it("exits after an uncaught exception when terminal stderr is revoked", async () => {
+		const result = await runPostmortemProbe(`
+			import { spyOn } from "bun:test";
+			import "${postmortemModuleUrl}";
+
+			spyOn(process.stderr, "write").mockImplementation(() => {
+				throw Object.assign(new Error("terminal revoked"), { code: "EIO" });
+			});
+			queueMicrotask(() => {
+				throw new Error("fatal after disconnect");
+			});
+			await Promise.withResolvers<void>().promise;
+		`);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("[Uncaught Exception] Error: fatal after disconnect");
 	});
 
 	it("releases manual cleanup at the deadline even when a callback never settles", async () => {

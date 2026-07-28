@@ -10,7 +10,7 @@ import type {
 	AgentToolUpdateCallback,
 	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
-import type { Component } from "@oh-my-pi/pi-tui";
+import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 
@@ -19,6 +19,7 @@ import { normalizeToLF } from "../edit/normalize";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
+import { couldBecomeXdUrl, parseXdUrl } from "../internal-urls/xd-protocol";
 import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
@@ -35,7 +36,7 @@ import {
 	writeArchive,
 } from "../utils/zip";
 import { routeWriteThroughBridge } from "./acp-bridge";
-import { truncateForPrompt } from "./approval";
+import { resolveToolTier, truncateForPrompt } from "./approval";
 import { assertEditableFile } from "./auto-generated-guard";
 import {
 	type ConflictEntry,
@@ -48,7 +49,14 @@ import {
 } from "./conflict-detect";
 import { invalidateFsScanAfterWrite } from "./fs-cache-invalidation";
 import { type OutputMeta, outputMeta } from "./output-meta";
-import { formatPathRelativeToCwd, isInternalUrlPath, pathTargetsSsh, peelWriteUrlSelector } from "./path-utils";
+import {
+	formatPathRelativeToCwd,
+	isInternalUrlPath,
+	pathTargetsSsh,
+	peelWriteUrlSelector,
+	probeLiteralPathExists,
+	splitPathAndSel,
+} from "./path-utils";
 import { enforcePlanModeWrite, resolvePlanPath, unwrapHashlineHeaderPath } from "./plan-mode-guard";
 import {
 	cachedRenderedString,
@@ -66,6 +74,8 @@ import {
 	TRUNCATE_LENGTHS,
 	truncateToWidth,
 } from "./render-utils";
+import { dispatchReportIssueDevice, REPORT_ISSUE_DEVICE_NAME, renderReportIssueDeviceCall } from "./report-tool-issue";
+import { dispatchResolutionDevice, isResolutionDeviceName, renderResolutionDeviceCall } from "./resolve";
 import {
 	deleteRowByKey,
 	deleteRowByRowId,
@@ -78,9 +88,119 @@ import {
 } from "./sqlite-reader";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
+import {
+	dispatchXdevTool,
+	renderXdevCall,
+	renderXdevResult,
+	resolveXdevTool,
+	type XdevDispatch,
+	xdevListing,
+} from "./xdev";
 
 const LOOSE_HASHLINE_HEADER_RE = /^\s*\[[^#\r\n]+#[^ \t\r\n]*\]\s*$/;
 const EXECUTABLE_NOTICE = "[Notice: Made executable via chmod +x]";
+const URI_LIKE_WRITE_PATH_RE = /^([a-z][a-z0-9+.-]*):\/{1,2}(.*)$/i;
+const XD_MISSING_DELIMITER_RE = /^xd\/+(.*)$/i;
+const XD_SCHEME_NEAR_MISSES: Record<string, true> = { dx: true, xdd: true, xdt: true };
+
+function assertWriteTargetAddressable(target: string, router: InternalUrlRouter): void {
+	const trimmed = target.trim();
+	if (path.win32.isAbsolute(trimmed) || router.canHandle(trimmed)) return;
+
+	const missingDelimiter = trimmed.match(XD_MISSING_DELIMITER_RE);
+	if (missingDelimiter) {
+		throw new ToolError(
+			`Unknown URI-like write target '${trimmed}'. Did you mean 'xd://${missingDelimiter[1]}'? Prefix the path with './' to write it as a filesystem path.`,
+		);
+	}
+
+	const uriLike = trimmed.match(URI_LIKE_WRITE_PATH_RE);
+	if (!uriLike) return;
+
+	const scheme = uriLike[1]!.toLowerCase();
+	// conflict:// has no router handler but is spliced downstream by
+	// parseConflictUri (which emits its own precise id/scope errors); let it pass.
+	if (scheme === "conflict") return;
+	const canonicalScheme = router.getHandler(scheme) ? scheme : XD_SCHEME_NEAR_MISSES[scheme] ? "xd" : undefined;
+	const suggestion = canonicalScheme
+		? ` Did you mean '${canonicalScheme}://${uriLike[2]}'?`
+		: " Tool devices use 'xd://<tool>'.";
+	throw new ToolError(
+		`Unknown URI-like write target '${trimmed}'.${suggestion} Prefix the path with './' to write it as a filesystem path.`,
+	);
+}
+
+/**
+ * Fail closed when a local write target looks like a mis-dispatched read.
+ *
+ * A read-only step that selects `write` instead of `read` passes the full read
+ * expression (`src/foo.tsx:1-260:raw`) as the target. Because a literal colon
+ * filename is legal on POSIX (issue #4618), that request otherwise resolves to
+ * filesystem creation and reports success, leaving a stray zero-byte file the
+ * model cannot recover from — the local analogue of the `xd://` near-miss guard
+ * ({@link assertWriteTargetAddressable}, issue #6123).
+ *
+ * Fires only on the high-confidence combination the report identifies: the tail
+ * parses as a read-tool selector, the literal target is missing, and no content
+ * was supplied. Non-empty content is the escape hatch — it is never blocked, so
+ * a deliberate write to a selector-shaped filename still succeeds. An existing
+ * literal path or an ambiguous stat (`"unknown"`: EACCES, transient I/O) also
+ * passes through so a real file is never shadowed by the guard.
+ */
+function readSelectorForEmptyWrite(target: string, content: string): string | undefined {
+	if (content.length > 0) return undefined;
+	return splitPathAndSel(target).sel;
+}
+
+function throwReadSelectorMisfire(target: string, sel: string): never {
+	throw new ToolError(
+		`write target '${target}' ends with a read-tool selector ':${sel}' and no such file exists — refusing to create a literal file by that name. ` +
+			`If you meant to read it, use read({ path: "${target}" }). ` +
+			`If you truly intend to create this file, pass its contents in \`content\` (a non-empty write is never blocked).`,
+	);
+}
+
+/**
+ * Recognize a semicolon-joined list of read-tool selectors mis-dispatched as a
+ * single write target — the multi-file read expression the scout emitted in
+ * issue #6809 (`a.txt:1-2;b/c.txt:3-4`). Every `;`-segment must be non-empty and
+ * carry its own read selector ({@link splitPathAndSel} peels a `:N-M`, `:raw`,
+ * or `:conflicts` tail). No real call targets such a list: `read` accepts one
+ * path, `write` writes one file. Unlike {@link readSelectorForEmptyWrite} this
+ * fires regardless of `content` — the non-empty-content escape hatch exists for
+ * a lone selector-shaped *filename*, never a `;`-list, and honoring it here
+ * silently creates a nested directory tree (`a.txt:1-2;b/`) in the workspace.
+ * The caller still probes the literal target first, so an existing POSIX file
+ * by that exact name stays writable (same escape as the single-selector guard).
+ */
+function readSelectorListMisfire(target: string): number | undefined {
+	if (!target.includes(";")) return undefined;
+	const segments = target.split(";");
+	if (segments.length < 2) return undefined;
+	for (const segment of segments) {
+		const trimmed = segment.trim();
+		if (trimmed.length === 0 || splitPathAndSel(trimmed).sel === undefined) return undefined;
+	}
+	return segments.length;
+}
+
+function throwReadSelectorListMisfire(target: string, count: number): never {
+	throw new ToolError(
+		`write target '${target}' is a semicolon-joined list of ${count} read-tool selectors, not a filesystem path — refusing to create it. ` +
+			`write creates a single file; issue one read() per path to read these ranges (e.g. read({ path: "<one path>:<range>" })).`,
+	);
+}
+
+async function assertNotReadSelectorMisfire(target: string, content: string, cwd: string): Promise<void> {
+	const listCount = readSelectorListMisfire(target);
+	if (listCount !== undefined && (await probeLiteralPathExists(target, cwd)) === "missing") {
+		throwReadSelectorListMisfire(target, listCount);
+	}
+	const sel = readSelectorForEmptyWrite(target, content);
+	if (sel === undefined) return;
+	if ((await probeLiteralPathExists(target, cwd)) !== "missing") return;
+	throwReadSelectorMisfire(target, sel);
+}
 
 const BULK_DIRECTIVE_RE = /^#?(\d+)\s*[:=]\s*(@ours|@theirs|@base|@both)$/;
 /**
@@ -191,6 +311,8 @@ export interface WriteToolDetails {
 	/** Absolute filesystem path the write resolved to. Used by the renderer to wrap
 	 * the (possibly cwd-relative) header path in an OSC 8 `file://` hyperlink. */
 	resolvedPath?: string;
+	/** Set when the write dispatched an `xd://` tool device; drives renderer delegation. */
+	xdev?: XdevDispatch;
 }
 
 /**
@@ -384,6 +506,37 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// Unwrap a hashline `[path#TAG]` wrapper first (parity with execute) so a
 		// wrapped `[ssh://h/x#ABCD]` can't dodge scheme detection and the tier checks below.
 		const path = unwrapHashlineHeaderPath(rawPath);
+		// xd:// device writes execute the mounted tool — take its approval tier.
+		// The resolution devices (xd://resolve, xd://reject, xd://propose)
+		// finalize a staged, already-previewed action, so they stay at read tier.
+		const xdevTarget = parseXdUrl(path);
+		if (xdevTarget) {
+			if (xdevTarget.name === REPORT_ISSUE_DEVICE_NAME) return "write";
+			if (xdevTarget.name && isResolutionDeviceName(xdevTarget.name)) return "read";
+			const inst =
+				xdevTarget.name && this.session.xdev ? resolveXdevTool(this.session.xdev, xdevTarget.name) : undefined;
+			if (!inst) return "exec";
+			// Decode the device JSON payload and evaluate the mounted tool's own
+			// approval (which may be argument-dependent, e.g. ast_edit is read-tier
+			// for internal-URL paths, debug is read-tier for inspection actions).
+			// Malformed JSON, non-object payloads, missing content, and approval
+			// functions that reject schema-invalid objects stay exec so the gate
+			// fails closed — the dispatch itself rejects invalid arguments too.
+			const rawContent = (args as Partial<WriteParams>).content;
+			if (typeof rawContent !== "string") return "exec";
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(rawContent);
+			} catch {
+				return "exec";
+			}
+			if (!isRecord(parsed)) return "exec";
+			try {
+				return resolveToolTier(inst, parsed);
+			} catch {
+				return "exec";
+			}
+		}
 		// Remote SSH writes open an outbound connection and run a remote shell —
 		// gate them like the exec-tier `ssh` tool, ahead of the handler-write
 		// logic. Substring match also covers selector-suffixed targets.
@@ -509,6 +662,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			} catch (error) {
 				throw new ToolError(error instanceof Error ? error.message : String(error));
 			}
+		}
+		const writeTarget = `${resolvedArchivePath.archivePath}:${resolvedArchivePath.archiveSubPath}`;
+		const sel = readSelectorForEmptyWrite(writeTarget, content);
+		if (sel !== undefined && !entries.has(resolvedArchivePath.archiveSubPath)) {
+			throwReadSelectorMisfire(writeTarget, sel);
 		}
 		entries.set(resolvedArchivePath.archiveSubPath, content);
 
@@ -951,27 +1109,80 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			// Strip hashline display prefixes ([PATH#HASH] + LINE:) if the model copied them from read output
 			const { text: cleanContent, stripped } = stripWriteContent(this.session, content);
 			const internalRouter = InternalUrlRouter.instance();
+			assertWriteTargetAddressable(path, internalRouter);
 			if (internalRouter.canHandle(path)) {
 				const parsed = parseInternalUrl(path);
 				const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
 				const handler = internalRouter.getHandler(scheme);
 				if (handler?.write) {
-					// Handler-owned writes (vault:// notes, host URIs) mutate user
-					// data outside the local sandbox — plan mode must reject them.
-					enforcePlanModeWrite(this.session, path, { op: "update" });
-					emitWriteProgress(onUpdate, cleanContent, path);
-					await handler.write(parsed, cleanContent, { cwd: this.session.cwd, signal });
+					// Handler-owned writes mutate user data outside the local
+					// sandbox. xd:// dispatches retain each wrapped tool's tier.
+					if (scheme !== "xd") {
+						enforcePlanModeWrite(this.session, path, { op: "update" });
+						emitWriteProgress(onUpdate, cleanContent, path);
+					}
+					let xdResult: AgentToolResult<WriteToolDetails> | undefined;
+					await internalRouter.write(path, cleanContent, {
+						cwd: this.session.cwd,
+						signal,
+						xd: {
+							write: async (name, deviceContent) => {
+								if (name === REPORT_ISSUE_DEVICE_NAME) {
+									const { result, xdev } = await dispatchReportIssueDevice(this.session, deviceContent);
+									xdResult = {
+										content: result.content,
+										details: { xdev },
+										isError: result.isError,
+										useless: result.useless,
+									};
+									return;
+								}
+								if (name && isResolutionDeviceName(name)) {
+									const { result, xdev } = await dispatchResolutionDevice(this.session, name, deviceContent);
+									xdResult = {
+										content: result.content,
+										details: { xdev },
+										isError: result.isError,
+										useless: result.useless,
+									};
+									return;
+								}
+								const xdev = this.session.xdev;
+								if (!xdev) {
+									throw new ToolError("xd:// is not mounted in this session.");
+								}
+								if (!name) {
+									throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${xdevListing(xdev)}`);
+								}
+								const { result, xdev: dispatch } = await dispatchXdevTool(
+									xdev,
+									name,
+									deviceContent,
+									_toolCallId,
+									signal,
+									onUpdate as AgentToolUpdateCallback,
+									// The write tool's own gate just resolved approval at this
+									// device's tier (see #approval above) — mark it so a wrapped
+									// inner tool does not prompt a second time.
+									context ? { ...context, xdevApproved: true } : undefined,
+								);
+								xdResult = {
+									content: result.content,
+									details: { xdev: dispatch },
+									isError: result.isError,
+									useless: result.useless,
+								};
+							},
+						},
+					});
+					if (xdResult) return xdResult;
 					let resultText = `Successfully wrote ${cleanContent.length} bytes to ${path}`;
 					if (stripped) {
 						resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
 					}
 					return { content: [{ type: "text", text: resultText }], details: {} };
 				}
-				if (scheme !== "local") {
-					throw new ToolError(
-						`${scheme}:// URLs are read-only for write; use the protocol-specific tool for mutations.`,
-					);
-				}
+				if (scheme !== "local") await internalRouter.write(path, cleanContent);
 				// local:// is backed by the session-local artifact sandbox and is
 				// resolved by resolvePlanPath below so write/read share the same root.
 			}
@@ -1041,13 +1252,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return sqliteResult;
 			}
 
+			await assertNotReadSelectorMisfire(path, cleanContent, this.session.cwd);
 			enforcePlanModeWrite(this.session, path, { op: "create" });
 			const absolutePath = resolvePlanPath(this.session, path);
 			const batchRequest = getLspBatchRequest(context?.toolCall);
 
 			// Check if file exists and is auto-generated before overwriting
 			if (await fs.exists(absolutePath)) {
-				await assertEditableFile(absolutePath, path);
+				await assertEditableFile(absolutePath, path, this.session.settings);
 			}
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
@@ -1254,10 +1466,33 @@ function renderContentPreview(
 	});
 }
 
+/** Render context for the write tool: resolves an `xd://`-mounted tool so its live renderer drives device dispatch previews. */
+export interface WriteRenderContext {
+	resolveXdevMounted?: (name: string) => AgentTool | undefined;
+}
+
 export const writeToolRenderer = {
-	renderCall(args: WriteRenderArgs, options: RenderResultOptions, uiTheme: Theme): Component {
+	renderCall(
+		args: WriteRenderArgs,
+		options: RenderResultOptions & { renderContext?: WriteRenderContext },
+		uiTheme: Theme,
+	): Component | undefined {
 		const rawPath =
 			typeof args.file_path === "string" ? args.file_path : typeof args.path === "string" ? args.path : "";
+		// Render NOTHING until the streamed path arrives and provably is not an
+		// xd:// device; xd:// writes then delegate to the mounted tool's renderer.
+		// A present-but-malformed path (array/object from a bad provider parse)
+		// is definitively not xd:// — fall through to the legacy frame.
+		if (args.path === undefined && args.file_path === undefined) return undefined;
+		if (rawPath && couldBecomeXdUrl(rawPath)) {
+			const xdev = parseXdUrl(rawPath);
+			// The path string is settled once the content field started streaming.
+			const pathSettled = args.content !== undefined;
+			if (!xdev?.name || !pathSettled) return undefined;
+			if (isResolutionDeviceName(xdev.name)) return renderResolutionDeviceCall(xdev.name, args.content, uiTheme);
+			if (xdev.name === REPORT_ISSUE_DEVICE_NAME) return renderReportIssueDeviceCall(args.content, uiTheme);
+			return renderXdevCall(xdev.name, args.content, options, uiTheme, options.renderContext?.resolveXdevMounted);
+		}
 		const filePath = shortenPath(rawPath);
 		const lang = rawPath ? (getLanguageFromPath(rawPath) ?? "text") : "text";
 		const langIcon = uiTheme.fg("muted", uiTheme.getLangIcon(lang));
@@ -1300,10 +1535,18 @@ export const writeToolRenderer = {
 
 	renderResult(
 		result: { content: Array<{ type: string; text?: string }>; details?: WriteToolDetails; isError?: boolean },
-		options: RenderResultOptions,
+		options: RenderResultOptions & { renderContext?: WriteRenderContext },
 		uiTheme: Theme,
 		args?: WriteRenderArgs,
 	): Component {
+		// xd:// dispatch results render as the mounted tool's own result.
+		const xdev = result.details?.xdev;
+		if (xdev) {
+			const delegated = renderXdevResult(xdev, result, options, uiTheme, options.renderContext?.resolveXdevMounted);
+			if (delegated) return delegated;
+			const text = result.content?.find(c => c.type === "text")?.text ?? "";
+			return new Text(uiTheme.fg("toolOutput", replaceTabs(text)), 0, 0);
+		}
 		const rawPath =
 			typeof args?.file_path === "string" ? args.file_path : typeof args?.path === "string" ? args.path : "";
 		const filePath = shortenPath(rawPath);

@@ -2,7 +2,7 @@
  * Regression test for #3680: third-party extension / hook modules that call
  * `process.exit()` at the top level must not terminate the host OMP process.
  *
- * The harness intercepts the load via `withExitGuard`; this test pins that the
+ * The harness intercepts the load via `withHostGuard`; this test pins that the
  * intercepted error surfaces as a per-module load failure (so OMP keeps going)
  * instead of crashing the test runner.
  */
@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { loadHooks } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/loader";
-import { ExtensionExitError, withExitGuard } from "@oh-my-pi/pi-coding-agent/extensibility/utils";
+import { ExtensionExitError, withHostGuard } from "@oh-my-pi/pi-coding-agent/extensibility/utils";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("extension/hook loader process.exit guard (#3680)", () => {
@@ -32,6 +32,52 @@ describe("extension/hook loader process.exit guard (#3680)", () => {
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
 		fs.writeFileSync(filePath, source);
 		return filePath;
+	};
+
+	const runProbe = async (probe: string) => {
+		const proc = Bun.spawn([process.execPath, "-e", probe], {
+			cwd: path.resolve(import.meta.dir, "../../.."),
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		// Real process signals cannot use fake timers; this only bounds a wedged child.
+		const watchdog = setTimeout(() => {
+			try {
+				proc.kill("SIGKILL");
+			} catch {}
+		}, 2000);
+		try {
+			const [exitCode, stdout, stderr] = await Promise.all([
+				proc.exited,
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+			]);
+			return { exitCode, stdout, stderr };
+		} finally {
+			clearTimeout(watchdog);
+		}
+	};
+
+	const runGuardedShutdownProbe = (trigger: "sigint" | "fatal") => {
+		const action =
+			trigger === "sigint"
+				? 'process.kill(process.pid, "SIGINT");'
+				: 'void Promise.reject(new Error("probe fatal"));';
+		return runProbe(`
+import { postmortem } from "@oh-my-pi/pi-utils";
+import { withHostGuard } from "@oh-my-pi/pi-coding-agent/extensibility/utils";
+
+postmortem.register("probe-cleanup", reason => {
+	process.stdout.write(\`cleanup:\${reason}\\n\`);
+});
+void withHostGuard(async () => {
+	process.stdout.write("guard-active\\n");
+	${action}
+	// Keep the real child event loop alive so the platform can deliver SIGINT.
+	await Bun.sleep(10_000);
+});
+`);
 	};
 
 	it("converts a top-level process.exit in an extension into a load error", async () => {
@@ -111,7 +157,7 @@ describe("extension/hook loader process.exit guard (#3680)", () => {
 		const originalExit = process.exit;
 
 		await expect(
-			withExitGuard(async () => {
+			withHostGuard(async () => {
 				throw new Error("boom");
 			}),
 		).rejects.toThrow("boom");
@@ -122,19 +168,55 @@ describe("extension/hook loader process.exit guard (#3680)", () => {
 	it("raises ExtensionExitError when the guarded callback calls process.exit", async () => {
 		const originalExit = process.exit;
 
-		await expect(withExitGuard(async () => process.exit(7))).rejects.toBeInstanceOf(ExtensionExitError);
+		await expect(withHostGuard(async () => process.exit(7))).rejects.toBeInstanceOf(ExtensionExitError);
 
 		expect(process.exit).toBe(originalExit);
+	});
+
+	it("keeps postmortem.quit behind the extension exit guard", async () => {
+		const { exitCode, stdout, stderr } = await runProbe(`
+import { postmortem } from "@oh-my-pi/pi-utils";
+import { withHostGuard } from "@oh-my-pi/pi-coding-agent/extensibility/utils";
+
+try {
+	await withHostGuard(() => postmortem.quit(37));
+} catch (err) {
+	process.stdout.write(\`\${err instanceof Error ? err.name : "UnknownError"}:\${String(err)}\\n\`);
+}
+`);
+
+		expect(exitCode).toBe(0);
+		expect(stdout).toContain("ExtensionExitError:ExtensionExitError: Module called process.exit(37)");
+		expect(stderr).toBe("");
+	});
+
+	it("lets host SIGINT exit once while a guarded callback remains pending", async () => {
+		const { exitCode, stdout, stderr } = await runGuardedShutdownProbe("sigint");
+
+		expect(exitCode).toBe(130);
+		expect(stdout).toBe("guard-active\ncleanup:sigint\n");
+		expect(stderr).not.toContain("[Unhandled Rejection]");
+		expect(stderr).not.toContain("ExtensionExitError");
+	});
+
+	it("lets fatal cleanup exit once while a guarded callback remains pending", async () => {
+		const { exitCode, stdout, stderr } = await runGuardedShutdownProbe("fatal");
+
+		expect(exitCode).toBe(1);
+		expect(stdout).toBe("guard-active\ncleanup:unhandled_rejection\n");
+		expect(stderr.match(/\[Unhandled Rejection\]/g)).toHaveLength(1);
+		expect(stderr).toContain("Error: probe fatal");
+		expect(stderr).not.toContain("ExtensionExitError");
 	});
 
 	it("only the outermost guard restores process.exit when guards nest", async () => {
 		const originalExit = process.exit;
 
-		await withExitGuard(async () => {
+		await withHostGuard(async () => {
 			const outer = process.exit;
 			expect(outer).not.toBe(originalExit);
 
-			await withExitGuard(async () => {
+			await withHostGuard(async () => {
 				expect(process.exit).toBe(outer);
 			});
 

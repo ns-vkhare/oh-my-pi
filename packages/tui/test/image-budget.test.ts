@@ -675,6 +675,80 @@ describe("TUI inline-image budget", () => {
 		}
 	});
 
+	it("deletes every tracked Kitty image during live cleanup", async () => {
+		const term = new VirtualTerminal(40, 12);
+		const writes: string[] = [];
+		const realWrite = term.write.bind(term);
+		vi.spyOn(term, "write").mockImplementation((data: string) => {
+			writes.push(data);
+			realWrite(data);
+		});
+
+		const tui = new TUI(term);
+		const firstId = tui.imageBudget.acquireId("first");
+		const secondId = tui.imageBudget.acquireId("second");
+		tui.addChild(makeImage(tui.imageBudget, "first"));
+		tui.addChild(makeImage(tui.imageBudget, "second"));
+
+		try {
+			tui.start();
+			await settle(term);
+			writes.length = 0;
+
+			tui.clearInlineImages();
+
+			const output = writes.join("");
+			expect(output).toContain(encodeKittyDeleteImage(firstId));
+			expect(output).toContain(encodeKittyDeleteImage(secondId));
+			expect(tui.imageBudget.shouldTransmit(firstId)).toBe(true);
+			expect([...tui.imageBudget.takeAllTransmittedIds()]).toEqual([]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("lets a full-width non-fullscreen overlay replace Unicode image placeholder rows", async () => {
+		const originalGraphics = { ...getKittyGraphics() };
+		const term = new VirtualTerminal(40, 12);
+		const writes: string[] = [];
+		const realWrite = term.write.bind(term);
+		vi.spyOn(term, "write").mockImplementation((data: string) => {
+			writes.push(data);
+			realWrite(data);
+		});
+
+		setKittyGraphics({ unicodePlaceholders: true });
+		const tui = new TUI(term);
+		tui.addChild(makeImage(tui.imageBudget, "behind-modal"));
+		try {
+			tui.start();
+			await settle(term);
+			writes.length = 0;
+
+			const overlay = tui.showOverlay(new Text("MODEL SELECTOR\nMODEL ROW 2\nMODEL ROW 3\nMODEL ROW 4", 0, 0), {
+				anchor: "top-left",
+				width: "100%",
+				maxHeight: "100%",
+			});
+			await settle(term);
+
+			const modalOutput = writes.join("");
+			expect(modalOutput).not.toContain("\x1b[?1049h");
+			const modalViewport = term.getViewport().join("\n");
+			expect(modalViewport).toContain("MODEL SELECTOR");
+			expect(modalViewport).not.toContain(KITTY_PLACEHOLDER);
+
+			writes.length = 0;
+			overlay.hide();
+			await settle(term);
+
+			expect(term.getViewport().join("\n")).toContain(KITTY_PLACEHOLDER);
+		} finally {
+			tui.stop();
+			setKittyGraphics(originalGraphics);
+		}
+	});
+
 	it("transmits image data only once; a later full redraw re-emits just the placement", async () => {
 		const term = new VirtualTerminal(40, 12);
 		const writes: string[] = [];
@@ -756,6 +830,71 @@ describe("TUI inline-image budget", () => {
 			const output = writes.join("");
 			expect(output).toContain("\x1b_Ga=t");
 			expect(output).toContain(BASE64_ONE_PIXEL_PNG);
+		} finally {
+			tui.stop();
+			terminal.id = originalId;
+			setKittyGraphics(originalGraphics);
+		}
+	});
+
+	it("keeps a deferred fullscreen exit until a Ghostty image repaint can emit it", () => {
+		const originalId = terminal.id;
+		const originalGraphics = { ...getKittyGraphics() };
+		const term = new VirtualTerminal(40, 12);
+		const writes: string[] = [];
+		const realWrite = term.write.bind(term);
+		vi.spyOn(term, "write").mockImplementation((data: string) => {
+			writes.push(data);
+			realWrite(data);
+		});
+		let now = 0;
+		const scheduled: Array<{ delayMs: number; callback: () => void; canceled: boolean }> = [];
+		const renderScheduler = {
+			now: () => now,
+			scheduleImmediate: (callback: () => void) => callback(),
+			scheduleRender: (callback: () => void, delayMs: number) => {
+				const entry = { delayMs, callback, canceled: false };
+				scheduled.push(entry);
+				return {
+					cancel: () => {
+						entry.canceled = true;
+					},
+				};
+			},
+		};
+
+		terminal.id = "ghostty";
+		terminal.imageProtocol = ImageProtocol.Kitty;
+		setKittyGraphics({ unicodePlaceholders: true });
+		const tui = new TUI(term, undefined, { renderScheduler });
+		tui.addChild(new Text("old session", 0, 0));
+
+		try {
+			tui.start();
+			const overlay = tui.showOverlay(new Text("session selector", 0, 0), {
+				width: "100%",
+				maxHeight: "100%",
+				fullscreen: true,
+			});
+			tui.addChild(makeImage(tui.imageBudget, "resumed-image"));
+			tui.requestRender(true, { clearScrollback: true });
+			overlay.hide();
+
+			const queued = scheduled.find(entry => !entry.canceled);
+			expect(queued).toBeDefined();
+			now = 40;
+			queued!.canceled = true;
+			queued!.callback();
+
+			const delayed = scheduled.find(entry => !entry.canceled);
+			expect(delayed).toBeDefined();
+			now = 100;
+			delayed!.canceled = true;
+			delayed!.callback();
+
+			const exitPaint = writes.find(write => write.includes("\x1b[?1049l"));
+			expect(exitPaint).toContain("\x1b[3J");
+			expect(exitPaint).toContain(BASE64_ONE_PIXEL_PNG);
 		} finally {
 			tui.stop();
 			terminal.id = originalId;

@@ -10,6 +10,7 @@
   Fork of <a href="https://github.com/can1357/oh-my-pi">oh-my-pi</a> (<code>omp</code>) by <a href="https://github.com/can1357">@can1357</a>, itself a fork of <a href="https://github.com/badlogic/pi-mono">Pi</a> by <a href="https://github.com/mariozechner">@mariozechner</a>.
 </p>
 
+
 ---
 
 > **This README only covers what this fork adds.** For the full picture — the 40+ providers, 32 built-in tools, LSP/DAP integration, hashline edits, subagents, collab, memory, and everything else that makes `omp` what it is — read the [upstream README](https://github.com/can1357/oh-my-pi#readme) and [omp.sh](https://omp.sh). Nothing below replaces that; it sits on top of it.

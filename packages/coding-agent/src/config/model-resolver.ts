@@ -466,7 +466,7 @@ export interface ModelMatchPreferences {
 }
 
 export type ModelLookupRegistry = Pick<ModelRegistry, "getAvailable">;
-type CliModelRegistry = Pick<ModelRegistry, "getAll">;
+type CliModelRegistry = Pick<ModelRegistry, "getAll" | "getAvailable">;
 type InitialModelRegistry = Pick<ModelRegistry, "getAvailable" | "find">;
 type RestorableModelRegistry = Pick<ModelRegistry, "getAvailable" | "find" | "getApiKey">;
 
@@ -623,11 +623,18 @@ function findExactModelReferenceMatch(modelReference: string, availableModels: M
  * 4. provider-scoped fuzzy match,
  * 5. substring match with the alias-vs-dated pick.
  * Returns the matched model or undefined if no match found.
+ *
+ * `exactOnly` stops after the exact phases (1-3), skipping the fuzzy/substring
+ * fallbacks (4-5). Callers use it to resolve the full selector exactly before
+ * a trailing `:<level>` thinking suffix is split off, so the suffix can never
+ * be fuzzily absorbed into a longer sibling id (e.g. `kimi-for-coding:high`
+ * must not match `kimi-for-coding-highspeed`).
  */
 function matchModel(
 	modelPattern: string,
 	availableModels: Model<Api>[],
 	context: ModelPreferenceContext,
+	options?: { exactOnly?: boolean },
 ): Model<Api> | undefined {
 	const exactRefMatch = findExactModelReferenceMatch(modelPattern, availableModels);
 	if (exactRefMatch) {
@@ -662,6 +669,14 @@ function matchModel(
 			const preferred = bareAlias ? aliasMatches.filter(m => bareAlias.providers.includes(m.provider)) : [];
 			return pickPreferredModel(preferred.length > 0 ? preferred : aliasMatches, context);
 		}
+	}
+
+	// Exact phases exhausted. Fuzzy/substring fallbacks (below) subsequence-match
+	// the whole pattern and would let a trailing `:<level>` thinking suffix bleed
+	// into a longer sibling id; callers that still hold an unstripped suffix ask
+	// for exact-only so the suffix is split off before any fuzzy attempt.
+	if (options?.exactOnly) {
+		return undefined;
 	}
 	// Check for provider/modelId format — fuzzy match within provider only.
 	const slashIndex = modelPattern.indexOf("/");
@@ -766,17 +781,32 @@ function parseModelPatternWithContext(
 	context: ModelPreferenceContext,
 	options?: { allowInvalidThinkingSelectorFallback?: boolean },
 ): ParsedModelResult {
-	// Try exact match first
-	const exactMatch = matchModel(pattern, availableModels, context);
+	// Exact match on the full pattern first (no fuzzy): a literal id that
+	const exactMatch = matchModel(pattern, availableModels, context, { exactOnly: true });
 	if (exactMatch) {
 		return { model: exactMatch, thinkingLevel: undefined, warning: undefined, explicitThinkingLevel: false };
 	}
 
-	// No match - try stripping a valid thinking suffix and recursing.
-	// `max` is accepted only after the full pattern failed, so literal model IDs
-	// ending in `:max` keep winning over the thinking suffix.
+	// Prefer a fuzzy match whose actual id ends in the suffix, preserving
+	// shorthand selectors for literal tier models such as `router:low`. Other
+	// fuzzy results (e.g. `kimi-for-coding-highspeed`) cannot absorb the suffix.
 	const { base, level } = splitThinkingSuffix(pattern, -1, MAX_THINKING_SUFFIX_OPTIONS);
 	if (level) {
+		const literalSuffixMatch = matchModel(pattern, availableModels, context);
+		if (literalSuffixMatch?.id.toLowerCase().endsWith(`:${level}`)) {
+			return {
+				model: literalSuffixMatch,
+				thinkingLevel: undefined,
+				warning: undefined,
+				explicitThinkingLevel: false,
+			};
+		}
+
+		// Strip a valid thinking suffix and recurse before accepting any other
+		// fuzzy match, so `:<level>` cannot be absorbed into a longer sibling
+		// id (e.g. `kimi-for-coding:high` must not match
+		// `kimi-for-coding-highspeed`). `max` is accepted only after the exact
+		// match above failed, so literal model IDs ending in `:max` keep winning.
 		const result = parseModelPatternWithContext(base, availableModels, context, options);
 		if (result.model) {
 			// Only use this thinking level if no warning from inner recursion
@@ -789,6 +819,13 @@ function parseModelPatternWithContext(
 			};
 		}
 		return result;
+	}
+
+	// No valid thinking suffix: fall back to fuzzy/substring matching on the
+	// whole pattern.
+	const fallbackMatch = matchModel(pattern, availableModels, context);
+	if (fallbackMatch) {
+		return { model: fallbackMatch, thinkingLevel: undefined, warning: undefined, explicitThinkingLevel: false };
 	}
 
 	const lastColonIndex = pattern.lastIndexOf(":");
@@ -859,6 +896,10 @@ export function parseModelPattern(
 const DEFAULT_MODEL_ROLE = "default";
 const MODEL_ROLE_ALIAS_PREFIXES = [MODEL_ROLE_ALIAS_PREFIX, LEGACY_MODEL_ROLE_ALIAS_PREFIX];
 
+export interface ModelRoleLookup {
+	getModelRole(role: ModelRole | string): string | undefined;
+}
+
 function isModelRole(role: string): role is ModelRole {
 	return (MODEL_ROLE_IDS as string[]).includes(role);
 }
@@ -875,7 +916,7 @@ function modelRoleAliasPrefixLength(value: string): number | undefined {
 	return MODEL_ROLE_ALIAS_PREFIXES.find(prefix => value.startsWith(prefix))?.length;
 }
 
-function getModelRoleAlias(value: string, settings?: Settings): string | undefined {
+function getModelRoleAlias(value: string, settings?: ModelRoleLookup): string | undefined {
 	const normalized = value.trim();
 	const prefixLength = modelRoleAliasPrefixLength(normalized);
 	if (prefixLength === undefined) return undefined;
@@ -931,7 +972,7 @@ function resolveDefaultInheritedPatterns(
 	role: ModelRole,
 	configuredDefault: string | undefined,
 	roleDefaults: string[],
-	settings: Settings | undefined,
+	settings: ModelRoleLookup | undefined,
 	visited: Set<string>,
 ): string[] {
 	if (!shouldInheritDefaultBeforePriority(role) || !configuredDefault) return [];
@@ -969,7 +1010,7 @@ function resolveDefaultInheritedPatterns(
 
 function resolveConfiguredRolePattern(
 	value: string,
-	settings?: Settings,
+	settings?: ModelRoleLookup,
 	visited: Set<string> = new Set(),
 ): string[] | undefined {
 	const normalized = value.trim();
@@ -1006,7 +1047,7 @@ function resolveConfiguredRolePattern(
 /**
  * Expand a role alias like "@smol" to the configured model string.
  */
-export function expandRoleAlias(value: string, settings?: Settings): string {
+export function expandRoleAlias(value: string, settings?: ModelRoleLookup): string {
 	const normalized = value.trim();
 	if (normalized === DEFAULT_MODEL_ROLE) {
 		return settings?.getModelRole("default") ?? value;
@@ -1016,7 +1057,10 @@ export function expandRoleAlias(value: string, settings?: Settings): string {
 	return resolved ?? value;
 }
 
-export function resolveConfiguredModelPatterns(value: string | string[] | undefined, settings?: Settings): string[] {
+export function resolveConfiguredModelPatterns(
+	value: string | string[] | undefined,
+	settings?: ModelRoleLookup,
+): string[] {
 	const patterns = normalizeModelPatternList(value);
 	return patterns.flatMap(pattern => {
 		const resolved = resolveConfiguredRolePattern(pattern, settings);
@@ -1055,6 +1099,37 @@ export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOp
 		activeModelPattern?.trim() || fallbackModelPattern?.trim() || settings?.getModelRole("default")?.trim() || "";
 	return resolveConfiguredModelPatterns(fallback, settings);
 }
+/** Default prewalk hand-off target when no explicit target is configured. */
+export const DEFAULT_PREWALK_TARGET = "@smol";
+
+export interface AgentPrewalkResolutionOptions {
+	/** `task.agentPrewalk` settings value for this agent: `"on"`, `"off"`, or a model pattern. */
+	settingsOverride?: string;
+	/** Agent definition `prewalk` frontmatter: `true` = default target, string = custom target pattern. */
+	agentPrewalk?: boolean | string;
+}
+
+/**
+ * Effective prewalk target pattern for a subagent, or `undefined` when prewalk
+ * is disabled. The settings override decides enablement first ("off" wins,
+ * "on" enables with the agent's own target or {@link DEFAULT_PREWALK_TARGET},
+ * any other value is a custom target pattern); otherwise the agent
+ * definition's `prewalk` field applies. Role aliases in the returned pattern
+ * are expanded later by {@link resolveModelOverride}.
+ */
+export function resolveAgentPrewalkPattern(options: AgentPrewalkResolutionOptions): string | undefined {
+	const agentPattern =
+		typeof options.agentPrewalk === "string" && options.agentPrewalk.trim() ? options.agentPrewalk.trim() : undefined;
+	const override = options.settingsOverride?.trim();
+	if (override) {
+		const lowered = override.toLowerCase();
+		if (lowered === "off" || lowered === "false") return undefined;
+		if (lowered === "on" || lowered === "true") return agentPattern ?? DEFAULT_PREWALK_TARGET;
+		return override;
+	}
+	if (options.agentPrewalk === true) return DEFAULT_PREWALK_TARGET;
+	return agentPattern;
+}
 
 /**
  * Resolve a model role value into a concrete model and thinking metadata.
@@ -1062,6 +1137,8 @@ export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOp
 export interface ResolvedModelRoleValue {
 	model: Model<Api> | undefined;
 	thinkingLevel?: ConfiguredThinkingLevel;
+	/** matchedPatternIndex identifies the first configured pattern that matched an available model. */
+	matchedPatternIndex?: number;
 	explicitThinkingLevel: boolean;
 	warning: string | undefined;
 }
@@ -1069,7 +1146,7 @@ export interface ResolvedModelRoleValue {
 export function resolveModelRoleValue(
 	roleValue: string | undefined,
 	availableModels: Model<Api>[],
-	options?: { settings?: Settings; matchPreferences?: ModelMatchPreferences },
+	options?: { settings?: Settings; roleLookup?: ModelRoleLookup; matchPreferences?: ModelMatchPreferences },
 ): ResolvedModelRoleValue {
 	if (!roleValue) {
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
@@ -1080,7 +1157,7 @@ export function resolveModelRoleValue(
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
 	}
 
-	const effectivePatterns = resolveConfiguredModelPatterns(normalized, options?.settings);
+	const effectivePatterns = resolveConfiguredModelPatterns(normalized, options?.roleLookup ?? options?.settings);
 	if (!effectivePatterns || effectivePatterns.length === 0) {
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
 	}
@@ -1091,11 +1168,12 @@ export function resolveModelRoleValue(
 	// models) once and reuse it across every fallback pattern instead of
 	// rebuilding it per pattern inside parseModelPattern.
 	const preferenceContext = buildPreferenceContext(availableModels, matchPreferences);
-	for (const effectivePattern of effectivePatterns) {
+	for (const [patternIndex, effectivePattern] of effectivePatterns.entries()) {
 		const resolved = matchPatternWithContext(effectivePattern, availableModels, preferenceContext);
 		if (resolved.model) {
 			return {
 				model: resolved.model,
+				matchedPatternIndex: patternIndex,
 				thinkingLevel: resolved.explicitThinkingLevel
 					? resolved.thinkingLevel === AUTO_THINKING
 						? AUTO_THINKING
@@ -1519,9 +1597,43 @@ export function filterAvailableModelsByEnabledPatterns(
 
 	return includeSyntheticAllowedModels(available, allowedModels);
 }
+function findExactCliModel(
+	selector: string,
+	allModels: Model<Api>[],
+	availableModels: Model<Api>[],
+	options?: { catalogFallback?: boolean },
+): Model<Api> | undefined {
+	// Explicit provider/id references stay authoritative against the full catalog.
+	const referenced = findExactModelReferenceMatch(selector, allModels);
+	if (referenced) return referenced;
+
+	// Flat-id (or full-selector-string) matches prefer authenticated providers,
+	// then fall back to catalog order. This covers aggregator-style flat ids
+	// that merely look provider-qualified (e.g. "openai/gpt-oss-120b" hosted on
+	// OpenRouter), where the provider/id decomposition above found nothing.
+	const lower = selector.toLowerCase();
+	const isFlatMatch = (model: Model<Api>) =>
+		model.id.toLowerCase() === lower || formatModelString(model).toLowerCase() === lower;
+	const preferred = availableModels.find(isFlatMatch);
+	if (preferred) return preferred;
+	// The unauthenticated catalog fallback is a weak match: a bare id like
+	// `default` collides with the bundled `cursor/default` model, which must not
+	// shadow a configured `modelRoles.default` role the user can actually run.
+	// Callers resolving a possible role name pass `catalogFallback: false` so the
+	// role gets a chance first; the deferred fuzzy fallback below still recovers
+	// the catalog id when no role matches.
+	if (options?.catalogFallback === false) return undefined;
+	return availableModels === allModels ? undefined : allModels.find(isFlatMatch);
+}
 
 export interface ResolveCliModelResult {
 	model: Model<Api> | undefined;
+	/** configuredPatterns contains the role's ordered primary candidates. */
+	configuredPatterns?: string[];
+	/** configuredRole identifies the role expanded into configuredPatterns. */
+	configuredRole?: string;
+	/** configuredPatternIndex identifies the configured role pattern that matched an available model. */
+	configuredPatternIndex?: number;
 	selector?: string;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	warning: string | undefined;
@@ -1530,22 +1642,29 @@ export interface ResolveCliModelResult {
 
 /**
  * Resolve a single model from CLI flags.
+ *
+ * Explicit `provider/id` references and authenticated bare ids take precedence
+ * over configured role names, which in turn take precedence over an
+ * unauthenticated catalog-only id (so a bundled `cursor/default` never shadows a
+ * configured `modelRoles.default`).
  */
 export function resolveCliModel(options: {
 	cliProvider?: string;
 	cliModel?: string;
 	modelRegistry: CliModelRegistry;
+	/** Authenticated models to prefer for unqualified selectors; defaults to the registry's authenticated set. */
+	availableModels?: Model<Api>[];
 	settings?: Settings;
 	preferences?: ModelMatchPreferences;
 }): ResolveCliModelResult {
-	const { cliProvider, cliModel, modelRegistry, settings, preferences } = options;
+	const { cliProvider, cliModel, modelRegistry, settings, preferences, availableModels: preferredModels } = options;
 
 	if (!cliModel) {
 		return { model: undefined, selector: undefined, warning: undefined, error: undefined };
 	}
 
-	const availableModels = modelRegistry.getAll();
-	if (availableModels.length === 0) {
+	const allModels = modelRegistry.getAll();
+	if (allModels.length === 0) {
 		return {
 			model: undefined,
 			selector: undefined,
@@ -1554,21 +1673,9 @@ export function resolveCliModel(options: {
 		};
 	}
 
-	if (!cliProvider && modelRoleAliasPrefixLength(cliModel) !== undefined) {
-		const resolved = resolveModelRoleValue(cliModel, availableModels, { settings, matchPreferences: preferences });
-		if (resolved.model) {
-			return {
-				model: resolved.model,
-				selector: formatModelString(resolved.model),
-				thinkingLevel: resolved.thinkingLevel,
-				warning: resolved.warning,
-				error: undefined,
-			};
-		}
-	}
-
+	const availableModels = preferredModels ?? modelRegistry.getAvailable();
 	const providerMap = new Map<string, string>();
-	for (const model of availableModels) {
+	for (const model of allModels) {
 		providerMap.set(model.provider.toLowerCase(), model.provider);
 	}
 
@@ -1584,19 +1691,7 @@ export function resolveCliModel(options: {
 
 	const trimmedModel = cliModel.trim();
 	if (!provider) {
-		const lower = trimmedModel.toLowerCase();
-		// When input has provider/id format (e.g. "zai/glm-5"), prefer decomposed
-		// provider+id match over flat id match. Without this, a model with id
-		// "zai/glm-5" on provider "vercel-ai-gateway" wins over provider "zai"
-		// with id "glm-5", because Array.find returns the first catalog hit.
-		let exact = findExactModelReferenceMatch(trimmedModel, availableModels);
-		if (!exact) {
-			// Flat exact id (or full selector) by catalog order: CLI resolution
-			// stays deterministic across runs regardless of usage-based ranking.
-			exact = availableModels.find(
-				model => model.id.toLowerCase() === lower || `${model.provider}/${model.id}`.toLowerCase() === lower,
-			);
-		}
+		const exact = findExactCliModel(trimmedModel, allModels, availableModels, { catalogFallback: false });
 		if (exact) {
 			return {
 				model: exact,
@@ -1605,6 +1700,79 @@ export function resolveCliModel(options: {
 				thinkingLevel: undefined,
 				error: undefined,
 			};
+		}
+		const { base: exactBase, level: exactThinkingLevel } = splitThinkingSuffix(
+			trimmedModel,
+			-1,
+			MAX_THINKING_SUFFIX_OPTIONS,
+		);
+		if (exactThinkingLevel) {
+			const exactSuffixed = findExactCliModel(exactBase, allModels, availableModels, { catalogFallback: false });
+			if (exactSuffixed) {
+				return {
+					model: exactSuffixed,
+					selector: formatModelString(exactSuffixed),
+					warning: undefined,
+					thinkingLevel: exactThinkingLevel,
+					error: undefined,
+				};
+			}
+		}
+	}
+	let configuredPatterns: string[] | undefined;
+	if (!cliProvider) {
+		const { base: bareRoleName, level: bareRoleThinkingLevel } = splitThinkingSuffix(
+			trimmedModel,
+			-1,
+			MAX_THINKING_SUFFIX_OPTIONS,
+		);
+		const roleSelector =
+			modelRoleAliasPrefixLength(trimmedModel) !== undefined
+				? trimmedModel
+				: settings?.getModelRole(bareRoleName) !== undefined
+					? `${formatModelRoleAlias(bareRoleName)}${bareRoleThinkingLevel ? `:${bareRoleThinkingLevel}` : ""}`
+					: undefined;
+		if (roleSelector) {
+			const { base: roleAlias } = splitThinkingSuffix(
+				roleSelector,
+				modelRoleAliasPrefixLength(roleSelector) ?? -1,
+				MAX_THINKING_SUFFIX_OPTIONS,
+			);
+			const configuredRole = getModelRoleAlias(roleAlias, settings);
+			configuredPatterns = resolveConfiguredModelPatterns([roleSelector], settings);
+			const availableResolved = resolveModelRoleValue(roleSelector, availableModels, {
+				settings,
+				matchPreferences: preferences,
+			});
+			const resolved = availableResolved.model
+				? availableResolved
+				: resolveModelRoleValue(roleSelector, allModels, {
+						settings,
+						matchPreferences: preferences,
+					});
+			if (resolved.model) {
+				return {
+					model: resolved.model,
+					selector: formatModelString(resolved.model),
+					configuredRole,
+					configuredPatterns,
+					configuredPatternIndex: resolved.matchedPatternIndex,
+					thinkingLevel: resolved.thinkingLevel,
+					warning: resolved.warning,
+					error: undefined,
+				};
+			}
+			if (configuredPatterns && configuredPatterns.length > 0) {
+				return {
+					model: undefined,
+					configuredPatterns,
+					configuredRole,
+					selector: undefined,
+					thinkingLevel: undefined,
+					warning: resolved.warning,
+					error: `Model "${trimmedModel}" not found. Run "omp models" to see available models.`,
+				};
+			}
 		}
 	}
 
@@ -1628,7 +1796,7 @@ export function resolveCliModel(options: {
 	}
 
 	if (provider) {
-		const exactProviderMatch = resolveProviderModelReference(provider, pattern, availableModels);
+		const exactProviderMatch = resolveProviderModelReference(provider, pattern, allModels);
 		if (exactProviderMatch) {
 			return {
 				model: exactProviderMatch,
@@ -1640,15 +1808,22 @@ export function resolveCliModel(options: {
 		}
 	}
 
-	const candidates = provider ? availableModels.filter(model => model.provider === provider) : availableModels;
-	const { model, thinkingLevel, warning, upstream } = parseModelPattern(pattern, candidates, preferences, {
+	const candidates = provider ? allModels.filter(model => model.provider === provider) : availableModels;
+	let parsed = parseModelPattern(pattern, candidates, preferences, {
 		allowInvalidThinkingSelectorFallback: false,
 	});
+	if (!parsed.model && !provider) {
+		parsed = parseModelPattern(pattern, allModels, preferences, {
+			allowInvalidThinkingSelectorFallback: false,
+		});
+	}
+	const { model, thinkingLevel, warning, upstream } = parsed;
 
 	if (!model) {
 		const display = provider ? `${provider}/${pattern}` : cliModel;
 		return {
 			model: undefined,
+			configuredPatterns,
 			selector: undefined,
 			thinkingLevel: undefined,
 			warning,

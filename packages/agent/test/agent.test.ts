@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { Agent, type AgentEvent, type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { type SimpleStreamOptions, z } from "@oh-my-pi/pi-ai";
+import { type SimpleStreamOptions, type ToolResultMessage, z } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { createAssistantMessage } from "./helpers";
 
@@ -184,7 +185,7 @@ describe("Agent", () => {
 		expect(lastMessage.errorMessage).toBe(errorText);
 	});
 
-	it("prompt() keeps unrelated provider stream failures out of the assistant lifecycle", async () => {
+	it("prompt() emits assistant error lifecycle for provider stream failures", async () => {
 		const mock = createMockModel({ responses: [] });
 		const errorText = "connection reset";
 		const agent = new Agent({
@@ -201,17 +202,360 @@ describe("Agent", () => {
 		await agent.prompt("trigger");
 		unsubscribe();
 
-		expect(events.some(event => event.type === "message_start" && event.message.role === "assistant")).toBe(false);
-		expect(events.some(event => event.type === "message_end" && event.message.role === "assistant")).toBe(false);
-		const agentEnd = events.find(event => event.type === "agent_end");
-		if (agentEnd?.type !== "agent_end") {
-			throw new Error("agent_end not emitted");
+		const assistantStartIndex = events.findIndex(
+			event => event.type === "message_start" && event.message.role === "assistant",
+		);
+		const assistantEndIndex = events.findIndex(
+			event => event.type === "message_end" && event.message.role === "assistant",
+		);
+		const turnEndIndex = events.findIndex(event => event.type === "turn_end");
+		const agentEndIndex = events.findIndex(event => event.type === "agent_end");
+		expect(assistantStartIndex).toBeGreaterThan(-1);
+		expect(assistantEndIndex).toBeGreaterThan(assistantStartIndex);
+		expect(turnEndIndex).toBeGreaterThan(assistantEndIndex);
+		expect(agentEndIndex).toBeGreaterThan(turnEndIndex);
+
+		const assistantEnd = events[assistantEndIndex];
+		if (assistantEnd?.type !== "message_end" || assistantEnd.message.role !== "assistant") {
+			throw new Error("assistant message_end not emitted");
 		}
-		const errorMessage = agentEnd.messages.find(message => message.role === "assistant");
-		if (errorMessage?.role !== "assistant") {
-			throw new Error("assistant error was not included in agent_end");
-		}
-		expect(errorMessage.errorMessage).toBe(errorText);
+		expect(assistantEnd.message.stopReason).toBe("error");
+		expect(assistantEnd.message.errorMessage).toBe(errorText);
+	});
+
+	it("pairs tool calls from failed partial streams with synthetic tool results", async () => {
+		const mock = createMockModel({ responses: [] });
+		const errorText = "connection reset after tool call";
+		const toolCall = { type: "toolCall" as const, id: "tool-1", name: "alpha", arguments: { value: "hello" } };
+		const started = createAssistantMessage([toolCall]);
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: started });
+					stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: started });
+					stream.fail(new Error(errorText));
+				});
+				return stream;
+			},
+		});
+		const events: AgentEvent[] = [];
+		const unsubscribe = agent.subscribe(event => events.push(event));
+
+		await agent.prompt("trigger");
+		unsubscribe();
+
+		const toolResult = agent.state.messages.find(message => message.role === "toolResult");
+		expect(toolResult).toMatchObject({
+			role: "toolResult",
+			toolCallId: "tool-1",
+			toolName: "alpha",
+			isError: true,
+			details: {
+				__synthetic: true,
+				source: "assistant_stop_error",
+				executed: false,
+				upstreamError: errorText,
+			},
+		});
+
+		const turnEnd = events.find(event => event.type === "turn_end");
+		expect(turnEnd).toMatchObject({
+			type: "turn_end",
+			toolResults: [{ role: "toolResult", toolCallId: "tool-1", isError: true }],
+		});
+	});
+
+	it("drops incomplete tool calls when a partial stream fails before toolcall_end", async () => {
+		const mock = createMockModel({ responses: [] });
+		const started = createAssistantMessage([{ type: "toolCall", id: "tool-1", name: "alpha", arguments: {} }]);
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: started });
+					stream.push({ type: "toolcall_start", contentIndex: 0, partial: started });
+					stream.push({ type: "toolcall_delta", contentIndex: 0, delta: '{"value":', partial: started });
+					stream.fail(new Error("connection reset during tool arguments"));
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("trigger");
+
+		const assistant = agent.state.messages.find(message => message.role === "assistant");
+		expect(assistant?.content.some(block => block.type === "toolCall")).toBe(false);
+		expect(agent.state.messages.some(message => message.role === "toolResult")).toBe(false);
+	});
+
+	it("preserves buffered Cursor results when a partial stream fails", async () => {
+		const mock = createMockModel({ responses: [] });
+		const errorText = "connection reset after Cursor exec";
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "cursor-tool-1",
+			name: "shell",
+			arguments: { command: "pwd" },
+			[kCursorExecResolved]: true,
+		};
+		const started = createAssistantMessage([toolCall]);
+		const realToolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "/workspace" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			cursorOnToolResult: message => message,
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(async () => {
+					await options?.cursorOnToolResult?.(realToolResult);
+					stream.push({ type: "start", partial: started });
+					stream.fail(new Error(errorText));
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("trigger");
+
+		const toolResults = agent.state.messages.filter(message => message.role === "toolResult");
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "/workspace" }],
+			isError: false,
+		});
+	});
+
+	it("persists the transformed payload when the stream fails mid-transform", async () => {
+		// The error drain snapshots the Cursor buffer just like the normal one, so
+		// it needs the same await: a transformer still in flight when the provider
+		// errors would otherwise patch an entry this path already detached, and
+		// the original payload is persisted instead. A provider error is exactly
+		// when a transform is most likely to be mid-flight.
+		const mock = createMockModel({ responses: [] });
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "cursor-tool-err",
+			name: "shell",
+			arguments: { command: "pwd" },
+			[kCursorExecResolved]: true,
+		};
+		const started = createAssistantMessage([toolCall]);
+		const realToolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "original" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		// Held across the failure so the transform is guaranteed to still be
+		// pending when the catch path runs.
+		const gate = Promise.withResolvers<void>();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			cursorOnToolResult: async message => {
+				await gate.promise;
+				return { ...message, content: [{ type: "text" as const, text: "transformed" }] };
+			},
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					// Fire-and-forget, exactly like the provider's data loop.
+					void options?.cursorOnToolResult?.(realToolResult);
+					stream.push({ type: "start", partial: started });
+					stream.fail(new Error("connection reset mid-transform"));
+				});
+				return stream;
+			},
+		});
+
+		const turn = agent.prompt("trigger");
+		await Bun.sleep(0);
+		gate.resolve();
+		await turn;
+
+		const toolResults = agent.state.messages.filter(message => message.role === "toolResult");
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({
+			toolCallId: toolCall.id,
+			content: [{ type: "text", text: "transformed" }],
+		});
+	});
+
+	it("buffers a Cursor result even with neither exec handlers nor a transformer", async () => {
+		// Both options are optional, but the Cursor provider resolves its native
+		// tools server-side regardless and marks those blocks
+		// `kCursorExecResolved`, so `agent-loop.ts` emits no placeholder for them.
+		// Without a result sink the provider's own fallback result is dropped and
+		// the assistant block is left unpaired — `buildSessionContext` then strips
+		// the whole interaction on replay.
+		const mock = createMockModel({ responses: [] });
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "cursor-tool-bare",
+			name: "todo",
+			arguments: { todos: [] },
+			[kCursorExecResolved]: true,
+		};
+		const started = createAssistantMessage([toolCall]);
+		const realToolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "Todo snapshot not mirrored" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		// No `cursorExecHandlers`, no `cursorOnToolResult` — a bare SDK host.
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					void options?.cursorOnToolResult?.(realToolResult);
+					stream.push({ type: "start", partial: started });
+					stream.push({ type: "done", reason: "stop", message: started });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("trigger");
+
+		const toolResults = agent.state.messages.filter(message => message.role === "toolResult");
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({ toolCallId: toolCall.id, toolName: toolCall.name });
+	});
+
+	it("keeps the reserved result when the transformer rejects", async () => {
+		// `cursorOnToolResult` is a supported option returning a Promise, and the
+		// provider dispatches decoded messages with `void handleServerMessage(...)`.
+		// The drain awaits a pending transformer, so a REJECTING one must not
+		// take the turn down with it or cost the result: an unbuffered toolResult
+		// leaves its toolCall block unpaired and the transcript rebuild strips it
+		// as dangling. The reserved (pre-transform) payload stands in.
+		const mock = createMockModel({ responses: [] });
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "cursor-tool-slow",
+			name: "shell",
+			arguments: { command: "pwd" },
+			[kCursorExecResolved]: true,
+		};
+		const started = createAssistantMessage([toolCall]);
+		const realToolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "/workspace" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			cursorOnToolResult: async () => {
+				throw new Error("transformer blew up");
+			},
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					// Fire-and-forget, exactly like the provider's data loop.
+					void options?.cursorOnToolResult?.(realToolResult);
+					stream.push({ type: "start", partial: started });
+					stream.push({ type: "done", reason: "stop", message: started });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("trigger");
+
+		const toolResults = agent.state.messages.filter(message => message.role === "toolResult");
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "/workspace" }],
+		});
+	});
+
+	it("persists the transformed payload when the transformer resolves after message_end", async () => {
+		// The transformer is awaited by the provider's fire-and-forget dispatch,
+		// so `message_end` decoded from the same chunk can reach the drain while
+		// it is still pending. Buffering the call is not enough: a transformer
+		// that actually rewrites the result must have that rewrite persisted,
+		// exactly like the awaited exec-channel paths. Otherwise the customized
+		// payload is silently replaced by the original in this timing window.
+		const mock = createMockModel({ responses: [] });
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "cursor-tool-late",
+			name: "shell",
+			arguments: { command: "pwd" },
+			[kCursorExecResolved]: true,
+		};
+		const started = createAssistantMessage([toolCall]);
+		const realToolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "original" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		// Deterministic race, no wall-clock delay. The transformer blocks on a
+		// gate this test holds open across the whole stream, so it is guaranteed
+		// to still be unresolved when `message_end` reaches the drain. The gate
+		// is released only after `prompt()` has been started and has had a chance
+		// to run to the drain — a drain that does not await the transformer will
+		// already have persisted the original payload by then.
+		//
+		// Gating on the `message_end` event instead would deadlock: that event is
+		// emitted from inside the drain that now waits on this promise.
+		const gate = Promise.withResolvers<void>();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			cursorOnToolResult: async message => {
+				await gate.promise;
+				return { ...message, content: [{ type: "text" as const, text: "transformed" }] };
+			},
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					// Fire-and-forget, exactly like the provider's data loop: the
+					// transformer is still pending when the stream closes below.
+					void options?.cursorOnToolResult?.(realToolResult);
+					stream.push({ type: "start", partial: started });
+					stream.push({ type: "done", reason: "stop", message: started });
+				});
+				return stream;
+			},
+		});
+
+		const turn = agent.prompt("trigger");
+		// Let the stream drain as far as it can while the transformer is blocked.
+		// An unawaited drain finishes the turn here, with the original payload.
+		for (let i = 0; i < 50; i++) await Promise.resolve();
+		gate.resolve();
+		await turn;
+
+		const toolResults = agent.state.messages.filter(message => message.role === "toolResult");
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({
+			toolCallId: toolCall.id,
+			content: [{ type: "text", text: "transformed" }],
+		});
 	});
 
 	it("prompt() finalizes an existing assistant stream for Anthropic output-blocked stream errors", async () => {

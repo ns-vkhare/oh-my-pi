@@ -13,6 +13,7 @@ import type {
 	AgentToolUpdateCallback,
 	ThinkingLevel,
 	ToolApproval,
+	ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
@@ -24,6 +25,9 @@ import type {
 	Model,
 	ModelSpec,
 	ProviderResponseMetadata,
+	ServiceTier,
+	ServiceTierByFamily,
+	ServiceTierFamily,
 	SimpleStreamOptions,
 	Static,
 	TextContent,
@@ -439,6 +443,24 @@ export interface ExtensionContext {
 	getSystemPrompt(): string[];
 	/** Structured memory runtime for status/search/save across the configured backend. */
 	memory?: MemoryRuntimeContext;
+	/**
+	 * Schedule a repeating callback whose throws are contained. Unlike raw
+	 * `setInterval`, a synchronous throw or rejected promise from `callback` is
+	 * logged and surfaced through the extension error channel instead of
+	 * escaping as a process-fatal `uncaughtException` — one misbehaving timer
+	 * can no longer take down the whole session. The handle is `unref`'d and
+	 * cleared automatically on `session_shutdown`. Prefer this over raw
+	 * `setInterval` for any extension background work.
+	 */
+	setInterval(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
+	/**
+	 * Schedule a one-shot callback whose throws are contained, mirroring
+	 * {@link setInterval}. Cleared automatically on `session_shutdown` if it has
+	 * not yet fired.
+	 */
+	setTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
+	/** Clear a timer scheduled via {@link setInterval} or {@link setTimeout}. */
+	clearTimer(timer: Timer): void;
 }
 
 /**
@@ -517,11 +539,16 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	/** If true, tool is registered but not auto-included in the initial active set.
 	 *  The registering extension is responsible for activating/deactivating it via setActiveTools(). */
 	defaultInactive?: boolean;
+	/** How this tool is presented when enabled. See {@link ToolLoadMode}. Extension tools default to `"discoverable"`; set `"essential"` to stay top-level. */
+	loadMode?: ToolLoadMode;
 	/** If true, tool may stage deferred changes that require explicit resolve/discard. */
 	deferrable?: boolean;
 	/** Tool approval tier. Defaults to `"exec"` when omitted.
 	 *  `"read"`: read-only operations. `"write"`: mutations. `"exec"`: code execution. */
 	approval?: ToolApproval;
+	/** Structured-output strict grammar opt-in/out. `false` is meaningful: OpenAI-family
+	 *  serializers preserve an explicit `strict: false` on the wire (#4336/#4340). */
+	strict?: boolean;
 	/** MCP server name for discovery/search metadata when this tool fronts an MCP server. */
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
@@ -1017,8 +1044,14 @@ export interface RegisteredCommand {
 // ============================================================================
 
 /** Handler function type for events */
-// biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements
 export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
+
+/** Service tiers accepted by each provider family. */
+export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family extends "anthropic"
+	? "priority"
+	: Family extends "google"
+		? "flex" | "priority"
+		: ServiceTier;
 
 /**
  * ExtensionAPI passed to extension factory functions.
@@ -1206,6 +1239,18 @@ export interface ExtensionAPI {
 	/** Set thinking level for the current session. */
 	setThinkingLevel(level: ThinkingLevel): void;
 
+	/** Get a snapshot of the current session's per-family service tiers. */
+	getServiceTiers(): Readonly<ServiceTierByFamily>;
+
+	/**
+	 * Set one provider family's service tier for subsequent requests, or clear
+	 * its session override with `undefined`.
+	 */
+	setServiceTier<Family extends ServiceTierFamily>(
+		family: Family,
+		tier: ExtensionServiceTier<Family> | undefined,
+	): void;
+
 	/** Get the current session name. */
 	getSessionName(): string | undefined;
 
@@ -1385,6 +1430,10 @@ export type GetThinkingLevelHandler = () => ThinkingLevel | undefined;
 
 export type SetThinkingLevelHandler = (level: ThinkingLevel, persist?: boolean) => void;
 
+export type GetServiceTiersHandler = () => ServiceTierByFamily;
+
+export type SetServiceTierHandler = (family: ServiceTierFamily, tier: ServiceTier | undefined) => void;
+
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
@@ -1405,6 +1454,8 @@ export interface ExtensionActions {
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
+	getServiceTiers?: GetServiceTiersHandler;
+	setServiceTier?: SetServiceTierHandler;
 	getSessionName: () => string | undefined;
 	setSessionName: (name: string) => Promise<void>;
 }
@@ -1436,8 +1487,11 @@ export interface ExtensionCommandContextActions {
 	reload: () => Promise<void>;
 }
 
-/** Full runtime = state + actions. */
-export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
+/** Full runtime = state + actions, including host-compatible service-tier fallbacks. */
+export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {
+	getServiceTiers: GetServiceTiersHandler;
+	setServiceTier: SetServiceTierHandler;
+}
 
 /** Loaded extension with all registered items. */
 export interface Extension {

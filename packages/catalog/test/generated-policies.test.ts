@@ -86,6 +86,39 @@ describe("generated model policies", () => {
 		expect(models[3]?.priority).toBe(1);
 	});
 
+	it("pins GPT-5.6 Codex-transport context window to the 372K hard capacity (#5705)", () => {
+		const models: ModelSpec<Api>[] = [
+			// Codex discovery underreports these via DEFAULT_CONTEXT_WINDOW=272000.
+			createSpec({
+				id: "gpt-5.6-luna",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				contextWindow: 272000,
+			}),
+			createSpec({
+				id: "gpt-5.6-sol",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				contextWindow: 272000,
+			}),
+			createSpec({
+				id: "gpt-5.6-terra",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				contextWindow: 272000,
+			}),
+			// The first-party API-key entry uses openai-responses and is untouched.
+			createSpec({ id: "gpt-5.6-sol", api: "openai-responses", provider: "openai", contextWindow: 1050000 }),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.contextWindow).toBe(372000);
+		expect(models[1]?.contextWindow).toBe(372000);
+		expect(models[2]?.contextWindow).toBe(372000);
+		expect(models[3]?.contextWindow).toBe(1050000);
+	});
+
 	it("pins Claude Mythos 5 first-party Anthropic catalog metadata", () => {
 		const models: ModelSpec<Api>[] = [
 			createSpec({
@@ -104,6 +137,29 @@ describe("generated model policies", () => {
 			mode: "anthropic-adaptive",
 			efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
 			supportsDisplay: true,
+		});
+	});
+
+	it("preserves QwenCloud's mandatory qwen3.8 effort ladder", () => {
+		const models: ModelSpec<Api>[] = [
+			createSpec({
+				id: "qwen3.8-max-preview",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				thinking: {
+					mode: "effort",
+					efforts: [Effort.Low, Effort.High, Effort.XHigh],
+					requiresEffort: true,
+				},
+			}),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.Low, Effort.High, Effort.XHigh],
+			requiresEffort: true,
 		});
 	});
 

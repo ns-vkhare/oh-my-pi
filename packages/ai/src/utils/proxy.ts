@@ -61,7 +61,7 @@ export function shouldBypassProxy(urlObj: URL): boolean {
 		.map(r => r.trim())
 		.filter(Boolean);
 	const targetHost = urlObj.hostname.toLowerCase();
-	const targetPort = urlObj.port || (urlObj.protocol === "https:" ? "443" : "80");
+	const targetPort = urlObj.port || (urlObj.protocol === "https:" || urlObj.protocol === "wss:" ? "443" : "80");
 
 	for (const rule of rules) {
 		if (rule === "*") {
@@ -127,6 +127,16 @@ export function getProxyForProvider(provider: string): string | undefined {
 	const value = Bun.env[envKey] || Bun.env.PI_PROXY;
 	proxyCache.set(provider, value);
 	return value;
+}
+
+/** Resolves provider-specific and standard proxy variables for a target URL, honoring NO_PROXY. */
+export function getProxyForUrl(provider: string, url: URL): string | undefined {
+	if (shouldBypassProxy(url)) return undefined;
+	const protocolProxy =
+		url.protocol === "https:" || url.protocol === "wss:"
+			? Bun.env.HTTPS_PROXY || Bun.env.https_proxy
+			: Bun.env.HTTP_PROXY || Bun.env.http_proxy;
+	return getProxyForProvider(provider) || protocolProxy || Bun.env.ALL_PROXY || Bun.env.all_proxy || undefined;
 }
 
 /**

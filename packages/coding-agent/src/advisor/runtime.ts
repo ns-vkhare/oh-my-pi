@@ -1,9 +1,16 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
+import { type CursorExecResolvedCarrier, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { logger } from "@oh-my-pi/pi-utils";
 import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
-import { formatSessionHistoryMarkdown, PRIMARY_CONTEXT_CUSTOM_TYPES } from "../session/session-history-format";
+import {
+	formatExecutionSourcePreview,
+	formatSessionHistoryMarkdown,
+	formatToolResultErrorPreview,
+	PRIMARY_CONTEXT_CUSTOM_TYPES,
+} from "../session/session-history-format";
 
 /**
  * Minimal slice of `Agent` the runtime drives — satisfied by pi-agent-core
@@ -35,10 +42,10 @@ export interface AdvisorRuntimeHost {
 	 * Pre-prompt context maintenance for the advisor's own append-only context.
 	 * Promotes the advisor model to a larger sibling when its context nears the
 	 * window (mirroring the primary's promote-first policy) and resolves `true`
-	 * when the advisor should re-prime — reset and replay the current
-	 * primary-bounded transcript — because promotion did not free enough room.
-	 * Optional: hosts that omit it get no maintenance (context only shrinks when
-	 * the primary's next compaction triggers {@link AdvisorRuntime.reset}).
+	 * when the advisor must clear its own context before sending the current
+	 * incremental update. The cursor stays at the current primary position: this
+	 * recovery path must never replay the full primary transcript.
+	 * Optional: hosts that omit it get no proactive maintenance.
 	 */
 	maintainContext?(incomingTokens: number): Promise<boolean>;
 	/**
@@ -51,16 +58,36 @@ export interface AdvisorRuntimeHost {
 	/**
 	 * Called with the error of every failed advisor turn, before the retry sleep
 	 * or the dropped-after-3 path. Lets the host apply credential-level remedies
-	 * the advisor loop lacks: the in-stream a/b/c auth retry rotates through
-	 * sibling credentials within one request but never blocks the LAST failing
-	 * one — the primary agent's retry pipeline does that via
-	 * `markUsageLimitReached`, so without this hook the advisor re-picks the
-	 * same usage-limited account on every retry. Errors thrown here are logged
-	 * and swallowed.
+	 * and configured model fallback that the advisor loop cannot perform itself.
+	 * Return `true` after switching models so the same clean batch is retried
+	 * immediately with a fresh failure budget. `failedMessages` contains the
+	 * failed prompt's appended turns before rollback. Errors thrown here are
+	 * logged and swallowed.
 	 */
-	onTurnError?(error: unknown): Promise<void> | void;
+	onTurnError?(
+		error: unknown,
+		failedMessages: readonly AgentMessage[],
+	): Promise<boolean | undefined> | boolean | undefined;
+	/** Called after a successful advisor turn so the host can finish fallback lifecycle reporting. */
+	onTurnSuccess?(): Promise<void> | void;
 	/** Surface a non-recovering advisor failure to the host UI without adding model-visible context. */
 	notifyFailure?(error: unknown): void;
+	/** Signal that the advisor paused on a quota/rate-limit after host-level
+	 *  recovery (credential switch, fallback chain) declined. Cleared only by
+	 *  an explicit reset (`/new`, config rebuild, session restart). */
+	notifyQuotaExhausted?(): void;
+}
+
+/**
+ * A request rejection that no amount of retrying can fix for this advisor
+ * configuration: the provider refuses the model/request shape outright (e.g.
+ * "The 'gpt-5.3-codex-spark' model is not supported when using Codex with a
+ * ChatGPT account", code=invalid_request_error). Distinct from quota errors,
+ * which pause via the dedicated quota path and auto-resume on reset.
+ */
+function isPermanentAdvisorError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /invalid_request_error|model[_ ]not[_ ]found|is not supported when|does not exist/i.test(message);
 }
 
 const ADVISOR_QUARANTINE_PREFIX = "Advisor response quarantined";
@@ -108,7 +135,20 @@ export function quarantineAdvisorUnsafeOutput(
 	const unavailableToolNames = new Set<string>();
 	const generatedParts: string[] = [];
 	for (const block of message.content) {
-		if (block.type === "toolCall" && !availableToolNames.has(block.name)) unavailableToolNames.add(block.name);
+		// Cursor exec-channel native blocks (bash/read/grep/...) are stamped
+		// kCursorExecResolved: they already ran server-side through the
+		// advisor-scoped CursorExecHandlers bridge, which rejects ungranted
+		// tools in-band ("Tool not available") and lets the model self-correct.
+		// Quarantining them would discard the legitimate advise emitted in the
+		// same turn (issue #5900). The scoped bridge is the grant gate here, not
+		// this pre-dispatch check.
+		if (
+			block.type === "toolCall" &&
+			!availableToolNames.has(block.name) &&
+			(block as CursorExecResolvedCarrier)[kCursorExecResolved] !== true
+		) {
+			unavailableToolNames.add(block.name);
+		}
 		if (block.type === "toolCall" && block.name === "advise" && typeof block.arguments.note === "string") {
 			generatedParts.push(block.arguments.note);
 		}
@@ -178,33 +218,92 @@ export function buildAdvisorQuarantineSourceText(currentInput: string, messages:
  */
 const MAX_COALESCE_ROUNDS = 3;
 
+/**
+ * Consecutive quarantined advisor turns tolerated before the failure is surfaced
+ * to the host UI. A quarantine discards the advisor's whole turn before dispatch,
+ * so its advice never reaches the primary; one silent re-prime is allowed to
+ * recover a one-off hallucination, but a persistent quarantine loop is a real
+ * supervision gap the user must see (issue #6661). Reset on any successful turn.
+ */
+const MAX_QUARANTINE_RETRIES = 2;
+
+const ADVISOR_RENDER_OPTIONS = {
+	includeThinking: true,
+	includeToolIntent: true,
+	watchedRoles: true,
+	expandPrimaryContext: true,
+	expandEditDiffs: true,
+} as const;
+
 interface PendingDelta {
 	text: string;
+	rawMessages: AgentMessage[];
+	renderRevision: number;
 	turns: number;
 	/** Whether the primary was mid-turn (willContinue:true) when this delta was rendered. */
 	wip: boolean;
+	overflowRecovery?: boolean;
 }
 
 interface CatchupWaiter {
 	threshold: number;
-	resolve: () => void;
-	finish: () => void;
+	finish: (caughtUp: boolean) => void;
 	timer?: NodeJS.Timeout;
+}
+
+interface DeliveredMessage {
+	message: AgentMessage;
+	fingerprint: bigint | undefined;
+}
+
+function fingerprintMessage(message: AgentMessage): bigint | undefined {
+	try {
+		const serialized = JSON.stringify(message);
+		if (serialized === undefined) return undefined;
+		return Bun.hash.wyhash(serialized);
+	} catch {
+		return undefined;
+	}
 }
 
 export class AdvisorRuntime {
 	#lastCount = 0;
+	/**
+	 * Delivered prefix identities. References make the normal append-only path
+	 * allocation-free; fingerprints preserve identity across equivalent clones.
+	 */
+	#deliveredPrefix: DeliveredMessage[] = [];
 	/** Last-shown body, keyed by primary-context customType (plan/goal mode rules,
 	 *  approved plan). These prompts are re-injected verbatim every primary turn;
 	 *  this lets {@link #renderDelta} collapse an unchanged copy to a one-line
 	 *  marker so the advisor isn't re-fed the full ~1k-token rules each turn.
 	 *  Cleared on every re-prime/seed and when a failed batch is dropped. */
 	#seenContext = new Map<string, string>();
+	/** Incremented whenever the advisor loses context so queued raw deltas are re-rendered against fresh dedupe state. */
+	#renderRevision = 0;
+	/** Regex secret values observed in primary deltas and retained until advisor context resets. */
+	#advisorRegexSecretValues = new Set<string>();
 	#pending: PendingDelta[] = [];
 	#busy = false;
 	#backlog = 0;
 	#consecutiveFailures = 0;
 	#failureNotified = false;
+	/** Consecutive quarantined turns since the last success/reset (issue #6661). */
+	#consecutiveQuarantines = 0;
+	/** Completed 3-failure backlog-drop cycles since the last success/reset. */
+	#droppedBacklogs = 0;
+	/**
+	 * Hard stop after repeated drop cycles or a permanent request rejection
+	 * (e.g. "model not supported"): without it the advisor re-attempts on every
+	 * new delta forever, and in a shared daemon that unbounded churn burns CPU
+	 * and starves every hosted session's event loop. Cleared only by an
+	 * explicit {@link reset} (config rebuild, /new, session restart).
+	 */
+	#halted = false;
+	/** True from the moment an advisor turn fails until one succeeds (or an
+	 *  explicit reset/seed). While set, {@link waitForCatchup} resolves
+	 *  immediately: the primary agent NEVER parks on a failing advisor. */
+	#failing = false;
 	#latestMessages?: AgentMessage[];
 	#waiters: CatchupWaiter[] = [];
 	/** Bumped by every external {@link reset}/{@link dispose}. A drain iteration
@@ -213,6 +312,13 @@ export class AdvisorRuntime {
 	 *  being retried/requeued into the post-reset conversation. */
 	#epoch = 0;
 	disposed = false;
+	/** Quota/rate-limit pause state. When `true`, the advisor stops processing
+	 *  turns and drops new deltas until an explicit {@link reset} clears it
+	 *  (triggered by `/new`, config rebuild, or session restart). There is no
+	 *  timer-based auto-resume: provider quota windows (5h/7d) are far longer
+	 *  than any reasonable timer, and premature retries waste calls and
+	 *  re-trigger the same error. */
+	#quotaExhausted = false;
 
 	constructor(
 		private readonly agent: AdvisorAgent,
@@ -223,17 +329,15 @@ export class AdvisorRuntime {
 	get backlog(): number {
 		return this.#backlog;
 	}
-
-	/**
-	 * True when `#pending` is non-empty while the drain loop is busy — i.e., newer
-	 * primary turns arrived after the current batch's transcript window was fixed
-	 * but before the advisor model finished processing it. The delivery path uses
-	 * this to annotate advice that was generated without seeing those newer turns.
-	 * Can be true during `agent.prompt()`, a `maintainContext` await, or a retry
-	 * sleep — any time `#drain` is busy and a concurrent `onTurnEnd` pushed.
-	 */
-	get hasFreshBacklog(): boolean {
-		return this.#pending.length > 0;
+	get quotaExhausted(): boolean {
+		return this.#quotaExhausted;
+	}
+	get failureNotified(): boolean {
+		return this.#failureNotified;
+	}
+	/** True after the runtime hard-stopped on repeated or permanent failures. */
+	get halted(): boolean {
+		return this.#halted;
 	}
 
 	/**
@@ -247,35 +351,78 @@ export class AdvisorRuntime {
 	 *   the delta and forwarded to the reprime path so it is never silently dropped.
 	 */
 	onTurnEnd(messages?: AgentMessage[], opts?: { willContinue?: boolean }): void {
-		if (this.disposed) return;
+		if (this.disposed || this.#quotaExhausted || this.#halted) return;
 		const all = messages ?? this.host.snapshotMessages();
 		this.#latestMessages = all;
 		const wip = opts?.willContinue ?? false;
-		const render = this.#renderDelta(all, wip);
-		if (render) {
-			this.#pending.push({ text: render, turns: 1, wip });
+		let rendered: Omit<PendingDelta, "turns" | "overflowRecovery"> | null = null;
+		// #renderDelta advances the cursor/prefix/dedup state before formatting
+		// can throw; snapshot them so a formatter bug loses NOTHING — the next
+		// turn re-renders this delta (a prefix change mid-render self-heals via
+		// the fingerprint scan, at worst costing one full replay).
+		const cursorBefore = this.#lastCount;
+		const prefixBefore = this.#deliveredPrefix.slice();
+		const seenBefore = [...this.#seenContext];
+		try {
+			rendered = this.#renderDelta(all, wip);
+		} catch (err) {
+			// A render bug must never propagate into the primary agent's
+			// turn-end callback: the advisor skips this delta and stops gating
+			// the catch-up wait until a turn succeeds.
+			this.#lastCount = cursorBefore;
+			this.#deliveredPrefix = prefixBefore;
+			this.#seenContext.clear();
+			for (const [key, value] of seenBefore) this.#seenContext.set(key, value);
+			this.#failing = true;
+			this.#wakeAllWaiters();
+			logger.warn("advisor delta render failed", { err: String(err) });
+		}
+		if (rendered) {
+			this.#pending.push({ ...rendered, turns: 1 });
 			this.#backlog++;
 			this.#notifyWaiters();
 			void this.#drain();
 		}
 	}
 
-	waitForCatchup(maxMs: number, threshold: number, signal?: AbortSignal): Promise<void> {
-		if (this.disposed || signal?.aborted || this.#backlog < threshold) return Promise.resolve();
-		const { promise, resolve } = Promise.withResolvers<void>();
+	/**
+	 * Wait until the advisor backlog falls below `threshold`.
+	 *
+	 * Returns `false` when the deadline, abort signal, or a runtime failure releases
+	 * the waiter before the requested backlog was drained.
+	 */
+	waitForCatchup(maxMs: number, threshold: number, signal?: AbortSignal): Promise<boolean> {
+		if (
+			this.disposed ||
+			signal?.aborted ||
+			this.#backlog < threshold ||
+			this.#quotaExhausted ||
+			this.#halted ||
+			// An advisor mid-failure/retry must NEVER gate the primary agent:
+			// its backlog cannot drain until the retry cycle resolves, and the
+			// primary would otherwise park for the full catch-up budget.
+			this.#failing
+		)
+			return Promise.resolve(this.#backlog < threshold);
+		const { promise, resolve } = Promise.withResolvers<boolean>();
 		let waiter!: CatchupWaiter;
-		const finish = (): void => {
+		const finish = (caughtUp: boolean): void => {
 			const idx = this.#waiters.indexOf(waiter);
 			if (idx >= 0) this.#waiters.splice(idx, 1);
 			clearTimeout(waiter.timer);
-			signal?.removeEventListener("abort", finish);
-			resolve();
+			signal?.removeEventListener("abort", abort);
+			resolve(caughtUp);
 		};
-		waiter = { threshold, resolve, finish, timer: setTimeout(finish, maxMs) };
+		const abort = (): void => finish(false);
+		waiter = {
+			threshold,
+			finish,
+			timer: setTimeout(abort, maxMs),
+		};
 		this.#waiters.push(waiter);
-		signal?.addEventListener("abort", finish, { once: true });
+		signal?.addEventListener("abort", abort, { once: true });
 		if (signal?.aborted) {
-			finish();
+			abort();
 		}
 		return promise;
 	}
@@ -287,30 +434,60 @@ export class AdvisorRuntime {
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
 		this.#failureNotified = false;
+		this.#advisorRegexSecretValues.clear();
 		this.#wakeAllWaiters();
 		try {
 			this.agent.abort("advisor disposed");
 		} catch {}
 	}
 
-	#resetAdvisorContext(clearBacklog: boolean, wakeWaiters: boolean): void {
-		this.#lastCount = 0;
-		this.#pending = [];
-		this.#consecutiveFailures = 0;
-		this.#failureNotified = false;
+	#clearSeenContext(): void {
 		this.#seenContext.clear();
-		if (clearBacklog) {
-			this.#backlog = 0;
-		}
-		if (wakeWaiters) {
-			this.#wakeAllWaiters();
-		}
+		this.#advisorRegexSecretValues.clear();
+		this.#renderRevision++;
+	}
+
+	#clearAdvisorContextAtCurrentCursor(): void {
+		this.#consecutiveFailures = 0;
+		this.#clearSeenContext();
 		try {
 			this.agent.reset();
 		} catch {}
 		try {
 			this.agent.abort("advisor reset");
 		} catch {}
+	}
+
+	#resetAdvisorContext(clearBacklog: boolean, wakeWaiters: boolean): void {
+		this.#lastCount = 0;
+		this.#deliveredPrefix = [];
+		this.#pending = [];
+		this.#clearAdvisorContextAtCurrentCursor();
+		if (clearBacklog) {
+			this.#backlog = 0;
+		}
+		if (wakeWaiters) {
+			this.#wakeAllWaiters();
+		}
+	}
+
+	/**
+	 * Account one completed 3-failure backlog-drop cycle. Repeated cycles (or a
+	 * single permanent request rejection, e.g. "model not supported") hard-stop
+	 * the runtime: in a shared daemon, unbounded advisor churn re-builds heavy
+	 * context on every new delta and starves every hosted session's event loop.
+	 * Only an explicit {@link reset} (config rebuild, /new, restart) resumes.
+	 */
+	#noteDroppedBacklog(error: unknown): void {
+		this.#droppedBacklogs++;
+		if (this.#droppedBacklogs < 3 && !isPermanentAdvisorError(error)) return;
+		this.#halted = true;
+		this.#pending = [];
+		this.#wakeAllWaiters();
+		logger.warn("advisor halted after repeated failures; use /advisor or reload config to re-enable", {
+			droppedBacklogs: this.#droppedBacklogs,
+			err: String(error),
+		});
 	}
 
 	/**
@@ -322,6 +499,12 @@ export class AdvisorRuntime {
 	 */
 	reset(): void {
 		this.#epoch++;
+		this.#quotaExhausted = false;
+		this.#halted = false;
+		this.#failing = false;
+		this.#droppedBacklogs = 0;
+		this.#consecutiveQuarantines = 0;
+		this.#failureNotified = false;
 		this.#resetAdvisorContext(true, true);
 	}
 
@@ -331,40 +514,105 @@ export class AdvisorRuntime {
 	 * advisor (which would be expensive and likely stale).
 	 */
 	seedTo(count: number): void {
-		this.#lastCount = count;
+		const messages = this.host.snapshotMessages().slice(0, count);
+		this.#lastCount = messages.length;
+		this.#deliveredPrefix = messages.map(message => ({
+			message,
+			fingerprint: fingerprintMessage(message),
+		}));
 		this.#pending = [];
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
+		this.#failing = false;
+		this.#droppedBacklogs = 0;
 		this.#failureNotified = false;
-		this.#seenContext.clear();
+		this.#clearSeenContext();
 		this.#wakeAllWaiters();
 	}
 
-	#renderDelta(messages?: AgentMessage[], wip = false): string | null {
-		const all = messages ?? this.#latestMessages ?? this.host.snapshotMessages();
-		if (all.length < this.#lastCount) {
-			this.#lastCount = all.length;
-			this.#seenContext.clear();
-			return null;
-		}
-		const delta = all
-			.slice(this.#lastCount)
-			.filter(m => !(m.role === "custom" && m.customType === "advisor"))
-			.map(m => this.#dedupContextMessage(m));
-		this.#lastCount = all.length;
+	#formatRawDelta(rawMessages: AgentMessage[], wip = false): string | null {
+		const delta = rawMessages
+			.filter(message => !(message.role === "custom" && message.customType === "advisor"))
+			.map(message => this.#dedupContextMessage(message));
 		if (delta.length === 0) return null;
 		const obfuscator = this.host.obfuscator;
-		const formattedDelta = obfuscator?.hasSecrets() ? obfuscateAdvisorDelta(obfuscator, delta) : delta;
-		const md = formatSessionHistoryMarkdown(formattedDelta, {
-			includeThinking: true,
-			includeToolIntent: true,
-			watchedRoles: true,
-			expandPrimaryContext: true,
-			expandEditDiffs: true,
-		});
+		let md = formatSessionHistoryMarkdown(delta, ADVISOR_RENDER_OPTIONS);
 		if (!md.trim()) return null;
+		if (obfuscator?.hasSecrets()) {
+			let discoveredNewRegexSecretValue = false;
+			const addRegexValues = (text: string): void => {
+				for (const secretValue of obfuscator.collectRegexSecretValuesForObfuscation(text)) {
+					if (this.#advisorRegexSecretValues.has(secretValue)) continue;
+					this.#advisorRegexSecretValues.add(secretValue);
+					discoveredNewRegexSecretValue = true;
+				}
+			};
+			for (const message of delta) {
+				if (
+					message.role === "custom" &&
+					PRIMARY_CONTEXT_CUSTOM_TYPES.has(message.customType) &&
+					typeof message.content === "string"
+				) {
+					addRegexValues(message.content);
+				}
+			}
+			addRegexValues(md);
+			scrubAdvisorHistory(obfuscator, this.agent.state.messages, this.#advisorRegexSecretValues);
+			if (discoveredNewRegexSecretValue) {
+				this.#pending = this.#pending.map(delta => ({
+					...delta,
+					text: obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(delta.text, this.#advisorRegexSecretValues),
+				}));
+			}
+			md = formatSessionHistoryMarkdown(
+				delta.map(message =>
+					message.role === "custom" && PRIMARY_CONTEXT_CUSTOM_TYPES.has(message.customType)
+						? obfuscateAdvisorMessage(obfuscator, message, this.#advisorRegexSecretValues)
+						: message,
+				),
+				ADVISOR_RENDER_OPTIONS,
+			);
+			md = obfuscator.obfuscate(md, this.#advisorRegexSecretValues);
+		}
 		const heading = wip ? "### Session update [in progress — more steps follow]" : "### Session update";
 		return `${heading}\n\n${md}`;
+	}
+
+	#renderDelta(messages?: AgentMessage[], wip = false): Omit<PendingDelta, "turns" | "overflowRecovery"> | null {
+		const all = messages ?? this.#latestMessages ?? this.host.snapshotMessages();
+		let prefixChanged = all.length < this.#lastCount;
+		for (let i = 0; !prefixChanged && i < this.#lastCount; i++) {
+			const delivered = this.#deliveredPrefix[i];
+			const current = all[i];
+			if (delivered === undefined || current === undefined) {
+				prefixChanged = true;
+				break;
+			}
+			if (delivered.message === current) continue;
+			const fingerprint = fingerprintMessage(current);
+			if (
+				delivered.fingerprint === undefined ||
+				fingerprint === undefined ||
+				delivered.fingerprint !== fingerprint
+			) {
+				prefixChanged = true;
+				break;
+			}
+			delivered.message = current;
+		}
+		if (prefixChanged) {
+			this.#epoch++;
+			this.#resetAdvisorContext(true, true);
+		}
+		const rawMessages = all.slice(this.#lastCount);
+		for (let i = this.#lastCount; i < all.length; i++) {
+			const message = all[i];
+			if (message === undefined) continue;
+			this.#deliveredPrefix.push({ message, fingerprint: fingerprintMessage(message) });
+		}
+		this.#lastCount = all.length;
+		const text = this.#formatRawDelta(rawMessages, wip);
+		return text ? { text, rawMessages, renderRevision: this.#renderRevision, wip } : null;
 	}
 
 	/**
@@ -391,14 +639,14 @@ export class AdvisorRuntime {
 		for (let i = this.#waiters.length - 1; i >= 0; i--) {
 			const w = this.#waiters[i];
 			if (this.#backlog < w.threshold) {
-				w.finish();
+				w.finish(true);
 			}
 		}
 	}
 
 	#wakeAllWaiters(): void {
 		for (const w of [...this.#waiters]) {
-			w.finish();
+			w.finish(false);
 		}
 	}
 
@@ -425,40 +673,50 @@ export class AdvisorRuntime {
 	}
 
 	/**
-	 * Collect all currently pending deltas into one batch, running
-	 * `maintainContext` for correct token budgeting. Loops until the pending
-	 * queue is stable (no new deltas arrived during a maintenance check) or a
-	 * reprime is triggered. Every `await` inside the loop has an epoch guard so
-	 * a reset/dispose mid-await cannot leak a stale batch into the post-reset
-	 * conversation.
+	 * Collect the popped deltas into one batch, running `maintainContext` for
+	 * correct token budgeting. Loops until the pending queue is stable (no new
+	 * deltas arrived during a maintenance check) or the round cap is reached.
+	 * Every `await` inside the loop has an epoch guard so a reset/dispose
+	 * mid-await cannot leak a stale batch into the post-reset conversation.
+	 *
+	 * When maintenance requests recovery, only the advisor Agent/log is reset
+	 * (at the current primary cursor) and the already-collected raw batch is
+	 * re-rendered — older, already-delivered primary transcript is never
+	 * replayed.
 	 *
 	 * The coalescing loop is capped at {@link MAX_COALESCE_ROUNDS} iterations so
 	 * a pathologically fast primary combined with a slow `maintainContext` cannot
 	 * stall dispatch indefinitely — any items still in `#pending` after the cap
-	 * are left for the next drain iteration.
+	 * are left for the next drain iteration. Overflow-recovery batches skip
+	 * coalescing entirely: they retry exactly the bounded batch that overflowed.
 	 *
 	 * Returns `null` when the epoch was invalidated — caller should `continue`.
-	 * Returns `{ batch: null, finalTurns }` when there is nothing to render but
-	 * backlog still needs to be decremented.
 	 */
 	async #collectAndMaintainBatch(
 		epoch: number,
-	): Promise<{ batch: string | null; finalTurns: number; wip: boolean } | null> {
-		const initial = this.#pending.splice(0);
+		initial: PendingDelta[],
+		recoveringOverflow: boolean,
+	): Promise<{
+		batch: string | null;
+		rawMessages: AgentMessage[];
+		finalTurns: number;
+		wip: boolean;
+		resetContext: boolean;
+	} | null> {
 		let batchText = initial.map(b => b.text).join("\n\n");
+		let rawMessages = initial.flatMap(b => b.rawMessages);
 		let turns = initial.reduce((sum, b) => sum + b.turns, 0);
-		// Track WIP state of the most recent delta — forwarded to the reprime
-		// #renderDelta so a willContinue:true turn keeps its [in progress] heading
-		// even when the full transcript is replayed from scratch. Also returned to
-		// #drain so the retry-requeue path preserves it on failed turns.
+		// Track WIP state of the most recent delta — forwarded to the re-render
+		// so a willContinue:true turn keeps its [in progress] heading. Also
+		// returned to #drain so the retry-requeue path preserves it on failed turns.
 		let wip = initial.at(-1)?.wip ?? false;
 
 		for (let round = 0; round < MAX_COALESCE_ROUNDS; round++) {
 			if (this.host.maintainContext) {
 				const incomingTokens = estimateTokens({ role: "user", content: batchText, timestamp: Date.now() });
-				let shouldReprime = false;
+				let shouldResetContext = false;
 				try {
-					shouldReprime = await this.host.maintainContext(incomingTokens);
+					shouldResetContext = await this.host.maintainContext(incomingTokens);
 				} catch (err) {
 					logger.debug("advisor context maintenance failed", { err: String(err) });
 				}
@@ -466,17 +724,40 @@ export class AdvisorRuntime {
 				// invalidates this batch.
 				if (this.#epoch !== epoch) return null;
 
-				if (shouldReprime) {
-					// Tally deltas that arrived during this await before #resetAdvisorContext
-					// wipes #pending, so finalTurns stays accurate for backlog accounting.
-					// Also capture the latest WIP state before the queue is cleared.
-					const lateItems = this.#pending.splice(0);
-					turns += lateItems.reduce((sum, b) => sum + b.turns, 0);
-					if (lateItems.length > 0) wip = lateItems.at(-1)!.wip;
-					this.#resetAdvisorContext(false, false);
-					return { batch: this.#renderDelta(this.#latestMessages, wip), finalTurns: turns, wip };
+				if (shouldResetContext) {
+					// Once coalescing has begun (round > 0), deltas that arrived during
+					// this await are part of the coalescing window: tally them so
+					// finalTurns stays accurate for backlog accounting and their raw
+					// messages join the bounded re-render. On the initial round the
+					// popped batch stays bounded exactly as dispatched — later arrivals
+					// remain queued and ship as their own subsequent batch.
+					if (round > 0) {
+						const lateItems = this.#pending.splice(0);
+						turns += lateItems.reduce((sum, b) => sum + b.turns, 0);
+						if (lateItems.length > 0) {
+							wip = lateItems.at(-1)!.wip;
+							rawMessages = rawMessages.concat(lateItems.flatMap(b => b.rawMessages));
+						}
+					}
+					// Reset only the advisor Agent/log. The primary cursor, backlog,
+					// waiters, latest snapshot, and epoch stay untouched. Re-render only
+					// this already-popped raw batch so active plan/reference bodies are
+					// restored without replaying any older primary transcript.
+					this.#clearAdvisorContextAtCurrentCursor();
+					const rerendered = this.#formatRawDelta(rawMessages, wip);
+					return {
+						batch: rerendered ?? (batchText || null),
+						rawMessages,
+						finalTurns: turns,
+						wip,
+						resetContext: true,
+					};
 				}
 			}
+
+			// Overflow-recovery batches retry exactly the bounded batch that
+			// overflowed; pending updates stay queued behind them.
+			if (recoveringOverflow) break;
 
 			// On the final round stop here — any late arrivals would ship without
 			// a subsequent maintainContext budget check. Leave them in #pending for
@@ -489,11 +770,35 @@ export class AdvisorRuntime {
 			const late = this.#pending.splice(0);
 			if (late.length === 0) break;
 			batchText = [batchText, ...late.map(b => b.text)].join("\n\n");
+			rawMessages = rawMessages.concat(late.flatMap(b => b.rawMessages));
 			turns += late.reduce((sum, b) => sum + b.turns, 0);
 			wip = late.at(-1)!.wip;
 		}
 
-		return { batch: batchText || null, finalTurns: turns, wip };
+		const batchObfuscator = this.host.obfuscator;
+		if (batchObfuscator?.hasSecrets()) {
+			batchText = batchObfuscator.stripUnsafeFriendlyPlaceholderPrefixes(batchText, this.#advisorRegexSecretValues);
+		}
+		return { batch: batchText || null, rawMessages, finalTurns: turns, wip, resetContext: false };
+	}
+
+	#terminalAssistantFailure(snapshot: number): AssistantMessage | undefined {
+		const messages = this.agent.state.messages;
+		for (let i = messages.length - 1; i >= snapshot; i--) {
+			const message = messages[i];
+			if (message.role === "assistant" && message.stopReason === "error") return message;
+		}
+		return undefined;
+	}
+
+	#notifyFailureOnce(error: unknown): void {
+		if (this.#failureNotified) return;
+		this.#failureNotified = true;
+		try {
+			this.host.notifyFailure?.(error);
+		} catch (notifyErr) {
+			logger.warn("advisor failure notification failed", { err: String(notifyErr) });
+		}
 	}
 
 	async #drain(): Promise<void> {
@@ -501,13 +806,28 @@ export class AdvisorRuntime {
 		this.#busy = true;
 		try {
 			while (!this.disposed && this.#pending.length) {
+				let popped: PendingDelta[];
+				if (this.#pending[0]?.overflowRecovery) {
+					const recovery = this.#pending.shift();
+					if (!recovery) continue;
+					popped = [recovery];
+				} else {
+					popped = this.#pending.splice(0);
+				}
 				const epoch = this.#epoch;
-				const result = await this.#collectAndMaintainBatch(epoch);
+				for (const delta of popped) {
+					if (delta.renderRevision === this.#renderRevision) continue;
+					const refreshed = this.#formatRawDelta(delta.rawMessages, delta.wip);
+					if (refreshed) delta.text = refreshed;
+					delta.renderRevision = this.#renderRevision;
+				}
+				const recoveringOverflow = popped.some(delta => delta.overflowRecovery === true);
+				const result = await this.#collectAndMaintainBatch(epoch, popped, recoveringOverflow);
 
 				// Epoch was invalidated during batch collection; restart the loop.
 				if (result === null) continue;
 
-				const { batch, finalTurns, wip } = result;
+				const { batch, rawMessages, finalTurns, wip, resetContext } = result;
 
 				if (this.disposed || batch === null) {
 					this.#backlog = Math.max(0, this.#backlog - finalTurns);
@@ -522,6 +842,7 @@ export class AdvisorRuntime {
 				// batch on top of stale turns and the dropped-after-3 path would leak
 				// orphan failures into the next successful run's context.
 				const messageSnapshot = this.agent.state.messages.length;
+				const contextWasFresh = resetContext || recoveringOverflow || messageSnapshot === 0;
 				try {
 					// Reset the host's per-update advisor state (one-advise-per-update
 					// gate) before each model cycle so the new batch starts fresh.
@@ -540,20 +861,65 @@ export class AdvisorRuntime {
 					const turnError = getAdvisorTurnError(this.agent.state.messages.slice(messageSnapshot));
 					if (turnError) throw turnError;
 					success = true;
+					this.#failing = false;
 					this.#consecutiveFailures = 0;
 					this.#failureNotified = false;
+					this.#droppedBacklogs = 0;
+					this.#consecutiveQuarantines = 0;
+					if (this.host.onTurnSuccess) {
+						try {
+							await this.host.onTurnSuccess();
+						} catch (hookErr) {
+							logger.debug("advisor onTurnSuccess hook failed", { err: String(hookErr) });
+						}
+					}
 				} catch (err) {
 					// reset()/dispose() aborts the in-flight prompt; treat it as a
 					// reset, not a transient failure — drop the stale batch.
 					if (this.#epoch !== epoch) continue;
+					// Release any parked primary-agent waiters IMMEDIATELY — before
+					// the async onTurnError hook or any retry sleep — and refuse new
+					// parks until a turn succeeds. A failing advisor must never hold
+					// the primary on the catch-up gate.
+					this.#failing = true;
+					this.#wakeAllWaiters();
+					const failedMessages = this.agent.state.messages.slice(messageSnapshot);
+					const terminalFailure = this.#terminalAssistantFailure(messageSnapshot);
+					const terminalFailureId =
+						terminalFailure === undefined ? undefined : AIError.classifyMessage(terminalFailure);
+					const contextOverflow =
+						(terminalFailureId !== undefined && AIError.is(terminalFailureId, AIError.Flag.ContextOverflow)) ||
+						AIError.is(AIError.classify(err), AIError.Flag.ContextOverflow);
+					// A terminal provider failure that is neither retriable nor an
+					// overflow (e.g. a blocked prompt) will fail identically on every
+					// retry — classify it before rollback so the batch is dropped after
+					// one attempt instead of burning the 3-attempt budget (#5468).
+					const terminalFailureRetriable =
+						terminalFailureId === undefined ||
+						AIError.retriable(terminalFailureId) ||
+						AIError.is(terminalFailureId, AIError.Flag.ContextOverflow);
 					this.#rollbackFailedTurn(messageSnapshot);
 					logger.debug("advisor turn failed", { err: String(err) });
+					let recovered = false;
 					try {
-						await this.host.onTurnError?.(err);
+						recovered = (await this.host.onTurnError?.(err, failedMessages)) === true;
 					} catch (hookErr) {
 						logger.debug("advisor onTurnError hook failed", { err: String(hookErr) });
 					}
 					if (err instanceof AdvisorOutputQuarantinedError) {
+						// A quarantine discards the advisor's whole turn before dispatch, so
+						// its advice never reaches the primary. One re-prime is allowed to
+						// recover a one-off hallucination silently; a persistent quarantine
+						// loop is a supervision gap the user must see in the main UI — not an
+						// unbounded silent retry. Surface it (deduped by #notifyFailureOnce)
+						// and drop the batch to break the loop (issue #6661).
+						this.#consecutiveQuarantines++;
+						if (this.#consecutiveQuarantines >= MAX_QUARANTINE_RETRIES) {
+							this.#notifyFailureOnce(err);
+							this.#consecutiveQuarantines = 0;
+							this.#resetAdvisorContext(true, true);
+							continue;
+						}
 						const rePrime = this.#pending.length > 0 ? this.#latestMessages : undefined;
 						// Wake catchup waiters only when nothing is re-primed; otherwise the
 						// re-primed turn restores the backlog and waiters resolve on its completion.
@@ -563,26 +929,99 @@ export class AdvisorRuntime {
 					}
 					// Epoch guard after the async error hook.
 					if (this.#epoch !== epoch) continue;
-					this.#consecutiveFailures++;
-					if (this.#consecutiveFailures >= 3) {
-						logger.warn("advisor failed consecutively 3 times; dropping backlog to prevent stall");
-						if (!this.#failureNotified) {
-							this.#failureNotified = true;
-							try {
-								this.host.notifyFailure?.(err);
-							} catch (notifyErr) {
-								logger.warn("advisor failure notification failed", { err: String(notifyErr) });
-							}
-						}
+					if (recovered) {
 						this.#consecutiveFailures = 0;
-						// Drop the seen-context so the next turn re-expands primary-context
-						// prompts instead of marking them "unchanged" against content the
-						// advisor never received.
-						this.#seenContext.clear();
+						this.#failureNotified = false;
+						this.#pending.unshift({
+							text: batch,
+							rawMessages,
+							renderRevision: this.#renderRevision,
+							turns: finalTurns,
+							wip,
+							overflowRecovery: recoveringOverflow || undefined,
+						});
+						continue;
+					}
+					if (AIError.isUsageLimit(err)) {
+						// Host recovery (credential switch / fallback chain) declined:
+						// pause on the quota latch instead of burning retries — provider
+						// quota windows (5h/7d) outlast any retry budget. The batch is
+						// requeued and the backlog stays visible so reset() replays it.
+						logger.warn("advisor quota exhausted", { err: String(err) });
+						this.#quotaExhausted = true;
+						this.#consecutiveFailures = 0;
+						this.#failureNotified = false;
+						this.#clearSeenContext();
+						this.#pending.unshift({
+							text: batch,
+							rawMessages,
+							renderRevision: this.#renderRevision,
+							turns: finalTurns,
+							wip,
+							overflowRecovery: recoveringOverflow || undefined,
+						});
+						this.#wakeAllWaiters();
+						try {
+							this.host.notifyQuotaExhausted?.();
+						} catch (notifyErr) {
+							logger.warn("advisor quota notification failed", { err: String(notifyErr) });
+						}
+						break;
+					}
+					if (!terminalFailureRetriable) {
+						logger.warn("advisor terminal failure is non-retriable; dropping bounded batch");
+						this.#notifyFailureOnce(err);
+						this.#consecutiveFailures = 0;
+						// The dropped batch may carry primary-context we never delivered; drop
+						// the seen-state too so queued raw deltas re-expand before delivery.
+						this.#clearSeenContext();
+						this.#noteDroppedBacklog(err);
 						success = true;
+					} else if (contextOverflow) {
+						this.#clearAdvisorContextAtCurrentCursor();
+						if (contextWasFresh) {
+							// The bounded update cannot fit even with no advisor history. Drop
+							// only this batch after its one fresh-context retry; pending and later
+							// deltas remain eligible so one oversized update cannot disable the advisor.
+							logger.warn("advisor update overflowed a fresh context; dropping bounded batch");
+							this.#notifyFailureOnce(err);
+							success = true;
+						} else {
+							// Retry once against the fresh advisor context, using only the same
+							// bounded raw batch. Pending updates remain queued behind it.
+							const recoveryBatch = this.#formatRawDelta(rawMessages, wip) ?? batch;
+							this.#pending.unshift({
+								text: recoveryBatch,
+								rawMessages,
+								renderRevision: this.#renderRevision,
+								turns: finalTurns,
+								wip,
+								overflowRecovery: true,
+							});
+							logger.debug("advisor context overflow recovered at current primary cursor");
+						}
 					} else {
-						this.#pending.unshift({ text: batch, turns: finalTurns, wip });
-						await Bun.sleep(this.retryDelayMs);
+						this.#consecutiveFailures++;
+						if (this.#consecutiveFailures >= 3) {
+							logger.warn("advisor failed consecutively 3 times; dropping backlog to prevent stall");
+							this.#notifyFailureOnce(err);
+							this.#consecutiveFailures = 0;
+							// The dropped batch may carry primary-context we never delivered; drop
+							// the seen-state too so queued raw deltas re-expand before delivery.
+							this.#clearSeenContext();
+							this.#noteDroppedBacklog(err);
+							success = true;
+						} else {
+							this.#pending.unshift({
+								text: batch,
+								rawMessages,
+								renderRevision: this.#renderRevision,
+								turns: finalTurns,
+								wip,
+								overflowRecovery: recoveringOverflow || undefined,
+							});
+							await Bun.sleep(this.retryDelayMs);
+						}
 					}
 				}
 
@@ -610,12 +1049,16 @@ function getAdvisorTurnError(messages: readonly AgentMessage[]): Error | undefin
 
 type TextualContent = string | readonly (TextContent | ImageContent)[];
 
-function obfuscateTextualContent(obfuscator: SecretObfuscator, content: TextualContent): TextualContent {
-	if (typeof content === "string") return obfuscator.obfuscate(content);
+function obfuscateTextualContent(
+	obfuscator: SecretObfuscator,
+	content: TextualContent,
+	sharedRegexSecretValues: ReadonlySet<string>,
+): TextualContent {
+	if (typeof content === "string") return obfuscator.obfuscate(content, sharedRegexSecretValues);
 	let changed = false;
 	const result = content.map((block): TextContent | ImageContent => {
 		if (block.type !== "text") return block;
-		const text = obfuscator.obfuscate(block.text);
+		const text = obfuscator.obfuscate(block.text, sharedRegexSecretValues);
 		if (text === block.text) return block;
 		changed = true;
 		return { ...block, text };
@@ -623,17 +1066,50 @@ function obfuscateTextualContent(obfuscator: SecretObfuscator, content: TextualC
 	return changed ? result : content;
 }
 
-function obfuscateAssistantMessage(obfuscator: SecretObfuscator, message: AssistantMessage): AssistantMessage {
+function firstAdvisorToolResultErrorLine(content: TextualContent): string | undefined {
+	if (typeof content === "string") return content.split("\n", 1)[0];
+	const first = content[0];
+	if (first?.type !== "text") return undefined;
+	return first.text.split("\n", 1)[0];
+}
+
+function obfuscateAdvisorToolResultErrorContent(
+	obfuscator: SecretObfuscator,
+	content: TextualContent,
+	sharedRegexSecretValues: ReadonlySet<string>,
+): TextualContent {
+	const firstLine = firstAdvisorToolResultErrorLine(content);
+	if (firstLine === undefined) return content;
+	const preview = formatToolResultErrorPreview(content);
+	const obfuscatedPreview = obfuscator.obfuscate(preview, sharedRegexSecretValues);
+	if (obfuscatedPreview === firstLine) return content;
+	if (typeof content === "string") return obfuscatedPreview + content.slice(firstLine.length);
+	const first = content[0]!;
+	if (first.type !== "text") return content;
+	return [{ ...first, text: obfuscatedPreview + first.text.slice(firstLine.length) }, ...content.slice(1)];
+}
+
+function obfuscateAssistantMessage(
+	obfuscator: SecretObfuscator,
+	message: AssistantMessage,
+	sharedRegexSecretValues: ReadonlySet<string>,
+): AssistantMessage {
 	let changed = false;
 	const content = message.content.map((block): AssistantMessage["content"][number] => {
 		if (block.type === "text") {
-			const text = obfuscator.obfuscate(block.text);
+			const text = obfuscator.obfuscate(block.text, sharedRegexSecretValues);
 			if (text === block.text) return block;
 			changed = true;
 			return { ...block, text };
 		}
+		if (block.type === "thinking") {
+			const thinking = obfuscator.obfuscate(block.thinking, sharedRegexSecretValues);
+			if (thinking === block.thinking) return block;
+			changed = true;
+			return { ...block, thinking, thinkingSignature: undefined };
+		}
 		if (block.type === "toolCall") {
-			const args = obfuscateToolArguments(obfuscator, block.arguments);
+			const args = obfuscateToolArguments(obfuscator, block.arguments, sharedRegexSecretValues);
 			if (args === block.arguments) return block;
 			changed = true;
 			return { ...block, arguments: args };
@@ -646,68 +1122,83 @@ function obfuscateAssistantMessage(obfuscator: SecretObfuscator, message: Assist
 function obfuscateDetails(
 	obfuscator: SecretObfuscator,
 	details: Record<string, unknown> | undefined,
+	sharedRegexSecretValues: ReadonlySet<string>,
 ): Record<string, unknown> | undefined {
 	if (!details) return details;
 	// Walk strings at every depth: `customOneLiner` renders nested fields
 	// (e.g. `async-result` reads `details.jobs[].label`/`jobId`), so a shallow
 	// pass leaks any secret a background job's label happens to contain.
-	return obfuscateToolArguments(obfuscator, details);
+	return obfuscateToolArguments(obfuscator, details, sharedRegexSecretValues);
 }
 
-function obfuscateAdvisorMessage(obfuscator: SecretObfuscator, message: AgentMessage): AgentMessage {
+function obfuscateAdvisorMessage(
+	obfuscator: SecretObfuscator,
+	message: AgentMessage,
+	sharedRegexSecretValues: ReadonlySet<string>,
+): AgentMessage {
 	switch (message.role) {
 		case "user":
 		case "developer": {
-			const content = obfuscateTextualContent(obfuscator, message.content as TextualContent);
+			const content = obfuscateTextualContent(
+				obfuscator,
+				message.content as TextualContent,
+				sharedRegexSecretValues,
+			);
 			return content === message.content ? message : ({ ...(message as object), content } as AgentMessage);
 		}
 		case "toolResult": {
 			const msg = message as AgentMessage & {
 				content: TextualContent;
 				details?: Record<string, unknown>;
+				isError?: boolean;
 			};
-			const content = obfuscateTextualContent(obfuscator, msg.content);
-			const details = obfuscateDetails(obfuscator, msg.details);
+			const content = msg.isError
+				? obfuscateAdvisorToolResultErrorContent(obfuscator, msg.content, sharedRegexSecretValues)
+				: msg.content;
+			let details = msg.details;
+			if (typeof details?.diff === "string") {
+				const diff = obfuscator.obfuscate(details.diff, sharedRegexSecretValues);
+				if (diff !== details.diff) details = { ...details, diff };
+			}
 			if (content === msg.content && details === msg.details) return message;
 			return { ...(message as object), content, details } as AgentMessage;
 		}
 		case "assistant":
-			return obfuscateAssistantMessage(obfuscator, message as AssistantMessage) as AgentMessage;
+			return obfuscateAssistantMessage(
+				obfuscator,
+				message as AssistantMessage,
+				sharedRegexSecretValues,
+			) as AgentMessage;
 		case "custom":
 		case "hookMessage": {
+			if (!formatSessionHistoryMarkdown([message], { expandPrimaryContext: true }).trim()) return message;
 			const msg = message as AgentMessage & {
 				content: TextualContent;
 				details?: Record<string, unknown>;
 			};
-			const content = obfuscateTextualContent(obfuscator, msg.content);
-			const details = obfuscateDetails(obfuscator, msg.details);
+			const content = obfuscateTextualContent(obfuscator, msg.content, sharedRegexSecretValues);
+			const details = obfuscateDetails(obfuscator, msg.details, sharedRegexSecretValues);
 			if (content === msg.content && details === msg.details) return message;
 			return { ...(message as object), content, details } as AgentMessage;
 		}
 		case "bashExecution": {
-			const msg = message as AgentMessage & { command: string; output: string };
-			const command = obfuscator.obfuscate(msg.command);
-			const output = obfuscator.obfuscate(msg.output);
-			return command === msg.command && output === msg.output
-				? message
-				: ({ ...(message as object), command, output } as AgentMessage);
+			const msg = message as AgentMessage & { command: string };
+			const command = obfuscator.obfuscate(formatExecutionSourcePreview(msg.command), sharedRegexSecretValues);
+			return command === msg.command ? message : ({ ...(message as object), command } as AgentMessage);
 		}
 		case "pythonExecution": {
-			const msg = message as AgentMessage & { code: string; output: string };
-			const code = obfuscator.obfuscate(msg.code);
-			const output = obfuscator.obfuscate(msg.output);
-			return code === msg.code && output === msg.output
-				? message
-				: ({ ...(message as object), code, output } as AgentMessage);
+			const msg = message as AgentMessage & { code: string };
+			const code = obfuscator.obfuscate(formatExecutionSourcePreview(msg.code), sharedRegexSecretValues);
+			return code === msg.code ? message : ({ ...(message as object), code } as AgentMessage);
 		}
 		case "branchSummary": {
 			const msg = message as AgentMessage & { summary: string };
-			const summary = obfuscator.obfuscate(msg.summary);
+			const summary = obfuscator.obfuscate(msg.summary, sharedRegexSecretValues);
 			return summary === msg.summary ? message : ({ ...(message as object), summary } as AgentMessage);
 		}
 		case "compactionSummary": {
 			const msg = message as AgentMessage & { summary: string };
-			const summary = obfuscator.obfuscate(msg.summary);
+			const summary = obfuscator.obfuscate(msg.summary, sharedRegexSecretValues);
 			return summary === msg.summary ? message : ({ ...(message as object), summary } as AgentMessage);
 		}
 		case "fileMention": {
@@ -716,11 +1207,10 @@ function obfuscateAdvisorMessage(obfuscator: SecretObfuscator, message: AgentMes
 			};
 			let changed = false;
 			const files = msg.files.map(file => {
-				const path = obfuscator.obfuscate(file.path);
-				const content = obfuscator.obfuscate(file.content);
-				if (path === file.path && content === file.content) return file;
+				const path = obfuscator.obfuscate(file.path, sharedRegexSecretValues);
+				if (path === file.path) return file;
 				changed = true;
-				return { ...file, path, content };
+				return { ...file, path };
 			});
 			return changed ? ({ ...(message as object), files } as AgentMessage) : message;
 		}
@@ -729,12 +1219,14 @@ function obfuscateAdvisorMessage(obfuscator: SecretObfuscator, message: AgentMes
 	}
 }
 
-function obfuscateAdvisorDelta(obfuscator: SecretObfuscator, messages: AgentMessage[]): AgentMessage[] {
-	let changed = false;
-	const result = messages.map(message => {
-		const next = obfuscateAdvisorMessage(obfuscator, message);
-		if (next !== message) changed = true;
-		return next;
-	});
-	return changed ? result : messages;
+function scrubAdvisorHistory(
+	obfuscator: SecretObfuscator,
+	messages: AgentMessage[],
+	sharedRegexSecretValues: ReadonlySet<string>,
+): void {
+	for (let index = 0; index < messages.length; index++) {
+		const message = messages[index]!;
+		const next = obfuscateAdvisorMessage(obfuscator, message, sharedRegexSecretValues);
+		if (next !== message) messages[index] = next;
+	}
 }

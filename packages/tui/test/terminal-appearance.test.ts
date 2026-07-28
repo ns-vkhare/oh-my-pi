@@ -19,6 +19,7 @@ const originalWslDistroName = Bun.env.WSL_DISTRO_NAME;
 const originalWslInterop = Bun.env.WSL_INTEROP;
 const originalWtSession = Bun.env.WT_SESSION;
 const originalTermProgram = Bun.env.TERM_PROGRAM;
+const originalTmux = Bun.env.TMUX;
 
 // These suites drive the real ProcessTerminal start()/probe pipeline, so they
 // opt out of the test-default headless suppression and restore it per case.
@@ -60,6 +61,7 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		restoreEnv("WSL_DISTRO_NAME", originalWslDistroName);
 		restoreEnv("WT_SESSION", originalWtSession);
 		restoreEnv("TERM_PROGRAM", originalTermProgram);
+		restoreEnv("TMUX", originalTmux);
 	});
 
 	function setupTerminal() {
@@ -255,6 +257,86 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		vi.advanceTimersByTime(30_000);
 
 		expect(queryCount()).toBe(afterStartup + 1);
+
+		terminal.stop();
+	});
+
+	it("refreshAppearance() issues exactly one OSC 11 re-query per call (#5352)", () => {
+		const { terminal, queryCount } = setupTerminal();
+
+		// Drain the OSC 11 reply and all seven startup DA1 sentinels (keyboard,
+		// OSC 11, and the DECRQM probes for 2026/2048/2031/1010/1011) so the
+		// probe FIFO is empty before the refresh gesture.
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+		const afterInitial = queryCount();
+
+		// An explicit refresh gesture (Ctrl+L) issues one bounded probe.
+		terminal.refreshAppearance?.();
+		expect(queryCount()).toBe(afterInitial + 1);
+
+		// Complete that query's cycle, then refresh again: still one probe each.
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+		terminal.refreshAppearance?.();
+		expect(queryCount()).toBe(afterInitial + 2);
+
+		terminal.stop();
+	});
+
+	it("passes an explicit appearance refresh through tmux without changing the startup probe", () => {
+		Bun.env.TMUX = "/tmp/tmux-1000/default,1234,0";
+		const { terminal, writes } = setupTerminal();
+
+		expect(writes).toContain("\x1b]11;?\x07");
+		expect(writes).toContain("\x1b[c");
+
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+		terminal.refreshAppearance?.();
+
+		expect(writes).toContain("\x1bPtmux;\x1b\x1b]11;?\x07\x1b\x1b[c\x1b\\");
+
+		terminal.stop();
+	});
+
+	it("refreshAppearance() re-evaluates a changed background through the callback pipeline", () => {
+		const { terminal } = setupTerminal();
+		const appearances: string[] = [];
+		terminal.onAppearanceChange(a => appearances.push(a));
+
+		// Startup classifies the terminal as light.
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+		expect(terminal.appearance).toBe("light");
+		expect(appearances).toEqual(["light"]);
+
+		// User switches the OS/terminal to dark and presses Ctrl+L. The bounded
+		// re-query picks up the new background and fires the appearance callback.
+		terminal.refreshAppearance?.();
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+
+		expect(terminal.appearance).toBe("dark");
+		expect(appearances).toEqual(["light", "dark"]);
+
+		terminal.stop();
+	});
+
+	it("refreshAppearance() still probes through a Mode 2031-capable bridge (#5352)", () => {
+		const { terminal, queryCount } = setupTerminal();
+
+		// Drain startup, then have the bridge (e.g. tmux) advertise Mode 2031
+		// support via DECRQM — CSI ? 2031 ; 2 $ y (reset/supported). The outer
+		// terminal may still never emit an appearance notification, so an explicit
+		// refresh must not be gated on advertised 2031 support.
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+		process.stdin.emit("data", "\x1b[?2031;2$y");
+		const afterInitial = queryCount();
+
+		terminal.refreshAppearance?.();
+		expect(queryCount()).toBe(afterInitial + 1);
 
 		terminal.stop();
 	});
@@ -589,13 +671,18 @@ describe("ProcessTerminal DECRQM + in-band resize (DEC 2026/2048)", () => {
 		expect(writes).not.toContain("\x1b[?2048l");
 	});
 
-	it("falls back to unsupported when the DA1 sentinel beats the DECRPM reply", () => {
+	it("marks a missing DECRPM response as inconclusive when the DA1 sentinel arrives", () => {
 		const { terminal, reports } = setup();
+		const confirmations: boolean[] = [];
+		terminal.onPrivateModeReport?.((mode, _supported, confirmed) => {
+			if (mode === 2026) confirmations.push(confirmed ?? true);
+		});
 		// Drain keyboard + osc11 sentinels, then 2026's DA1 (no DECRPM arrived).
 		process.stdin.emit("data", "\x1b[?1;2c");
 		process.stdin.emit("data", "\x1b[?1;2c");
 		process.stdin.emit("data", "\x1b[?1;2c");
 		expect(reports).toContainEqual({ mode: 2026, supported: false });
+		expect(confirmations).toEqual([false]);
 		terminal.stop();
 	});
 

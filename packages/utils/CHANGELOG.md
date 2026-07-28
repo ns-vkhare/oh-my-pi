@@ -2,6 +2,72 @@
 
 ## [Unreleased]
 
+## [17.1.8] - 2026-07-28
+
+### Added
+
+- Added `setProcessName` utility to set the OS-visible process name on Linux via `bun:ffi`, bypassing Bun's `process.title` limitations.
+
+### Fixed
+
+- Fixed child shell environment filtering to drop launch-directory `.env` values in addition to Bun-autoloaded `.env.local` values.
+
+## [17.1.5] - 2026-07-27
+
+### Fixed
+
+- `getShellConfig` no longer throws `No bash shell found` on Windows hosts without a discoverable bash. `resolveWindowsShell` searches Git for Windows install roots (machine, per-user, `GIT_INSTALL_ROOT`, scoop app dirs — scoop shims `sh.exe`/`git.exe` but never `bash.exe`), then `bash.exe`/`sh.exe` on PATH, and finally falls back to `cmd.exe` from ComSpec with `/c` args, so shell resolution always succeeds.
+
+## [17.1.4] - 2026-07-26
+
+### Fixed
+
+- Fixed postmortem signal and fatal shutdown exits being intercepted by temporary `process.exit` guards during extension startup ([#6488](https://github.com/can1357/oh-my-pi/issues/6488)).
+- Corrected Windows shell resolution errors to identify the active global, project, overlay, or runtime source for `shellPath` instead of directing every user to the retired `settings.json` file ([#6579](https://github.com/can1357/oh-my-pi/issues/6579)).
+- Contained timed-out child lifecycle rejections so `ptree` callers cannot leak an unhandled `TimeoutError` after settling ([#6635](https://github.com/can1357/oh-my-pi/issues/6635)).
+- Fixed an invalid configured `shellPath` being silently masked whenever an earlier caller had already resolved a shell in the same process; the guidance error now surfaces regardless of cache state.
+
+## [17.0.9] - 2026-07-23
+
+### Breaking Changes
+
+- Renamed `getAutoQaDbDir` to `getAutoQaDbPath` for accuracy; update any usage accordingly
+
+## [17.0.5] - 2026-07-18
+
+### Changed
+
+- Updated `installRuntimeModuleResolver` to return an uninstaller function that restores the stock `node:module` resolver once all runtime roots are unregistered.
+- Added documentation regarding a known limitation with Bun 1.3.14's `createRequire` behavior when the module resolver patch is active.
+
+## [17.0.2] - 2026-07-17
+
+### Added
+
+- Added a structured log sink API (`registerLogSink`, `LogEvent`, `LogLevel`) to the centralized logger, enabling out-of-band consumers (such as OpenTelemetry) to receive log events without affecting local file or console logging.
+
+### Changed
+
+- Bounded default `ptree.ChildProcess` stderr retention to a 32 KiB tail to prevent memory leaks in long-lived subprocesses. Full stderr capture must now be explicitly requested at spawn time using `{ stderr: "full" }` on `spawn` or `exec`.
+
+### Fixed
+
+- Fixed fatal cleanup failing to reach `process.exit()` when terminal stderr is revoked.
+- Isolated rotating log files and audit state per process to prevent concurrent instances from racing during compression and rotation.
+
+## [17.0.1] - 2026-07-16
+
+### Fixed
+
+- Added scoped graceful handling for stdio-write EPIPE rejections so protocol servers can await postmortem cleanup when their peer disconnects ([#4788](https://github.com/can1357/oh-my-pi/issues/4788)).
+
+## [17.0.0] - 2026-07-15
+
+### Fixed
+
+- Improved SSE streaming performance by batching complete lines into a single UTF-8 decode per chunk, reducing decoder overhead.
+- Fixed an issue in `parseFrontmatter` where a single malformed YAML line would corrupt sibling values by parsing each line independently.
+
 ## [16.5.2] - 2026-07-14
 
 ### Fixed

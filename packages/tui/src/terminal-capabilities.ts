@@ -10,6 +10,7 @@ import {
 	setKittyGraphics,
 } from "./kitty-graphics";
 import { isInsideTmux, wrapTmuxPassthrough, wrapTmuxPassthroughIfNeeded } from "./tmux";
+import type { HangulCompatibilityJamoWidth } from "./utils";
 
 export { isInsideTmux, wrapTmuxPassthrough } from "./tmux";
 
@@ -35,6 +36,38 @@ export type TerminalId =
 	| "warp"
 	| "base"
 	| "trueColor";
+
+const CMUX_NOTIFICATION_TITLE = "Oh My Pi";
+const CMUX_SURFACE_ID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
+
+/**
+ * Route a notification through cmux when the process belongs to a concrete
+ * surface. Workspace/socket state alone is not enough: only the injected
+ * surface UUID identifies the pane that should receive the notification.
+ * Returns whether cmux owns delivery so the caller can preserve every existing
+ * terminal fallback unchanged when no valid surface is present.
+ */
+function sendCmuxNotification(message: string | TerminalNotification, env: NodeJS.ProcessEnv = Bun.env): boolean {
+	const surfaceId = env.CMUX_SURFACE_ID?.trim();
+	if (!surfaceId || !CMUX_SURFACE_ID_PATTERN.test(surfaceId)) return false;
+
+	const title =
+		typeof message === "string" ? CMUX_NOTIFICATION_TITLE : message.title?.trim() || CMUX_NOTIFICATION_TITLE;
+	const body = typeof message === "string" ? message : (message.body ?? "");
+	try {
+		const child = Bun.spawn({
+			cmd: ["cmux", "notify", "--surface", surfaceId, "--title", title, "--body", body],
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		child.unref();
+	} catch {
+		// A missing cmux binary leaves delivery to the existing terminal fallback.
+		return false;
+	}
+	return true;
+}
 
 function hasNeedleBefore(line: string, needle: string, limit: number): boolean {
 	const index = line.indexOf(needle);
@@ -73,6 +106,12 @@ export class TerminalInfo {
 		readonly supportsScreenToScrollback: boolean = false,
 		/** Renders the Kitty OSC 66 text-sizing protocol (scaled spans). Kitty only. */
 		public readonly textSizing: boolean = false,
+		/**
+		 * Hangul Compatibility Jamo (U+3131..=U+318E) cell width. Ghostty follows
+		 * UAX#11 (2 cells); Warp paints 1; "platform" keeps the OS default
+		 * (macOS narrow, otherwise UAX#11).
+		 */
+		public readonly hangulJamoWidth: HangulCompatibilityJamoWidth = "platform",
 	) {}
 
 	/**
@@ -111,6 +150,7 @@ export class TerminalInfo {
 
 	sendNotification(message: string | TerminalNotification): void {
 		if (isNotificationSuppressed() || isTerminalHeadless()) return;
+		if (sendCmuxNotification(message)) return;
 		const formatted = this.formatNotification(message);
 		// Under tmux, terminals whose notify protocol is OSC 9 / OSC 99 would
 		// otherwise lose the notification entirely: tmux does not forward bare
@@ -147,12 +187,13 @@ export class TerminalInfo {
 
 /** Detect terminal multiplexers where scrollback clearing and height-change redraws are hostile. */
 export function isInsideTerminalMultiplexer(env: NodeJS.ProcessEnv = Bun.env): boolean {
-	// TMUX/STY/ZELLIJ/CMUX workspace+surface ids are authoritative session
-	// signals. TERM can also survive when those are stripped (`sudo` without -E,
-	// `su`, env-sanitizing launchers/ssh). Do not use CMUX_SOCKET_PATH here: it is
-	// a CLI socket override and can be set outside a CMUX terminal.
+	// TMUX/STY/ZELLIJ and CMUX workspace/surface/remote-transport markers are
+	// authoritative session signals. TERM can also survive when those are
+	// stripped (`sudo` without -E, `su`, env-sanitizing launchers/ssh). Do not
+	// use CMUX_SOCKET_PATH here: it is a CLI socket override and can be set
+	// outside a CMUX terminal.
 	if (env.TMUX || env.STY || env.ZELLIJ) return true;
-	if (env.CMUX_WORKSPACE_ID || env.CMUX_SURFACE_ID) return true;
+	if (env.CMUX_WORKSPACE_ID || env.CMUX_SURFACE_ID || env.CMUX_REMOTE_TRANSPORT) return true;
 	const term = env.TERM?.toLowerCase() ?? "";
 	return term.startsWith("tmux") || term.startsWith("screen");
 }
@@ -413,7 +454,17 @@ export function resolveWarpImageProtocol(
 }
 
 function getWarpTerminalInfo(platform: NodeJS.Platform, env: NodeJS.ProcessEnv = Bun.env): TerminalInfo {
-	return new TerminalInfo("warp", resolveWarpImageProtocol(platform, env), true, false, NotifyProtocol.Osc9);
+	return new TerminalInfo(
+		"warp",
+		resolveWarpImageProtocol(platform, env),
+		true,
+		false,
+		NotifyProtocol.Osc9,
+		false,
+		false,
+		false,
+		1,
+	);
 }
 const KNOWN_TERMINALS = Object.freeze({
 	// Fallback terminals
@@ -421,7 +472,7 @@ const KNOWN_TERMINALS = Object.freeze({
 	trueColor: new TerminalInfo("trueColor", null, true, false, NotifyProtocol.Bell),
 	// Recognized terminals
 	kitty: new TerminalInfo("kitty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc99, true, true, true),
-	ghostty: new TerminalInfo("ghostty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9),
+	ghostty: new TerminalInfo("ghostty", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9, false, false, false, 2),
 	wezterm: new TerminalInfo("wezterm", ImageProtocol.Kitty, true, true, NotifyProtocol.Osc9),
 	iterm2: new TerminalInfo("iterm2", ImageProtocol.Iterm2, true, true, NotifyProtocol.Osc9),
 	vscode: new TerminalInfo("vscode", null, true, true, NotifyProtocol.Bell),
@@ -431,7 +482,7 @@ const KNOWN_TERMINALS = Object.freeze({
 	// detectKittyUnicodePlaceholdersSupport correctly excludes it). It does not
 	// honor OSC 8 yet (the escape renders as visible text), so hyperlinks stay off,
 	// but it does support OSC 9 notifications.
-	warp: new TerminalInfo("warp", ImageProtocol.Kitty, true, false, NotifyProtocol.Osc9),
+	warp: new TerminalInfo("warp", ImageProtocol.Kitty, true, false, NotifyProtocol.Osc9, false, false, false, 1),
 });
 
 /** Resolve terminal identity from environment markers used by common emulators. */
@@ -952,11 +1003,25 @@ export function renderImage(
 
 	if (TERMINAL.imageProtocol === ImageProtocol.Sixel) {
 		try {
-			const targetWidthPx = Math.max(1, fit.columns * cellDims.widthPx);
-			const targetHeightPx = Math.max(1, fit.rows * cellDims.heightPx);
+			// SIXEL encodes in 6-pixel vertical bands. A height that is not a
+			// multiple of 6 is padded with transparent rows, but the terminal
+			// still allocates cell rows for the padded height. When the padded
+			// height crosses a cell boundary the terminal uses one more row
+			// than fit.rows, so the next line of content overwrites the bottom
+			// of the image — a visible slice stripped from the image. Round the
+			// encode height DOWN to the largest multiple of 6 that fits within
+			// the requested row budget, so the band boundary aligns without
+			// padding and the reserved row count never exceeds fit.rows. Scale
+			// the width by the same ratio so resize_exact preserves the aspect
+			// ratio instead of squashing the image vertically.
+			const rawHeightPx = Math.max(1, fit.rows * cellDims.heightPx);
+			const targetHeightPx = Math.max(6, Math.floor(rawHeightPx / 6) * 6);
+			const heightScale = targetHeightPx / rawHeightPx;
+			const targetWidthPx = Math.max(1, Math.round(fit.columns * cellDims.widthPx * heightScale));
+			const rows = Math.max(1, Math.ceil(targetHeightPx / cellDims.heightPx));
 			const decoded = new Uint8Array(Buffer.from(base64Data, "base64"));
 			const sequence = encodeSixel(decoded, targetWidthPx, targetHeightPx);
-			return { sequence, rows: fit.rows };
+			return { sequence, rows };
 		} catch {
 			return null;
 		}

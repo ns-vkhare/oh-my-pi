@@ -17,6 +17,8 @@ import * as path from "node:path";
 import { removeWithRetries, VERSION } from "@oh-my-pi/pi-utils";
 import {
 	type ChangelogEntry,
+	getNewEntries,
+	parseChangelog,
 	RECENT_CHANGELOG_ENTRY_LIMIT,
 	readLastChangelogVersion,
 	renderChangelogEntries,
@@ -148,6 +150,21 @@ describe("selectStartupChangelog", () => {
 		expect(selection.markdown).toContain(STARTUP_CHANGELOG_FULL_HINT);
 		expect(selection.markdown).not.toContain("TAIL-THREE");
 		expect(Buffer.byteLength(selection.markdown ?? "")).toBeLessThanOrEqual(STARTUP_CHANGELOG_MAX_BYTES);
+	});
+});
+
+describe("parseChangelog", () => {
+	test("reads current source release data and filters versions newer than the previous release", async () => {
+		const entries = await parseChangelog(undefined);
+		const latest = entries[0];
+		const previous = entries[1];
+
+		expect(`${latest?.major}.${latest?.minor}.${latest?.patch}`).toBe(VERSION);
+		expect(latest?.content).toContain(`## [${VERSION}]`);
+		expect(previous).toBeDefined();
+
+		const previousVersion = `${previous?.major}.${previous?.minor}.${previous?.patch}`;
+		expect(getNewEntries(entries, previousVersion)).toEqual([latest]);
 	});
 });
 

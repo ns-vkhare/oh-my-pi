@@ -1,10 +1,10 @@
 import { LRUCache } from "lru-cache/raw";
-import { Marked, type Token, Tokenizer, type TokenizerAndRendererExtension, type Tokens } from "marked";
+import { Lexer, Marked, type Token, Tokenizer, type TokenizerAndRendererExtension, type Tokens } from "marked";
 import { latexToBlock } from "../latex-block";
 import { inlineMathSpanEnd, isBareMathEnvironment, latexToUnicode } from "../latex-to-unicode";
 import type { SymbolTheme } from "../symbols";
 import { TERMINAL } from "../terminal-capabilities";
-import type { Component } from "../tui";
+import type { Component, NativeScrollbackCommittedRows, NativeScrollbackReplay } from "../tui";
 import {
 	applyBackgroundToLine,
 	Ellipsis,
@@ -19,6 +19,16 @@ import {
 } from "../utils";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
+
+// Marked treats the backslash in an ST-terminated OSC 8 sequence (`ESC \\`) as
+// Markdown punctuation when it is immediately followed by markup such as a
+// codespan backtick. Normalize well-formed OSC 8 prefixes to the equivalent BEL
+// terminator before lexing so the control sequence stays opaque to Markdown.
+const OSC8_ST_PREFIX_REGEX = /(\x1b\]8;[^\x07\x1b]*)\x1b\\/g;
+
+function normalizeOsc8Terminators(text: string): string {
+	return text.replace(OSC8_ST_PREFIX_REGEX, "$1\x07");
+}
 
 // OSC 66 (Kitty text-sizing) heading spans are emitted as a single indivisible
 // unit by the H1 render path. Like image-protocol lines, they must bypass
@@ -482,12 +492,25 @@ const customHrExtension: TokenizerAndRendererExtension = {
 	},
 };
 
+// Leftmost-match scan replacing /\$|\\\(|\\\[/ in mathExtension.start —
+// marked calls start() on the remaining source at every inline position, so
+// the regex alternation showed up in CPU profiles (part of a ~4.3% start()
+// tail). Three indexOf scans yield the identical leftmost index.
+/** @internal exported for tests — must stay index-identical to the old regex scan. */
+export function mathStartIndex(src: string): number | undefined {
+	let best = src.indexOf("$");
+	const paren = src.indexOf("\\(");
+	if (paren !== -1 && (best === -1 || paren < best)) best = paren;
+	const bracket = src.indexOf("\\[");
+	if (bracket !== -1 && (best === -1 || bracket < best)) best = bracket;
+	return best === -1 ? undefined : best;
+}
+
 const mathExtension: TokenizerAndRendererExtension = {
 	name: "math",
 	level: "inline",
 	start(src) {
-		const m = /\$|\\\(|\\\[/.exec(src);
-		return m ? m.index : undefined;
+		return mathStartIndex(src);
 	},
 	tokenizer(src) {
 		if (src.startsWith("$$")) {
@@ -592,7 +615,213 @@ const mathEnvBlockExtension: TokenizerAndRendererExtension = {
 		return (token as { text?: string }).text ?? "";
 	},
 };
-markdownParser.use({ extensions: [customHrExtension, mathBlockExtension, mathEnvBlockExtension, mathExtension] });
+
+// GFM's extended autolinks (`www.`, `http://`, `https://`, `ftp://`) may only
+// begin at a valid left boundary: start of line, whitespace, or one of `* _ ~ (`
+// (https://github.github.com/gfm/#autolinks-extension-). marked's bundled `url`
+// tokenizer instead fires after ANY character, so a local path such as
+// `~/meta/www.share/blog/index.dj` is mangled into a `http://www.share/...`
+// link. This inline extension runs before the built-in tokenizer: when an
+// autolink candidate is glued to an invalid preceding character it emits the
+// bare scheme prefix as literal text, so the remainder never reaches the `url`
+// tokenizer at a valid start. Candidates at a legal boundary fall through
+// (return undefined) to marked's own autolink handling unchanged.
+const AUTOLINK_SCHEME_REGEX = /^(?:www\.|https?:\/\/|ftp:\/\/)/i;
+// Case-insensitive scheme scan replacing /www\.|https?:\/\/|ftp:\/\//i in
+// boundedAutolinkExtension.start — like mathStartIndex above, this runs on the
+// remaining source at every inline position (part of a ~4.3% CPU start() scan
+// tail in profiles). charCode-only: no allocation, no toLowerCase copies.
+// `| 32` lower-cases ASCII letters; `.`/`:`/`/` are compared exactly, matching
+// the regex's ASCII-only `i` semantics. charCodeAt past the end returns NaN,
+// which fails every comparison, so no explicit bounds checks are needed.
+function isAutolinkSchemeAt(src: string, i: number): boolean {
+	const c = src.charCodeAt(i) | 32;
+	if (c === 119 /* w */) {
+		// www.
+		return (
+			(src.charCodeAt(i + 1) | 32) === 119 &&
+			(src.charCodeAt(i + 2) | 32) === 119 &&
+			src.charCodeAt(i + 3) === 46 /* . */
+		);
+	}
+	if (c === 104 /* h */) {
+		// http:// | https://
+		if (
+			(src.charCodeAt(i + 1) | 32) !== 116 /* t */ ||
+			(src.charCodeAt(i + 2) | 32) !== 116 /* t */ ||
+			(src.charCodeAt(i + 3) | 32) !== 112 /* p */
+		) {
+			return false;
+		}
+		let j = i + 4;
+		if ((src.charCodeAt(j) | 32) === 115 /* s */) j++;
+		return src.charCodeAt(j) === 58 /* : */ && src.charCodeAt(j + 1) === 47 /* / */ && src.charCodeAt(j + 2) === 47;
+	}
+	if (c === 102 /* f */) {
+		// ftp://
+		return (
+			(src.charCodeAt(i + 1) | 32) === 116 /* t */ &&
+			(src.charCodeAt(i + 2) | 32) === 112 /* p */ &&
+			src.charCodeAt(i + 3) === 58 /* : */ &&
+			src.charCodeAt(i + 4) === 47 /* / */ &&
+			src.charCodeAt(i + 5) === 47 /* / */
+		);
+	}
+	return false;
+}
+
+/** @internal exported for tests — must stay index-identical to the old regex scan. */
+export function autolinkSchemeScanIndex(src: string): number | undefined {
+	for (let i = 0; i < src.length; i++) {
+		const c = src.charCodeAt(i) | 32;
+		if ((c === 119 || c === 104 || c === 102) && isAutolinkSchemeAt(src, i)) return i;
+	}
+	return undefined;
+}
+const VALID_AUTOLINK_LEFT_BOUNDARY = /[\s*_~(]/;
+const boundedAutolinkExtension: TokenizerAndRendererExtension = {
+	name: "boundedAutolink",
+	level: "inline",
+	start(src) {
+		return autolinkSchemeScanIndex(src);
+	},
+	tokenizer(src, tokens) {
+		const match = AUTOLINK_SCHEME_REGEX.exec(src);
+		if (!match) return undefined;
+		const prevChar = tokens.at(-1)?.raw?.at(-1);
+		// Start of line or a legal delimiter → let marked autolink it.
+		if (prevChar === undefined || VALID_AUTOLINK_LEFT_BOUNDARY.test(prevChar)) return undefined;
+		// Glued to an invalid character (e.g. `/`, a letter, `.`): consume only
+		// the scheme prefix as text so the built-in `url` tokenizer cannot match.
+		const raw = match[0];
+		return { type: "text", raw, text: raw };
+	},
+};
+markdownParser.use({
+	extensions: [customHrExtension, mathBlockExtension, mathEnvBlockExtension, mathExtension, boundedAutolinkExtension],
+});
+
+// ---------------------------------------------------------------------------
+// GFM `url` tokenizer gate
+// ---------------------------------------------------------------------------
+// marked tries the bundled GFM `url` tokenizer at every inline tokenization
+// step, and its regex is expensive to FAIL: the email alternative
+// `^[A-Za-z0-9._+-]+(@)…` linearly consumes an identifier run, then backtracks
+// it one character at a time when no `@` follows. A 71414-sample / 1ms CPU
+// profile of the TUI put 73.3% of total CPU (74.9s of a 102s capture) inside
+// this single regex. The override below runs an O(bounded) charCode gate first
+// and only falls through to the built-in tokenizer — by returning `false`,
+// marked's tokenizer-override fallback contract — when a match is possible.
+//
+// Conservativeness argument. The built-in rule (no flags) is
+//   /^((?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*
+//    |^[A-Za-z0-9._+-]+(@)[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![-_])/
+// Both alternatives are anchored, so any match constrains the head of src:
+//  • Branch 1 requires src to start with `http://`, `https://`, `ftp://`
+//    (scheme letters in any case) or lowercase `www.`. The gate accepts all of
+//    these via isAutolinkSchemeAt(src, 0); it also over-accepts `WWW.`, a
+//    harmless false positive (the built-in regex simply fails to match).
+//  • Branch 2 requires src to start with one-or-more chars from
+//    `[A-Za-z0-9._+-]` immediately followed by `@`. The gate scans that exact
+//    class: if the run ends within URL_GATE_EMAIL_SCAN_LIMIT chars it accepts
+//    iff the terminator is `@`; a run reaching the limit is accepted
+//    unconditionally. Every src branch 2 can match is therefore accepted —
+//    the gate never rejects a src the built-in regex would match.
+const URL_GATE_EMAIL_SCAN_LIMIT = 320;
+
+/** @internal exported for tests — must never return false for a src the built-in url regex matches. */
+export function urlTokenPossible(src: string): boolean {
+	if (isAutolinkSchemeAt(src, 0)) return true;
+	let i = 0;
+	while (i < URL_GATE_EMAIL_SCAN_LIMIT) {
+		const c = src.charCodeAt(i);
+		const isLocalChar =
+			(c >= 97 && c <= 122) /* a-z */ ||
+			(c >= 65 && c <= 90) /* A-Z */ ||
+			(c >= 48 && c <= 57) /* 0-9 */ ||
+			c === 46 /* . */ ||
+			c === 95 /* _ */ ||
+			c === 43 /* + */ ||
+			c === 45; /* - */
+		if (!isLocalChar) break;
+		i++;
+	}
+	if (i === 0) return false;
+	if (i >= URL_GATE_EMAIL_SCAN_LIMIT) return true; // over-long run: give up conservatively
+	return src.charCodeAt(i) === 64 /* @ */;
+}
+
+// Setext-underline pre-gate for marked's `lheading` rule. The rule's lazy body
+// `((?:.|\n(?!<block-start>))+?)` re-runs its block-start lookahead while
+// expanding character by character, so even a FAILING attempt at offset 0
+// costs O(len × lookahead) — ~26µs per 200-char list-item body, and marked's
+// list tokenizer block-tokenizes every item's content (47.8% of a streaming
+// bench profile). A match REQUIRES the setext underline `\n {0,3}(=+|-+)`
+// somewhere in src, so this O(n) charCode scan never rejects a src the
+// built-in rule would match; single-line srcs (every tight list item) reject
+// on the first indexOf.
+function lheadingPossible(src: string): boolean {
+	let i = src.indexOf("\n");
+	while (i !== -1) {
+		let j = i + 1;
+		const limit = j + 3; // underline allows up to 3 leading spaces
+		while (j < limit && src.charCodeAt(j) === 0x20 /* space */) j++;
+		const c = src.charCodeAt(j); // NaN past the end fails both comparisons
+		if (c === 0x3d /* = */ || c === 0x2d /* - */) return true;
+		i = src.indexOf("\n", j);
+	}
+	return false;
+}
+
+markdownParser.use({
+	tokenizer: {
+		// `false` → marked falls back to the built-in tokenizer;
+		// `undefined` → no token here, built-in never runs.
+		url(src: string): Tokens.Link | undefined | false {
+			return urlTokenPossible(src) ? false : undefined;
+		},
+		lheading(src: string): Tokens.Heading | undefined | false {
+			return lheadingPossible(src) ? false : undefined;
+		},
+	},
+});
+
+// ---------------------------------------------------------------------------
+// Sticky clones of marked's pathological block rules
+// ---------------------------------------------------------------------------
+// Bun's (JSC) regex engine skips the start-anchor fast-fail for several of
+// marked's `^`-anchored block rules — `hr`, `lheading`, `table` and `html` are
+// anchored alternations of quantified branches, and a failing `exec`/`test`
+// rescans the entire remaining source instead of stopping after offset 0.
+// marked's list tokenizer runs `hr.test` and `lheading` per list line against
+// the remaining source, so lexing a long list is quadratic (66% of a streaming
+// bench profile sat in these two regexes). A sticky (`y`) clone with
+// `lastIndex` pinned to 0 attempts the match at offset 0 only.
+//
+// Equivalence: for a flagless rule whose source is `^`-anchored, a sticky
+// clone at `lastIndex = 0` matches exactly when the original matches (same
+// match object, same captures) — `^` already restricted matches to offset 0
+// (no `m` flag), and stickiness only removes the futile later attempts. The
+// flags/anchor guard below skips any rule a future marked version changes.
+class AnchoredAtZero extends RegExp {
+	exec(str: string): RegExpExecArray | null {
+		this.lastIndex = 0; // sticky matches set lastIndex; rules are shared
+		return super.exec(str);
+	}
+	test(str: string): boolean {
+		this.lastIndex = 0;
+		return super.test(str);
+	}
+}
+
+for (const table of [Lexer.rules.block.normal, Lexer.rules.block.gfm]) {
+	for (const name of ["hr", "lheading", "table", "html"] as const) {
+		const rule = table[name];
+		if (rule.flags === "" && rule.source.startsWith("^")) {
+			table[name] = new AnchoredAtZero(rule.source, "y");
+		}
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Module-level LRU render cache
@@ -604,14 +833,20 @@ markdownParser.use({ extensions: [customHrExtension, mathBlockExtension, mathEnv
 // (Rust FFI) work for content/layout combinations already seen this session.
 
 const RENDER_CACHE_MAX = 256; // sane cap: ~256 distinct message × width combos
-const RENDER_CACHE_MAX_SIZE = 512 * 1024;
-const RENDER_CACHE_MAX_ENTRY_SIZE = 32 * 1024;
+const RENDER_CACHE_MAX_SIZE = 4 * 1024 * 1024;
+const RENDER_CACHE_MAX_ENTRY_SIZE = 256 * 1024;
 const EMPTY_RENDER_LINES: readonly string[] = [];
-const renderCache = new LRUCache<string, readonly string[]>({
+
+interface RenderCacheEntry {
+	lines: readonly string[];
+	tables: readonly RenderedTableLayout[];
+}
+
+const renderCache = new LRUCache<string, RenderCacheEntry>({
 	max: RENDER_CACHE_MAX,
 	maxSize: RENDER_CACHE_MAX_SIZE,
 	maxEntrySize: RENDER_CACHE_MAX_ENTRY_SIZE,
-	sizeCalculation: renderedLinesCacheSize,
+	sizeCalculation: renderCacheEntrySize,
 });
 
 function renderedLinesCacheSize(lines: readonly string[]): number {
@@ -620,12 +855,191 @@ function renderedLinesCacheSize(lines: readonly string[]): number {
 	return Math.max(1, size);
 }
 
+function renderCacheEntrySize(entry: RenderCacheEntry): number {
+	let size = renderedLinesCacheSize(entry.lines);
+	for (const table of entry.tables) size += table.key.length + table.columnWidths.length + 4;
+	return size;
+}
+
 // A reference-link definition (`[label]: dest`) resolves across the whole
 // document, so a split lex cannot reproduce it — disable the streaming fast path
 // when one is present (rare in streamed output). The label may contain
 // backslash-escaped characters (`[a\]b]: x`), so escapes are matched explicitly;
 // over-matching is safe (it only costs the fast path), under-matching is not.
 const HAS_REF_DEF = /^ {0,3}\[(?:\\.|[^\]\\])+\]:/m;
+
+// marked's list tokenizer (Tokenizer.list, marked v18) continues a list across
+// blank lines only when the remaining source matches
+// `listItemRegex(marker)` = `^( {0,3}${marker})((?:[\t ][^\n]*)?(?:\n|$))`,
+// where `marker` is the exact bullet char for unordered lists (`\${char}`) or
+// 1-9 digits plus the exact delimiter for ordered lists (`\d{1,9}\${delim}`).
+// The marker is derived from the list's FIRST item (`n = t[1].trim()`), which
+// sits at the start of a top-level list token's raw:
+const LIST_MARKER_RE = /^ {0,3}(?:([*+-])|\d{1,9}([.)]))/;
+
+// Streaming-freeze equivalence invariant: lex(prefix) ++ lex(tail) must equal
+// lex(full text) — for the CURRENT text and for every append-only extension of
+// it, because a frozen prefix is sticky (it keeps being reused while the text
+// grows). At a blank-line (`\n\n`) cut directly after a top-level `list`
+// token, the only construct that can straddle the cut is a continuation item
+// of that list: marked consumed the blank line into the last item's raw and
+// re-ran `listItemRegex` at exactly `tailStart`, merging a same-marker item
+// into one renumbered loose list. The cut is safe only when that regex can
+// NEVER match at `tailStart`, no matter what is appended later.
+//
+// Append-only growth means existing characters are immutable while new ones
+// may appear after them, so "closed" may only be concluded from a present
+// character that contradicts every possible continuation (e.g. tail "1x" can
+// never grow into an ordered item, but tail "1" can become "1. c"). Running
+// out of text mid-marker therefore answers "may continue".
+//
+// Returns true when the tail could still continue the list (or the list's
+// marker is unrecognizable) — the conservative "don't freeze" answer. marked
+// may break the list anyway when the matching line is also an hr (`- - -`);
+// treating that as "may continue" merely skips a freeze, never corrupts one.
+function listMayContinueAt(text: string, tailStart: number, listRaw: string): boolean {
+	const marker = LIST_MARKER_RE.exec(listRaw);
+	if (marker === null) return true; // unrecognized list shape — stay conservative
+	const n = text.length;
+	let i = tailStart;
+	// `listItemRegex` allows up to 3 leading spaces (the caller's next-char
+	// guard rejects whitespace at the final cut, but mirror the rule exactly).
+	while (i < n && i - tailStart < 3 && text.charCodeAt(i) === 0x20 /* space */) i++;
+	if (i >= n) return true;
+	const bullet = marker[1];
+	if (bullet !== undefined) {
+		if (text[i] !== bullet) return false; // wrong marker char — closed forever
+		i++;
+	} else {
+		// Ordered: 1-9 digits, then the same `.`/`)` delimiter.
+		let digits = 0;
+		while (i < n && digits < 10) {
+			const c = text.charCodeAt(i);
+			if (c < 0x30 /* 0 */ || c > 0x39 /* 9 */) break;
+			digits++;
+			i++;
+		}
+		if (digits === 0 || digits > 9) return false; // no digit run / too long — closed forever
+		if (i >= n) return true; // delimiter (or more digits) may still arrive
+		if (text[i] !== marker[2]) return false; // wrong delimiter — closed forever
+		i++;
+	}
+	// After the marker: `(?:[\t ][^\n]*)?(?:\n|$)` — tab/space + anything, a
+	// bare newline, or end-of-input (which appends can still extend).
+	if (i >= n) return true;
+	const after = text.charCodeAt(i);
+	return after === 0x20 /* space */ || after === 0x09 /* tab */ || after === 0x0a /* \n */;
+}
+
+const NO_BLOCK_BOUNDARY = { end: 0, count: 0 } as const;
+
+/**
+ * Offset just past the last token in `tokens` that closes a block on a hard
+ * `"\n\n"` break, together with the number of tokens up to and including it.
+ * `count === 0` means the run holds no usable boundary.
+ *
+ * `base` is where `tokens[0]` starts inside `text`. A boundary qualifies only
+ * when splitting there is invisible to the lexer, i.e. `lex(head) ++ lex(tail)
+ * === lex(text)`:
+ *  - The break must sit inside `text`. At end-of-text the next character is
+ *    unknown (and, while streaming, may still arrive), so the cut is deferred.
+ *  - The next character must start real block content. Whitespace means the
+ *    block separator straddles the cut — e.g. a fence followed by
+ *    `"\n\n\n- list"` — and the two lexes desync.
+ *  - A preceding `list` must be provably closed: CommonMark lets a same-marker
+ *    item continue the list across the blank line, and marked merges both into
+ *    one renumbered loose list (`listMayContinueAt`).
+ */
+function stableBlockBoundary(text: string, base: number, tokens: Token[]): { end: number; count: number } {
+	let pos = base;
+	let end = 0;
+	let count = 0;
+	for (let i = 0; i < tokens.length; i++) {
+		const raw = tokens[i].raw;
+		const tokenEnd = pos + raw.length;
+		if (raw.endsWith("\n\n")) {
+			const prev = i > 0 ? tokens[i - 1] : undefined;
+			if (prev === undefined || prev.type !== "list" || !listMayContinueAt(text, tokenEnd, prev.raw)) {
+				end = tokenEnd;
+				count = i + 1;
+			}
+		}
+		pos = tokenEnd;
+	}
+	if (count === 0 || end >= text.length) return NO_BLOCK_BOUNDARY;
+	const next = text.charCodeAt(end);
+	if (next === 0x20 /* space */ || next === 0x0a /* \n */) return NO_BLOCK_BOUNDARY;
+	return { end, count };
+}
+
+// Bun's regex engine skips the start-anchor optimization for several of marked's
+// block rules — `hr`, `lheading`, `table` and `html` are `^`-anchored
+// alternations of quantified branches — so each failing `exec` rescans the whole
+// remaining source instead of stopping at offset 0. Lexing is then quadratic in
+// document length: an 800 KB message costs ~41 s under Bun where Node/V8 needs
+// ~60 ms, and it runs on the render path, freezing the UI. Bounded windows keep
+// every scan short and restore linear behavior (~0.7 s for that same message).
+const LEX_WINDOW_BYTES = 2 * 1024;
+// Under this size a single pass beats probing for window boundaries; the
+// crossover measured on pathological Markdown sits around 16 KB.
+const WINDOWED_LEX_MIN_BYTES = 16 * 1024;
+
+/**
+ * Lex `text` in bounded windows, producing the exact token stream
+ * `markdownParser.lexer(text)` would.
+ *
+ * Window cuts come from marked itself: a throwaway BLOCK-ONLY probe lex of the
+ * window reports its last stable block boundary ({@link stableBlockBoundary})
+ * and only that confirmed segment is handed to the real lexer; a window
+ * holding no boundary doubles until it finds one or reaches the end. Probes
+ * never run inline tokenization (their inlineQueue is discarded) — a boundary
+ * is a property of block structure alone, and probe inline passes were the
+ * dominant cost of an earlier revision. Block tokenization runs per window
+ * while inline tokenization is deferred to the end — mirroring `Lexer.lex` —
+ * so a `[label]: dest` definition anywhere in the document still resolves for
+ * every inline span.
+ *
+ * A boundary requires some top-level token whose raw ends in `"\n\n"`, so a
+ * window that contains no blank line cannot cut: each round starts at the next
+ * `"\n\n"` (skipping straight to the end when there is none — e.g. a tail
+ * that is one long tight list) instead of probing sizes that cannot succeed.
+ */
+function lexWindowed(text: string): Token[] {
+	const lexer = new Lexer(markdownParser.defaults);
+	let offset = 0;
+	while (offset < text.length) {
+		let segment = "";
+		const nextBlank = text.indexOf("\n\n", offset);
+		if (nextBlank === -1) {
+			segment = text.slice(offset);
+		} else {
+			const minSize = Math.max(LEX_WINDOW_BYTES, nextBlank + 2 - offset);
+			for (let size = minSize; segment.length === 0; size *= 2) {
+				if (offset + size >= text.length) {
+					segment = text.slice(offset);
+					break;
+				}
+				const probe = new Lexer(markdownParser.defaults);
+				probe.blockTokens(text.slice(offset, offset + size), probe.tokens);
+				const boundary = stableBlockBoundary(text, offset, probe.tokens);
+				if (boundary.count > 0) segment = text.slice(offset, boundary.end);
+			}
+		}
+		lexer.blockTokens(segment, lexer.tokens);
+		offset += segment.length;
+	}
+	for (const queued of lexer.inlineQueue) lexer.inlineTokens(queued.src, queued.tokens);
+	lexer.inlineQueue = [];
+	return lexer.tokens;
+}
+
+/** Lex a whole document, windowing anything large enough for the quadratic scan to bite. */
+function lexDocument(text: string): Token[] {
+	// A CR shifts every `raw` span (marked normalizes CRLF before tokenizing), so
+	// window offsets would address the wrong characters — lex those in one pass.
+	if (text.length < WINDOWED_LEX_MIN_BYTES || text.includes("\r")) return markdownParser.lexer(text);
+	return lexWindowed(text);
+}
 
 /** Drop all L2 cache entries. Call on theme change to prevent stale styled output. */
 export function clearRenderCache(): void {
@@ -951,6 +1365,7 @@ interface StreamPrefixLineCache extends RenderSignature {
 	text: string;
 	tokenCount: number;
 	lines: readonly string[];
+	tables: readonly TableRenderSpec[];
 }
 interface StreamingDiffLineCache extends RenderSignature {
 	lang: string | undefined;
@@ -958,7 +1373,25 @@ interface StreamingDiffLineCache extends RenderSignature {
 	lines: readonly string[];
 }
 
-export class Markdown implements Component {
+interface TableLayoutLock {
+	availableWidth: number;
+	columnWidths: readonly number[];
+}
+
+interface TableRenderSpec extends TableLayoutLock {
+	key: string;
+	lineCount: number;
+	startRow: number;
+	endRow: number;
+}
+
+interface RenderedTableLayout extends TableLayoutLock {
+	key: string;
+	startRow: number;
+	endRow: number;
+}
+
+export class Markdown implements Component, NativeScrollbackCommittedRows, NativeScrollbackReplay {
 	#text: string;
 	#paddingX: number; // Left/right padding
 	#paddingY: number; // Top/bottom padding
@@ -1005,10 +1438,19 @@ export class Markdown implements Component {
 	#renderingFrozenPrefix = false;
 	#streamingDiffLineCache?: StreamingDiffLineCache;
 	#activeRenderSignature?: RenderSignature;
+	// Streaming tables may grow naturally while wholly repaintable. Once any
+	// physical row of a table enters native scrollback, its current column widths
+	// are locked for the rest of this append-only text lineage: future wider cells
+	// wrap inside those columns instead of reflowing immutable history above.
+	#tableLayoutWidth?: number;
+	#lockedTableLayouts = new Map<string, TableLayoutLock>();
+	#lastRenderedTableLayouts: RenderedTableLayout[] = [];
+	#activeTableRenderSpecs?: TableRenderSpec[];
 
 	#ignoreTight = false;
 
 	setIgnoreTight(ignore: boolean): this {
+		if (this.#ignoreTight !== ignore) this.#clearTableLayouts();
 		this.#ignoreTight = ignore;
 		this.invalidate();
 		return this;
@@ -1022,7 +1464,7 @@ export class Markdown implements Component {
 		defaultTextStyle?: DefaultTextStyle,
 		codeBlockIndent: number = 2,
 	) {
-		this.#text = text;
+		this.#text = normalizeOsc8Terminators(text);
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 		this.#theme = theme;
@@ -1031,12 +1473,14 @@ export class Markdown implements Component {
 	}
 
 	setText(text: string): boolean {
+		text = normalizeOsc8Terminators(text);
 		// Equality guard: streaming re-emits identical text on ticks that carried
 		// no delta (throttled provider frames, reconciled tool-execution updates).
 		// Without this, the caller-side `#cachedLines` gets thrown away and the
 		// full lex + wrap runs per re-emit — one of the top CPU hotspots during
 		// streaming (issue #4353). Mirrors `Text.setText`'s guard.
 		if (text === this.#text) return false;
+		if (!text.startsWith(this.#text)) this.#clearTableLayouts();
 		this.#text = text;
 		if (!text.trim()) {
 			// Blank replacement: render() early-returns before #lexTokens can see
@@ -1080,6 +1524,41 @@ export class Markdown implements Component {
 		return this.#lastRenderSettledRows;
 	}
 
+	/**
+	 * Freeze every table whose first physical row is already part of the native
+	 * scrollback prefix. The recorded widths came from the exact frame that was
+	 * just emitted, so the next streamed delta cannot retroactively widen it.
+	 */
+	setNativeScrollbackCommittedRows(rows: number): void {
+		const committed = Number.isFinite(rows) ? Math.max(0, Math.trunc(rows)) : 0;
+		let changed = false;
+		for (const table of this.#lastRenderedTableLayouts) {
+			if (table.startRow >= committed || this.#lockedTableLayouts.has(table.key)) continue;
+			this.#lockedTableLayouts.set(table.key, {
+				availableWidth: table.availableWidth,
+				columnWidths: table.columnWidths.slice(),
+			});
+			changed = true;
+		}
+		if (changed) this.invalidate();
+	}
+
+	/** A destructive replay removes the immutable tape this layout was guarding. */
+	prepareNativeScrollbackReplay(): void {
+		this.#clearTableLayouts();
+		this.#tableLayoutWidth = undefined;
+		this.invalidate();
+	}
+
+	#clearTableLayouts(): void {
+		this.#lockedTableLayouts.clear();
+		this.#lastRenderedTableLayouts = [];
+		this.#activeTableRenderSpecs = undefined;
+		// Same-width replay/non-append rewrites could otherwise reuse physical
+		// prefix lines rendered with the retired locked widths.
+		this.#streamPrefixLineCache = undefined;
+	}
+
 	// Lex `text` into block tokens, reusing the frozen stable prefix when the text
 	// only grew (the streaming path). Falls back to a full lex whenever the prefix
 	// is no longer a prefix (non-append edit), the text carries reference-link
@@ -1097,12 +1576,12 @@ export class Markdown implements Component {
 			text.length > prefix.length &&
 			text.startsWith(prefix)
 		) {
-			const tailTokens = markdownParser.lexer(text.slice(prefix.length));
+			const tailTokens = lexDocument(text.slice(prefix.length));
 			const tokens = [...prefixTokens, ...tailTokens];
 			this.#freezeStablePrefix(text, tokens, { preserveExisting: true });
 			return tokens;
 		}
-		const tokens = markdownParser.lexer(text);
+		const tokens = lexDocument(text);
 		if (canStream) {
 			this.#freezeStablePrefix(text, tokens, { preserveExisting: false });
 		} else {
@@ -1119,36 +1598,11 @@ export class Markdown implements Component {
 	// reference definitions, so each token's `raw` is a verbatim slice of `text`
 	// and the summed offsets address `text` exactly.
 	#freezeStablePrefix(text: string, tokens: Token[], opts: { preserveExisting: boolean }): void {
-		let pos = 0;
-		let frozenEnd = 0;
-		let frozenCount = 0;
-		for (let i = 0; i < tokens.length; i++) {
-			const raw = tokens[i].raw;
-			const end = pos + raw.length;
-			// A `space` token ending in "\n\n" closes the preceding block, but a
-			// `list` before it can still be extended by a following same-marker
-			// item across the blank line (CommonMark loose-list continuation),
-			// which marked merges into one renumbered loose list. Freezing across
-			// such a cut would keep the lists separate. Never freeze right after a
-			// list — it stays in the re-lexed tail.
-			if (raw.endsWith("\n\n") && tokens[i - 1]?.type !== "list") {
-				frozenEnd = end;
-				frozenCount = i + 1;
-			}
-			pos = end;
-		}
-		// Freeze only when the tail begins with real block content. If the next
-		// char is whitespace (an extra blank line, or an indented continuation),
-		// the block separator straddles the cut and lex(prefix)++lex(tail) would
-		// desync from a full lex — e.g. a fence followed by "\n\n\n- list". When
-		// frozenEnd is at end-of-text the next char is unknown, so defer.
-		if (frozenCount > 0 && frozenEnd < text.length) {
-			const next = text.charCodeAt(frozenEnd);
-			if (next !== 0x20 /* space */ && next !== 0x0a /* \n */) {
-				this.#streamPrefixText = text.slice(0, frozenEnd);
-				this.#streamPrefixTokens = tokens.slice(0, frozenCount);
-				return;
-			}
+		const frozen = stableBlockBoundary(text, 0, tokens);
+		if (frozen.count > 0) {
+			this.#streamPrefixText = text.slice(0, frozen.end);
+			this.#streamPrefixTokens = tokens.slice(0, frozen.count);
+			return;
 		}
 
 		if (!opts.preserveExisting) {
@@ -1159,6 +1613,11 @@ export class Markdown implements Component {
 	}
 
 	render(width: number): readonly string[] {
+		if (this.#tableLayoutWidth !== undefined && this.#tableLayoutWidth !== width) {
+			this.#clearTableLayouts();
+			this.invalidate();
+		}
+		this.#tableLayoutWidth = width;
 		// L1: per-instance cache — fastest path for repeated renders of the same
 		// instance at the same width (e.g. resize debounce, repeated redraws).
 		// Returning the cached reference is load-bearing: parents memoize their
@@ -1200,29 +1659,40 @@ export class Markdown implements Component {
 		// theme.heading is used as the representative theme probe — it's required
 		// by MarkdownTheme and is one of the most styling-sensitive entries.
 		let cacheKey: string | undefined;
-		if (!this.transientRenderCache) {
+		if (!this.transientRenderCache && this.#lockedTableLayouts.size === 0) {
 			cacheKey = this.#renderCacheKey(normalizedText, signature);
 			const cached = renderCache.get(cacheKey);
 			if (cached !== undefined) {
+				// Restore both the rendered rows and the geometry metadata that produced
+				// them. A later scrollback publication must never lock widths from an
+				// older transient frame against rows served from this cache entry.
+				this.#lastRenderedTableLayouts = cached.tables.map(table => ({
+					...table,
+					columnWidths: table.columnWidths.slice(),
+				}));
 				// Populate L1 so subsequent calls from this instance are O(1) map lookup.
 				this.#cachedText = this.#text;
 				this.#cachedWidth = width;
-				this.#cachedLines = cached;
-				return cached;
+				this.#cachedLines = cached.lines;
+				return cached.lines;
 			}
 		}
 
 		// Parse markdown to HTML-like tokens
 		const tokens = this.#lexTokens(normalizedText);
 		let contentLines: string[];
+		const tableRenderSpecs: TableRenderSpec[] = [];
+		this.#activeTableRenderSpecs = tableRenderSpecs;
 		this.#activeRenderSignature = signature;
 		try {
 			contentLines = this.transientRenderCache
 				? this.#renderStreamingContentLines(tokens, normalizedText, signature, contentWidth)
-				: this.#renderContentLines(tokens, 0, tokens.length, contentWidth, signature);
+				: this.#renderContentLines(tokens, 0, tokens.length, contentWidth, signature, 0, 0);
 		} finally {
 			this.#activeRenderSignature = undefined;
+			this.#activeTableRenderSpecs = undefined;
 		}
+		this.#lastRenderedTableLayouts = this.#resolveRenderedTableLayouts(tableRenderSpecs, signature.paddingY);
 		const emptyLines = this.#renderEmptyPaddingLines(signature);
 
 		// Combine top padding, content, and bottom padding
@@ -1239,7 +1709,13 @@ export class Markdown implements Component {
 		// Update L2 module-level LRU so future instances with the same key skip
 		// the marked.lexer + highlightCode (Rust FFI) work entirely.
 		if (cacheKey !== undefined) {
-			renderCache.set(cacheKey, result);
+			renderCache.set(cacheKey, {
+				lines: result,
+				tables: this.#lastRenderedTableLayouts.map(table => ({
+					...table,
+					columnWidths: table.columnWidths.slice(),
+				})),
+			});
 		}
 
 		return result;
@@ -1276,15 +1752,18 @@ export class Markdown implements Component {
 		const frozenText = this.#streamPrefixText;
 		const frozenTokenCount = this.#streamPrefixTokens?.length ?? 0;
 		if (frozenText === undefined || frozenTokenCount === 0 || !normalizedText.startsWith(frozenText)) {
-			return this.#renderContentLines(tokens, 0, tokens.length, contentWidth, signature);
+			return this.#renderContentLines(tokens, 0, tokens.length, contentWidth, signature, 0, 0);
 		}
 
 		const contentLines: string[] = [];
 		const reusablePrefix = this.#matchingStreamPrefixLineCache(normalizedText, frozenText, signature);
 		let renderedUntil = 0;
+		let renderedSourceOffset = 0;
 		if (reusablePrefix && reusablePrefix.tokenCount <= frozenTokenCount) {
 			contentLines.push(...reusablePrefix.lines);
+			this.#activeTableRenderSpecs?.push(...reusablePrefix.tables);
 			renderedUntil = reusablePrefix.tokenCount;
+			renderedSourceOffset = reusablePrefix.text.length;
 		}
 
 		if (renderedUntil < frozenTokenCount) {
@@ -1293,7 +1772,15 @@ export class Markdown implements Component {
 			this.#renderingFrozenPrefix = true;
 			try {
 				contentLines.push(
-					...this.#renderContentLines(tokens, renderedUntil, frozenTokenCount, contentWidth, signature),
+					...this.#renderContentLines(
+						tokens,
+						renderedUntil,
+						frozenTokenCount,
+						contentWidth,
+						signature,
+						contentLines.length,
+						renderedSourceOffset,
+					),
 				);
 			} finally {
 				this.#renderingFrozenPrefix = false;
@@ -1306,6 +1793,7 @@ export class Markdown implements Component {
 			text: frozenText,
 			tokenCount: frozenTokenCount,
 			lines: contentLines.slice(),
+			tables: this.#activeTableRenderSpecs?.slice() ?? [],
 		};
 
 		// Settled exposure (hard-monotone): these rows are declared final to
@@ -1322,7 +1810,17 @@ export class Markdown implements Component {
 		}
 
 		if (renderedUntil < tokens.length) {
-			contentLines.push(...this.#renderContentLines(tokens, renderedUntil, tokens.length, contentWidth, signature));
+			contentLines.push(
+				...this.#renderContentLines(
+					tokens,
+					renderedUntil,
+					tokens.length,
+					contentWidth,
+					signature,
+					contentLines.length,
+					frozenText.length,
+				),
+			);
 		}
 
 		return contentLines;
@@ -1356,23 +1854,58 @@ export class Markdown implements Component {
 		end: number,
 		contentWidth: number,
 		signature: RenderSignature,
+		rowOffset: number,
+		startingSourceOffset: number,
 	): string[] {
-		const renderedLines: string[] = [];
+		const wrappedLines: string[] = [];
+		let sourceOffset = startingSourceOffset;
 		for (let i = start; i < end; i++) {
 			const token = tokens[i];
 			const nextToken = tokens[i + 1];
-			renderedLines.push(...this.#renderToken(token, contentWidth, nextToken?.type));
-		}
-
-		const wrappedLines: string[] = [];
-		for (const line of renderedLines) {
-			// Skip wrapping for image protocol lines and OSC 66 sized headings
-			// (would corrupt escape sequences / split the indivisible sized span).
-			if (TERMINAL.isImageLine(line) || isOsc66Line(line)) {
-				wrappedLines.push(line);
-			} else {
-				wrappedLines.push(...wrapTextWithAnsi(line, contentWidth));
+			const tableSpecStart = this.#activeTableRenderSpecs?.length ?? 0;
+			const tokenWrappedRowStart = wrappedLines.length;
+			const tokenRowStart = rowOffset + tokenWrappedRowStart;
+			const renderedTokenLines = this.#renderToken(
+				token,
+				contentWidth,
+				nextToken?.type,
+				undefined,
+				`offset:${sourceOffset}`,
+			);
+			const tokenLineOffsets = [0];
+			for (const line of renderedTokenLines) {
+				// Lists wrap while their structural prefixes are still available, so
+				// continuation rows retain the correct hanging indent. Re-wrapping the
+				// flattened rows here would discard that structure.
+				if (token.type === "list" || TERMINAL.isImageLine(line) || isOsc66Line(line)) {
+					wrappedLines.push(line);
+				} else {
+					wrappedLines.push(...wrapTextWithAnsi(line, contentWidth));
+				}
+				tokenLineOffsets.push(wrappedLines.length - tokenWrappedRowStart);
 			}
+			const tableSpecs = this.#activeTableRenderSpecs;
+			if (tableSpecs !== undefined) {
+				for (let specIndex = tableSpecStart; specIndex < tableSpecs.length; specIndex++) {
+					const spec = tableSpecs[specIndex]!;
+					let relativeStart: number;
+					let relativeEnd: number;
+					if (token.type === "table") {
+						// Exclude the optional inter-block blank from a top-level table's span.
+						relativeStart = 0;
+						relativeEnd = Math.min(renderedTokenLines.length, spec.lineCount);
+					} else {
+						// Container renderers express nested table spans relative to their
+						// returned lines. Preserve that exact span through this final wrap.
+						if (spec.startRow < 0 || spec.endRow <= spec.startRow) continue;
+						relativeStart = Math.min(renderedTokenLines.length, spec.startRow);
+						relativeEnd = Math.min(renderedTokenLines.length, spec.endRow);
+					}
+					spec.startRow = tokenRowStart + tokenLineOffsets[relativeStart]!;
+					spec.endRow = tokenRowStart + tokenLineOffsets[relativeEnd]!;
+				}
+			}
+			sourceOffset += token.raw.length;
 		}
 
 		const leftMargin = padding(signature.paddingX);
@@ -1414,6 +1947,21 @@ export class Markdown implements Component {
 		}
 
 		return contentLines;
+	}
+
+	#resolveRenderedTableLayouts(specs: readonly TableRenderSpec[], topPadding: number): RenderedTableLayout[] {
+		const layouts: RenderedTableLayout[] = [];
+		for (const spec of specs) {
+			if (spec.startRow < 0 || spec.endRow <= spec.startRow) continue;
+			layouts.push({
+				key: spec.key,
+				availableWidth: spec.availableWidth,
+				columnWidths: spec.columnWidths.slice(),
+				startRow: topPadding + spec.startRow,
+				endRow: topPadding + spec.endRow,
+			});
+		}
+		return layouts;
 	}
 
 	#renderCodeBodyLines(token: Token, codeIndent: string): string[] {
@@ -1626,7 +2174,13 @@ export class Markdown implements Component {
 		};
 	}
 
-	#renderToken(token: Token, width: number, nextTokenType?: string, styleContext?: InlineStyleContext): string[] {
+	#renderToken(
+		token: Token,
+		width: number,
+		nextTokenType?: string,
+		styleContext?: InlineStyleContext,
+		tokenKey = "root",
+	): string[] {
 		const lines: string[] = [];
 
 		// Display math block (own-line `$$…$$` / `\[…\]`): stack `\frac` vertically
@@ -1720,7 +2274,7 @@ export class Markdown implements Component {
 			}
 
 			case "list": {
-				const listLines = this.#renderList(token as ListToken, 0, styleContext);
+				const listLines = this.#renderList(token as ListToken, 0, width, styleContext);
 				lines.push(...listLines);
 				// Don't add spacing after lists if a space token follows
 				// (the space token will handle it)
@@ -1728,7 +2282,7 @@ export class Markdown implements Component {
 			}
 
 			case "table": {
-				const tableLines = this.#renderTable(token as TableToken, width, nextTokenType, styleContext);
+				const tableLines = this.#renderTable(token as TableToken, width, nextTokenType, styleContext, tokenKey);
 				lines.push(...tableLines);
 				break;
 			}
@@ -1741,20 +2295,59 @@ export class Markdown implements Component {
 				const quoteContentWidth = Math.max(1, width - 2);
 				const quoteTokens = token.tokens || [];
 				const renderedQuoteLines: string[] = [];
+				const blockquoteSpecStart = this.#activeTableRenderSpecs?.length ?? 0;
 
 				for (let i = 0; i < quoteTokens.length; i++) {
 					const quoteToken = quoteTokens[i];
 					const nextQuoteToken = quoteTokens[i + 1];
-					renderedQuoteLines.push(
-						...this.#renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext),
+					const quoteTokenRowStart = renderedQuoteLines.length;
+					const quoteSpecStart = this.#activeTableRenderSpecs?.length ?? 0;
+					const quoteTokenLines = this.#renderToken(
+						quoteToken,
+						quoteContentWidth,
+						nextQuoteToken?.type,
+						quoteInlineStyleContext,
+						`${tokenKey}/quote:${i}`,
 					);
+					renderedQuoteLines.push(...quoteTokenLines);
+
+					const tableSpecs = this.#activeTableRenderSpecs;
+					if (tableSpecs !== undefined) {
+						for (let specIndex = quoteSpecStart; specIndex < tableSpecs.length; specIndex++) {
+							const spec = tableSpecs[specIndex]!;
+							if (spec.startRow < 0) {
+								// Direct child tables initially have no row coordinates. Their
+								// structural line count excludes any inter-block blank.
+								spec.startRow = quoteTokenRowStart;
+								spec.endRow = quoteTokenRowStart + Math.min(quoteTokenLines.length, spec.lineCount);
+							} else {
+								// A nested blockquote already mapped the table into its own
+								// returned rows; translate those rows into this quote's input.
+								spec.startRow += quoteTokenRowStart;
+								spec.endRow += quoteTokenRowStart;
+							}
+						}
+					}
 				}
 
 				while (renderedQuoteLines.length > 0 && renderedQuoteLines[renderedQuoteLines.length - 1] === "") {
 					renderedQuoteLines.pop();
 				}
 
-				lines.push(...this.#applyQuoteBorder(renderedQuoteLines, width));
+				const quoteRowOffsets: number[] = [];
+				const borderedQuoteLines = this.#applyQuoteBorder(renderedQuoteLines, width, quoteRowOffsets);
+				const tableSpecs = this.#activeTableRenderSpecs;
+				if (tableSpecs !== undefined) {
+					for (let specIndex = blockquoteSpecStart; specIndex < tableSpecs.length; specIndex++) {
+						const spec = tableSpecs[specIndex]!;
+						if (spec.startRow < 0 || spec.endRow <= spec.startRow) continue;
+						const relativeStart = Math.min(renderedQuoteLines.length, spec.startRow);
+						const relativeEnd = Math.min(renderedQuoteLines.length, spec.endRow);
+						spec.startRow = quoteRowOffsets[relativeStart]!;
+						spec.endRow = quoteRowOffsets[relativeEnd]!;
+					}
+				}
+				lines.push(...borderedQuoteLines);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after blockquotes (unless space token follows)
 				}
@@ -1801,7 +2394,7 @@ export class Markdown implements Component {
 	 * Wrap already-rendered lines in the blockquote border and quote styling.
 	 * `width` is the full content width; the border reserves two cells.
 	 */
-	#applyQuoteBorder(renderedLines: string[], width: number): string[] {
+	#applyQuoteBorder(renderedLines: string[], width: number, sourceRowOffsets?: number[]): string[] {
 		const quoteStyle = (text: string) => this.#theme.quote(this.#theme.italic(text));
 		const quoteStylePrefix = this.#getStylePrefix(quoteStyle);
 		const applyQuoteStyle = (line: string): string => {
@@ -1813,11 +2406,13 @@ export class Markdown implements Component {
 		};
 		const quoteContentWidth = Math.max(1, width - 2);
 		const lines: string[] = [];
+		sourceRowOffsets?.push(0);
 		for (const quoteLine of renderedLines) {
 			const styledLine = applyQuoteStyle(quoteLine);
 			for (const wrappedLine of wrapTextWithAnsi(styledLine, quoteContentWidth)) {
 				lines.push(this.#theme.quoteBorder(`${this.#theme.symbols.quoteBorder} `) + wrappedLine);
 			}
+			sourceRowOffsets?.push(lines.length);
 		}
 		return lines;
 	}
@@ -1939,8 +2534,8 @@ export class Markdown implements Component {
 					if (token.text === token.href || token.text === hrefForComparison)
 						result += clickableLinkText + stylePrefix;
 					else {
-						const styledLinkUrl = this.#theme.linkUrl(` (${token.href})`);
-						result += clickableLinkText + formatHyperlink(styledLinkUrl, token.href) + stylePrefix;
+						const styledLinkUrl = this.#theme.linkUrl(`(${token.href})`);
+						result += `${clickableLinkText} ${formatHyperlink(styledLinkUrl, token.href)}${stylePrefix}`;
 					}
 					break;
 				}
@@ -1995,46 +2590,60 @@ export class Markdown implements Component {
 	/**
 	 * Render a list with proper nesting support
 	 */
-	#renderList(token: ListToken, depth: number, styleContext?: InlineStyleContext): string[] {
+	#renderList(token: ListToken, depth: number, width: number, styleContext?: InlineStyleContext): string[] {
 		const lines: string[] = [];
 		const indent = "  ".repeat(depth);
 		// Use the list's start property (defaults to 1 for ordered lists)
 		const startNumber = token.start ?? 1;
+		const pushWrapped = (text: string, firstPrefix: string, continuationPrefix: string): void => {
+			const prefixWidth = visibleWidth(firstPrefix);
+			if (prefixWidth >= width) {
+				lines.push(truncateToWidth(firstPrefix, width, Ellipsis.Omit));
+				lines.push(...wrapTextWithAnsi(text, Math.max(1, width)));
+				return;
+			}
+			const bodyWidth = width - prefixWidth;
+			const wrapped = wrapTextWithAnsi(text, bodyWidth);
+			if (wrapped.length === 0) {
+				lines.push(firstPrefix);
+				return;
+			}
+			lines.push(firstPrefix + wrapped[0]);
+			for (let lineIndex = 1; lineIndex < wrapped.length; lineIndex++) {
+				lines.push(continuationPrefix + wrapped[lineIndex]);
+			}
+		};
 
 		for (let i = 0; i < token.items.length; i++) {
 			const item = token.items[i];
 			const bullet = token.ordered ? `${startNumber + i}. ` : "- ";
+			const firstPrefix = indent + this.#theme.listBullet(bullet);
 			// Continuation rows align under the item text, so the hang matches the
 			// actual bullet width (`10. ` is 4 cells, not 2).
-			const continuationIndent = indent + padding(bullet.length);
+			const continuationIndent = indent + padding(visibleWidth(bullet));
 
 			// Process item tokens; nested-list lines arrive structurally tagged and
 			// already carry their own full indent.
-			const itemLines = this.#renderListItem(item.tokens || [], depth, styleContext);
+			const itemLines = this.#renderListItem(item.tokens || [], depth, width, styleContext);
 
 			if (itemLines.length > 0) {
 				const firstLine = itemLines[0]!;
 				if (firstLine.nested) {
-					// Nested list first - keep as-is (already has full indent)
 					lines.push(firstLine.text);
 				} else {
-					// Regular text content - add indent and bullet
-					lines.push(indent + this.#theme.listBullet(bullet) + firstLine.text);
+					pushWrapped(firstLine.text, firstPrefix, continuationIndent);
 				}
 
-				// Rest of the lines
 				for (let j = 1; j < itemLines.length; j++) {
 					const line = itemLines[j]!;
 					if (line.nested) {
-						// Nested list line - already has full indent
 						lines.push(line.text);
 					} else {
-						// Regular content - hang under the item text
-						lines.push(continuationIndent + line.text);
+						pushWrapped(line.text, continuationIndent, continuationIndent);
 					}
 				}
 			} else {
-				lines.push(indent + this.#theme.listBullet(bullet));
+				lines.push(firstPrefix);
 			}
 		}
 
@@ -2050,6 +2659,7 @@ export class Markdown implements Component {
 	#renderListItem(
 		tokens: Token[],
 		parentDepth: number,
+		width: number,
 		styleContext?: InlineStyleContext,
 	): Array<{ text: string; nested: boolean }> {
 		const lines: Array<{ text: string; nested: boolean }> = [];
@@ -2058,7 +2668,7 @@ export class Markdown implements Component {
 			if (token.type === "list") {
 				// Nested list - render with one additional indent level
 				// These lines carry their own indent, so tag them for pass-through
-				const nestedLines = this.#renderList(token as ListToken, parentDepth + 1, styleContext);
+				const nestedLines = this.#renderList(token as ListToken, parentDepth + 1, width, styleContext);
 				for (const nestedLine of nestedLines) {
 					lines.push({ text: nestedLine, nested: true });
 				}
@@ -2137,7 +2747,14 @@ export class Markdown implements Component {
 	 */
 	#wrapCellText(text: string, maxWidth: number): string[] {
 		const cellWidth = Math.max(1, maxWidth);
-		return splitTerminalLines(text).flatMap(line => wrapTextWithAnsi(line, cellWidth));
+		// Wrap the whole cell in one call so wrapTextWithAnsi() balances OSC 8
+		// hyperlink state across explicit newlines (e.g. `<br>` rendered as \n);
+		// per-fragment wrapping would drop the reopened link on later rows.
+		const wrapped = wrapTextWithAnsi(text, cellWidth);
+		while (wrapped.length > 1 && wrapped[wrapped.length - 1] === "") {
+			wrapped.pop();
+		}
+		return wrapped;
 	}
 
 	/**
@@ -2149,6 +2766,7 @@ export class Markdown implements Component {
 		availableWidth: number,
 		nextTokenType?: string,
 		styleContext?: InlineStyleContext,
+		tableKey = "table",
 	): string[] {
 		const lines: string[] = [];
 		const numCols = token.header.length;
@@ -2263,6 +2881,17 @@ export class Markdown implements Component {
 			}
 		}
 
+		const lockedLayout = this.#lockedTableLayouts.get(tableKey);
+		if (
+			lockedLayout !== undefined &&
+			lockedLayout.availableWidth === availableWidth &&
+			lockedLayout.columnWidths.length === numCols &&
+			lockedLayout.columnWidths.every(width => Number.isFinite(width) && width >= 1) &&
+			lockedLayout.columnWidths.reduce((total, width) => total + width, borderOverhead) <= availableWidth
+		) {
+			columnWidths = lockedLayout.columnWidths.slice();
+		}
+
 		const t = this.#theme.symbols.table;
 		const h = t.horizontal;
 		const v = t.vertical;
@@ -2316,7 +2945,16 @@ export class Markdown implements Component {
 
 		// Render bottom border
 		const bottomBorderCells = columnWidths.map(w => h.repeat(w));
-		lines.push(`${t.bottomLeft}${h}${bottomBorderCells.join(`${h}${t.teeUp}${h}`)}${h}${t.bottomRight}`);
+		const bottomBorder = `${t.bottomLeft}${h}${bottomBorderCells.join(`${h}${t.teeUp}${h}`)}${h}${t.bottomRight}`;
+		lines.push(bottomBorder);
+		this.#activeTableRenderSpecs?.push({
+			key: tableKey,
+			availableWidth,
+			columnWidths: columnWidths.slice(),
+			lineCount: lines.length,
+			startRow: -1,
+			endRow: -1,
+		});
 
 		if (nextTokenType && nextTokenType !== "space") {
 			lines.push(""); // Add spacing after table
@@ -2332,7 +2970,7 @@ export class Markdown implements Component {
 export function renderInlineMarkdown(text: string, mdTheme: MarkdownTheme, baseColor?: (t: string) => string): string {
 	// Guard against undefined/null during streaming — partial JSON can leave fields unpopulated.
 	if (typeof text !== "string") return (baseColor ?? (t => t))(text != null ? String(text) : "");
-	const tokens = markdownParser.lexer(text);
+	const tokens = markdownParser.lexer(normalizeOsc8Terminators(text));
 	const applyText = baseColor ?? ((t: string) => t);
 	let result = "";
 	for (const token of tokens) {

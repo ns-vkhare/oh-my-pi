@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Effort } from "@oh-my-pi/pi-ai";
@@ -16,8 +16,11 @@ import {
 	Settings,
 } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { AUTO_IMAGE_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/tools/image-providers";
+import { SEARCH_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/web/search/types";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
+import * as fileLock from "../src/config/file-lock";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 function context(): Context {
@@ -25,6 +28,15 @@ function context(): Context {
 		systemPrompt: [],
 		messages: [{ role: "user", content: "hi", timestamp: 0 }],
 	};
+}
+
+class FsCodeError extends Error {
+	code: string;
+
+	constructor(code: string, message: string) {
+		super(message);
+		this.code = code;
+	}
 }
 
 describe("Settings", () => {
@@ -62,6 +74,7 @@ describe("Settings", () => {
 	};
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		clearCustomApis();
 		__providerInFlightForTesting.setRoot(undefined);
 		AgentStorage.resetInstance();
@@ -112,6 +125,269 @@ describe("Settings", () => {
 			expect(await Bun.file(getConfigPath()).exists()).toBe(true);
 			expect(await Bun.file(yamlConfigPath).exists()).toBe(false);
 			expect((await readSettings()).setupVersion).toBe(1);
+		});
+	});
+
+	describe("shell configuration errors", () => {
+		it("points to the selected global config in the active agent directory", async () => {
+			const configPath = path.join(agentDir, "config.yaml");
+			const missingShell = tempDir.join("missing-global-bash");
+			await Bun.write(configPath, YAML.stringify({ shellPath: missingShell }, null, 2));
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(() => settings.getShellConfig()).toThrow(`Please update shellPath in ${configPath}`);
+		});
+
+		it("points to the project file that supplied shellPath", async () => {
+			const configPath = path.join(getProjectAgentDir(projectDir), "config.yml");
+			const missingShell = tempDir.join("missing-project-bash");
+			await Bun.write(configPath, YAML.stringify({ shellPath: missingShell }, null, 2));
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(() => settings.getShellConfig()).toThrow(`Please update shellPath in ${configPath}`);
+		});
+
+		it("points to the overlay that supplied shellPath", async () => {
+			const configPath = tempDir.join("shell-overlay.yml");
+			const missingShell = tempDir.join("missing-overlay-bash");
+			await Bun.write(configPath, YAML.stringify({ shellPath: missingShell }, null, 2));
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir, configFiles: [configPath] });
+
+			expect(() => settings.getShellConfig()).toThrow(`Please update shellPath in ${configPath}`);
+		});
+	});
+
+	describe("config file failure safety", () => {
+		it("moves malformed main config aside and refuses to start with silent defaults", async () => {
+			const configPath = getConfigPath();
+			const original = [
+				"auth:",
+				"  broker:",
+				"    token: TOP-SECRET",
+				"modelRoles:",
+				'  default: "unterminated',
+				"",
+			].join("\n");
+			await Bun.write(configPath, original);
+
+			await expect(Settings.init({ cwd: projectDir, agentDir })).rejects.toThrow("Settings config is invalid");
+
+			expect(await Bun.file(configPath).exists()).toBe(false);
+			const backupNames = fs.readdirSync(agentDir).filter(name => name.startsWith("config.yml.broken-"));
+			expect(backupNames).toHaveLength(1);
+			expect(await Bun.file(path.join(agentDir, backupNames[0])).text()).toBe(original);
+		});
+
+		it("rejects when another process quarantines malformed config before the lock is acquired", async () => {
+			const configPath = getConfigPath();
+			const backupPath = `${configPath}.broken-other-process`;
+			const original = 'modelRoles:\n  default: "unterminated\n';
+			await Bun.write(configPath, original);
+			const canonicalConfigPath = await fs.promises.realpath(configPath);
+			const withFileLock = fileLock.withFileLock;
+			let movedAside = false;
+			vi.spyOn(fileLock, "withFileLock").mockImplementation(async (filePath, fn, options) => {
+				if (!movedAside && filePath === canonicalConfigPath) {
+					await fs.promises.rename(configPath, backupPath);
+					movedAside = true;
+				}
+				return await withFileLock(filePath, fn, options);
+			});
+
+			await expect(Settings.init({ cwd: projectDir, agentDir })).rejects.toThrow(
+				"invalid before locking and is now missing",
+			);
+
+			expect(movedAside).toBe(true);
+			expect(await Bun.file(configPath).exists()).toBe(false);
+			expect(await Bun.file(backupPath).text()).toBe(original);
+		});
+
+		it("keeps malformed config in place for read-only loads", async () => {
+			const configPath = getConfigPath();
+			const original = 'modelRoles:\n  default: "unterminated\n';
+			await Bun.write(configPath, original);
+
+			await expect(Settings.loadReadOnly({ cwd: projectDir, agentDir })).rejects.toThrow(
+				"Settings config is invalid",
+			);
+
+			expect(await Bun.file(configPath).text()).toBe(original);
+			expect(fs.readdirSync(agentDir).filter(name => name.startsWith("config.yml.broken-"))).toEqual([]);
+		});
+
+		it("backs up a config corrupted after startup and retains the pending global change for retry", async () => {
+			await writeSettings({
+				auth: { broker: { token: "TOP-SECRET" } },
+				modelRoles: { default: "keep/default" },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const corrupted = 'auth:\n  broker:\n    token: TOP-SECRET\nmodelRoles:\n  default: "unterminated\n';
+			await Bun.write(getConfigPath(), corrupted);
+
+			settings.set("theme.dark", "anthracite");
+			await expect(settings.flush()).rejects.toThrow("Settings config is invalid");
+
+			expect(await Bun.file(getConfigPath()).exists()).toBe(false);
+			const backupNames = fs.readdirSync(agentDir).filter(name => name.startsWith("config.yml.broken-"));
+			expect(backupNames).toHaveLength(1);
+			const backupPath = path.join(agentDir, backupNames[0]);
+			expect(await Bun.file(backupPath).text()).toBe(corrupted);
+
+			await settings.flush();
+			expect(await readSettings()).toEqual({
+				auth: { broker: { token: "TOP-SECRET" } },
+				modelRoles: { default: "keep/default" },
+				theme: { dark: "anthracite" },
+			});
+			expect(await Bun.file(backupPath).text()).toBe(corrupted);
+			expect(fs.readdirSync(agentDir).some(name => name.endsWith(".tmp"))).toBe(false);
+			if (process.platform !== "win32") {
+				expect(fs.statSync(getConfigPath()).mode & 0o777).toBe(0o600);
+			}
+		});
+
+		it("backs up a corrupted project config and retains the pending project role for retry", async () => {
+			await writeSettings({});
+			const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+			await Bun.write(
+				projectConfigPath,
+				YAML.stringify({ modelRoles: { default: "keep/default" }, custom: { keep: true } }, null, 2),
+			);
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const corrupted = 'modelRoles:\n  default: keep/default\n  advisor: "unterminated\ncustom:\n  keep: true\n';
+			await Bun.write(projectConfigPath, corrupted);
+
+			settings.setProjectModelRole("smol", "new/smol");
+			await expect(settings.flush()).rejects.toThrow("Settings config is invalid");
+
+			expect(await Bun.file(projectConfigPath).exists()).toBe(false);
+			const projectAgentDir = path.dirname(projectConfigPath);
+			const backupNames = fs.readdirSync(projectAgentDir).filter(name => name.startsWith("config.yml.broken-"));
+			expect(backupNames).toHaveLength(1);
+			const backupPath = path.join(projectAgentDir, backupNames[0]);
+			expect(await Bun.file(backupPath).text()).toBe(corrupted);
+
+			await settings.flush();
+			const saved = YAML.parse(await Bun.file(projectConfigPath).text()) as Record<string, unknown>;
+			expect(saved).toEqual({
+				modelRoles: { default: "keep/default", smol: "new/smol" },
+				custom: { keep: true },
+			});
+			expect(await Bun.file(backupPath).text()).toBe(corrupted);
+		});
+
+		it("preserves a symlinked main config while atomically updating its target", async () => {
+			const managedConfigPath = tempDir.join("managed-config.yml");
+			await Bun.write(managedConfigPath, YAML.stringify({ setupVersion: 1 }, null, 2));
+			await fs.promises.symlink(managedConfigPath, getConfigPath(), "file");
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("setupVersion", 2);
+			await settings.flush();
+
+			expect(fs.lstatSync(getConfigPath()).isSymbolicLink()).toBe(true);
+			expect(YAML.parse(await Bun.file(managedConfigPath).text())).toEqual({ setupVersion: 2 });
+		});
+
+		it("falls back to move-aside replacement when Windows reports EPERM", async () => {
+			await writeSettings({ setupVersion: 1 });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const canonicalConfigPath = await fs.promises.realpath(getConfigPath());
+			const rename = fs.promises.rename.bind(fs.promises);
+			let injected = false;
+			vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+				if (!injected && String(source).endsWith(".tmp") && String(target) === canonicalConfigPath) {
+					injected = true;
+					throw new FsCodeError("EPERM", "injected Windows replacement failure");
+				}
+				await rename(source, target);
+			});
+
+			settings.set("setupVersion", 2);
+			await settings.flush();
+
+			expect(injected).toBe(true);
+			expect(await readSettings()).toEqual({ setupVersion: 2 });
+			expect(fs.readdirSync(agentDir).some(name => name.endsWith(".tmp") || name.endsWith(".bak"))).toBe(false);
+		});
+
+		it("leaves an unreadable main config untouched and retains its pending change", async () => {
+			const original = YAML.stringify(
+				{
+					auth: { broker: { token: "TOP-SECRET" } },
+					modelRoles: { default: "keep/default" },
+				},
+				null,
+				2,
+			);
+			await Bun.write(getConfigPath(), original);
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("theme.dark", "anthracite");
+			const readSpy = vi.spyOn(fs.promises, "readFile");
+			readSpy.mockRejectedValueOnce(new FsCodeError("EIO", "injected read failure"));
+
+			await expect(settings.flush()).rejects.toThrow("Failed to read settings config");
+			readSpy.mockRestore();
+
+			expect(await Bun.file(getConfigPath()).text()).toBe(original);
+			expect(fs.readdirSync(agentDir).some(name => name.startsWith("config.yml.broken-"))).toBe(false);
+			await settings.flush();
+			expect(await readSettings()).toEqual({
+				auth: { broker: { token: "TOP-SECRET" } },
+				modelRoles: { default: "keep/default" },
+				theme: { dark: "anthracite" },
+			});
+		});
+
+		it("leaves an unreadable project config untouched and retains its pending role", async () => {
+			await writeSettings({});
+			const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+			const original = YAML.stringify({ modelRoles: { default: "keep/default" }, custom: { keep: true } }, null, 2);
+			await Bun.write(projectConfigPath, original);
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.setProjectModelRole("smol", "new/smol");
+			const readSpy = vi.spyOn(fs.promises, "readFile");
+			readSpy.mockRejectedValueOnce(new FsCodeError("EACCES", "injected read failure"));
+
+			await expect(settings.flush()).rejects.toThrow("Failed to read settings config");
+			readSpy.mockRestore();
+
+			expect(await Bun.file(projectConfigPath).text()).toBe(original);
+			expect(
+				fs.readdirSync(path.dirname(projectConfigPath)).some(name => name.startsWith("config.yml.broken-")),
+			).toBe(false);
+			await settings.flush();
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
+				modelRoles: { default: "keep/default", smol: "new/smol" },
+				custom: { keep: true },
+			});
+		});
+
+		it("observes both failures when global and project configs are malformed", async () => {
+			const malformed = 'modelRoles:\n  default: "unterminated\n';
+			await Promise.all([
+				Bun.write(getConfigPath(), malformed),
+				Bun.write(path.join(projectDir, ".omp", "config.yml"), malformed),
+			]);
+			const unhandled: unknown[] = [];
+			const onUnhandled = (reason: unknown): void => {
+				unhandled.push(reason);
+			};
+			process.on("unhandledRejection", onUnhandled);
+			try {
+				await expect(Settings.init({ cwd: projectDir, agentDir })).rejects.toThrow("Settings config is invalid");
+				expect(unhandled).toEqual([]);
+				expect(fs.readdirSync(agentDir).some(name => name.startsWith("config.yml.broken-"))).toBe(true);
+				expect(
+					fs.readdirSync(path.join(projectDir, ".omp")).some(name => name.startsWith("config.yml.broken-")),
+				).toBe(true);
+			} finally {
+				process.removeListener("unhandledRejection", onUnhandled);
+			}
 		});
 	});
 
@@ -422,6 +698,85 @@ describe("Settings", () => {
 			expect(settings.getModelRole("smol")).toBe("anthropic/claude-haiku-4-5");
 		});
 
+		it("preserves concurrent external per-role edits when saving one global role", async () => {
+			await writeSettings({
+				modelRoles: { default: "anthropic/claude-sonnet-4-5", advisor: "moonshot/kimi-k2" },
+			});
+
+			// Process loads its #global snapshot.
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// External edit (another omp instance / manual edit): changes advisor,
+			// adds vision. This process's #global is now stale.
+			await writeSettings({
+				modelRoles: {
+					default: "anthropic/claude-sonnet-4-5",
+					advisor: "moonshot/kimi-k3:max",
+					vision: "anthropic/claude-haiku-4-5",
+				},
+			});
+
+			// This process makes one global-scope role switch and flushes.
+			settings.setModelRole("smol", "anthropic/claude-haiku-4-5");
+			await settings.flush();
+
+			const savedSettings = await readSettings();
+			// The role we changed lands…
+			expect((savedSettings.modelRoles as Record<string, string>).smol).toBe("anthropic/claude-haiku-4-5");
+			// …and the concurrent external per-role edits survive rather than
+			// being clobbered by our stale whole-map snapshot.
+			expect(savedSettings.modelRoles).toEqual({
+				default: "anthropic/claude-sonnet-4-5",
+				advisor: "moonshot/kimi-k3:max",
+				vision: "anthropic/claude-haiku-4-5",
+				smol: "anthropic/claude-haiku-4-5",
+			});
+		});
+
+		it("does not replay a preserved role after the save writes it", async () => {
+			await writeSettings({
+				modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const firstSaveEntered = Promise.withResolvers<void>();
+			const releaseFirstSave = Promise.withResolvers<void>();
+			const firstSaveFinished = Promise.withResolvers<void>();
+			const withFileLock = fileLock.withFileLock;
+			vi.spyOn(fileLock, "withFileLock").mockImplementation(async (filePath, fn, options) => {
+				firstSaveEntered.resolve();
+				const result = await withFileLock(filePath, fn, options);
+				firstSaveFinished.resolve();
+				return result;
+			});
+
+			settings.setModelRole("smol", "anthropic/claude-haiku-4-5");
+			await firstSaveEntered.promise;
+			settings.setModelRole("advisor", "moonshot/kimi-k3:max");
+			releaseFirstSave.resolve();
+			await firstSaveFinished.promise;
+
+			expect((await readSettings()).modelRoles).toEqual({
+				default: "anthropic/claude-sonnet-4-5",
+				smol: "anthropic/claude-haiku-4-5",
+				advisor: "moonshot/kimi-k3:max",
+			});
+
+			await writeSettings({
+				modelRoles: {
+					default: "anthropic/claude-sonnet-4-5",
+					smol: "anthropic/claude-haiku-4-5",
+					advisor: "external/new-advisor",
+				},
+			});
+			await settings.flush();
+
+			expect((await readSettings()).modelRoles).toEqual({
+				default: "anthropic/claude-sonnet-4-5",
+				smol: "anthropic/claude-haiku-4-5",
+				advisor: "external/new-advisor",
+			});
+		});
+
 		it("restores persisted model roles after clearing runtime overrides", async () => {
 			await writeSettings({
 				modelRoles: { default: "anthropic/claude-sonnet-4-5" },
@@ -514,6 +869,46 @@ describe("Settings", () => {
 
 			expect(settings.getEditVariantForModel("openrouter/moonshotai/Kimi-K2-Instruct")).toBeNull();
 			expect(settings.getEditVariantForModel("openai/gpt-5.2-codex")).toBe("apply_patch");
+		});
+	});
+
+	describe("provider preference migration", () => {
+		it("expands a legacy providers.webSearch choice into the head of webSearchOrder", async () => {
+			await writeSettings({ providers: { webSearch: "exa" } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("providers.webSearchOrder")).toEqual([
+				"exa",
+				...SEARCH_PROVIDER_ORDER.filter(id => id !== "exa"),
+			]);
+		});
+
+		it("drops legacy providers.webSearch auto without seeding an order", async () => {
+			await writeSettings({ providers: { webSearch: "auto" } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("providers.webSearchOrder")).toEqual([]);
+		});
+
+		it("keeps an explicit webSearchOrder over the legacy webSearch preference", async () => {
+			await writeSettings({ providers: { webSearch: "exa", webSearchOrder: ["gemini"] } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("providers.webSearchOrder")).toEqual(["gemini"]);
+		});
+
+		it("expands a legacy providers.image choice into the head of imageOrder", async () => {
+			await writeSettings({ providers: { image: "xai" } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("providers.imageOrder")).toEqual([
+				"xai",
+				...AUTO_IMAGE_PROVIDER_ORDER.filter(id => id !== "xai"),
+			]);
 		});
 	});
 
@@ -694,15 +1089,114 @@ describe("Settings", () => {
 			expect(settings.get("grep.enabled")).toBe(true);
 		});
 
-		it("migrates legacy tool names in persisted essential overrides", async () => {
+		it("migrates nested dev.autoqa.consent and todo.reminders.max without configuring parents", async () => {
 			await writeSettings({
-				tools: { essentialOverride: ["read", "find", "search", "grep"] },
-				"tools.essentialOverride": ["find", "search", "read"],
+				dev: { autoqa: { consent: "granted" } },
+				todo: { reminders: { max: 5 } },
 			});
 
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 
-			expect(settings.get("tools.essentialOverride")).toEqual(["read", "glob", "grep"]);
+			expect(settings.get("dev.autoqaConsent")).toBe("granted");
+			expect(settings.get("dev.autoqa")).toBe(true);
+			expect(settings.isConfigured("dev.autoqa")).toBe(false);
+			expect(settings.get("todo.remindersMax")).toBe(5);
+			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.isConfigured("todo.reminders")).toBe(false);
+		});
+
+		it("migrates quoted dotted legacy keys for consent and reminders max", async () => {
+			await Bun.write(getConfigPath(), `"dev.autoqa.consent": denied\n"todo.reminders.max": 2\n`);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("dev.autoqaConsent")).toBe("denied");
+			expect(settings.isConfigured("dev.autoqa")).toBe(false);
+			expect(settings.get("todo.remindersMax")).toBe(2);
+			expect(settings.get("todo.reminders")).toBe(true);
+		});
+
+		it("lets explicit new keys win over legacy nested consent/max values", async () => {
+			await writeSettings({
+				dev: { autoqa: { consent: "denied" }, autoqaConsent: "granted" },
+				todo: { reminders: { max: 1 }, remindersMax: 9 },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("dev.autoqaConsent")).toBe("granted");
+			expect(settings.isConfigured("dev.autoqa")).toBe(false);
+			expect(settings.get("todo.remindersMax")).toBe(9);
+			expect(settings.get("todo.reminders")).toBe(true);
+		});
+
+		it("preserves recoverable parent booleans alongside legacy leaf keys", async () => {
+			await Bun.write(
+				getConfigPath(),
+				`dev:\n  autoqa: true\n"dev.autoqa.consent": unset\ntodo:\n  reminders: false\n"todo.reminders.max": 4\n`,
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("dev.autoqa")).toBe(true);
+			expect(settings.get("dev.autoqaConsent")).toBe("unset");
+			expect(settings.get("todo.reminders")).toBe(false);
+			expect(settings.get("todo.remindersMax")).toBe(4);
+		});
+
+		it("migrates denied/granted/unset consent values through isolated overrides", () => {
+			for (const consent of ["denied", "granted", "unset"] as const) {
+				const settings = Settings.isolated({
+					"dev.autoqa.consent": consent,
+				} as Partial<Record<SettingPath, unknown>>);
+				expect(settings.get("dev.autoqaConsent")).toBe(consent);
+				expect(settings.isConfigured("dev.autoqa")).toBe(false);
+			}
+		});
+
+		it("persists migrated consent/max keys and drops legacy nested parents on save", async () => {
+			await writeSettings({
+				dev: { autoqa: { consent: "denied" } },
+				todo: { reminders: { max: 1 } },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("dev.autoqaConsent")).toBe("denied");
+			expect(settings.get("todo.remindersMax")).toBe(1);
+
+			// Touch an unrelated key so the migrated tree is written back.
+			settings.set("display.showTokenUsage", true);
+			await settings.flush();
+
+			const onDisk = await readSettings();
+			const dev = onDisk.dev as Record<string, unknown>;
+			const todo = onDisk.todo as Record<string, unknown>;
+			expect(dev.autoqaConsent).toBe("denied");
+			expect(dev.autoqa).toBeUndefined();
+			expect(todo.remindersMax).toBe(1);
+			expect(todo.reminders).toBeUndefined();
+			expect(onDisk["dev.autoqa.consent"]).toBeUndefined();
+			expect(onDisk["todo.reminders.max"]).toBeUndefined();
+
+			const reloaded = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			expect(reloaded.get("dev.autoqaConsent")).toBe("denied");
+			expect(reloaded.isConfigured("dev.autoqa")).toBe(false);
+			expect(reloaded.get("todo.remindersMax")).toBe(1);
+			expect(reloaded.get("todo.reminders")).toBe(true);
+		});
+
+		it("drops dead BM25-discovery keys and leaves tools.xdev at its default", async () => {
+			await writeSettings({
+				tools: { discoveryMode: "off", essentialOverride: ["read"] },
+				mcp: { discoveryMode: "auto", discoveryDefaultServers: ["gh"] },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// No migration mapping: legacy discovery intent is discarded, xdev
+			// keeps its own default. An explicit xdev value is untouched.
+			expect(settings.get("tools.xdev")).toBe(true);
+			expect(settings.isConfigured("tools.xdev")).toBe(false);
 		});
 
 		it("migrates from settings.json containing comments", async () => {
