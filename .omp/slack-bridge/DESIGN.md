@@ -103,6 +103,26 @@ unfurled link URLs (`attachments[].from_url`) are passed through as-is. A file
 that cannot be fetched is still named in the prompt with the reason — the agent
 must never answer as if nothing was attached.
 
+**Images go one step further.** A `png`/`jpeg`/`gif`/`webp` under 8MB is also
+base64-decoded into an `ImageContent` block on the `prompt` frame
+(`images?: ImageContent[]`, see `docs/rpc.md`), so the model *sees* the
+screenshot in the same turn instead of having to guess that a path is worth
+opening. Both forms are emitted: the block is what it looks at, the path is what
+`inspect_image` and re-reads need. Any other `image/*` — HEIC off a phone, SVG,
+TIFF — stays path-only and the note says why; an undecodable block would reach
+the provider and fail the whole turn, whereas `read` refuses it cleanly. omp
+normalizes and resizes the blocks per model and drops them for a text-only one,
+so the bridge never inspects model capability.
+
+**A DM that is nothing but attachments** (a pasted screenshot, no words) starts a
+task rather than falling through to help: there is no text to classify, and the
+router rejects an empty message anyway. It runs in `DEFAULT_REPO` with a fixed
+prompt that asks the agent to describe what it was handed and stop — enough to
+bind the thread, after which every reply is an ordinary steer carrying its own
+attachments. With no `DEFAULT_REPO` configured there is no repo to start in, so
+the bridge answers with the materialized paths instead; a later reply can name
+them, since a reply only ever carries its own files.
+
 ## UX (DM with the bot)
 
 Top-level DM commands (first token, case-insensitive). Every reply is a **thread
@@ -169,16 +189,26 @@ flowchart LR
   posts the help text). A dead local model can never swallow a message.
 - The model's `dir` is re-validated through the existing alias/`$HOME` check: a
   hallucinated path is rejected or falls back to `DEFAULT_REPO`, never trusted.
+- **Attachments are described, never shown.** The model gets a one-line
+  inventory (`screenshot.png (image/png)`) — names and types only, no bytes and
+  no local paths, because a Shuttle-served local model has no vision and its only
+  job is picking a command. Without it a bare "what's wrong here?" beside a
+  screenshot reads as pure ambiguity and routes to `help`; with it the same
+  message routes to `run` (verified A/B against `gemma-4-26b`). The real files
+  are attached by the bridge after routing, so the decision cannot lose them.
 
 `route.sh` contract:
 
 ```
 router/route.sh --model <pi-model-spec> --repos "alias=path,alias=path" \
-                [--default-repo <alias>] [--timeout <seconds>]
+                [--default-repo <alias>] [--attachments "name (type), …"] \
+                [--timeout <seconds>]
 ```
 
 - The Slack message text arrives on **stdin**, never as an argv word (it is
-  untrusted user text).
+  untrusted user text). The attachment inventory is an argv value — there is no
+  shell between the bridge and the script — collapsed to one line by the caller
+  so a crafted filename cannot forge prompt structure.
 - stdout: **exactly one line** — the `RouterDecision` as compact JSON — or
   nothing at all. stderr: diagnostics only.
 - Exit 0 = a decision line was printed. Any non-zero exit = no decision, and

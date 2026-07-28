@@ -92,6 +92,8 @@ function handle(frame) {
       send({ type: "response", id, command: "get_last_assistant_text", success: true, data: { text: "hello" } });
       break;
     case "prompt":
+      // Prove what landed on the wire, including whether images was sent.
+      send({ type: "message_update", echoedPrompt: { message: frame.message, images: frame.images, streamingBehavior: frame.streamingBehavior } });
       send({ type: "response", id, command: "prompt", success: true, data: { agentInvoked: true } });
       break;
     case "abort":
@@ -335,6 +337,31 @@ describe("OmpRpcClient", () => {
 			id: "h1",
 			result: { content: [{ type: "text", text: "done" }] },
 		});
+		await rpc.stop();
+	});
+
+	test("prompt() puts images on the wire and omits the field when there are none", async () => {
+		const rpc = newRpc();
+		const frames: unknown[] = [];
+		rpc.onEvent((e) => {
+			if (e.type === "message_update" && "echoedPrompt" in e) frames.push(e.echoedPrompt);
+		});
+		await rpc.start();
+
+		await rpc.prompt("look at this", [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }]);
+		await rpc.prompt("and now just words");
+		await rpc.prompt("empty array is the same as none", []);
+
+		expect(frames).toHaveLength(3);
+		expect(frames[0]).toEqual({
+			message: "look at this",
+			images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+			streamingBehavior: "steer",
+		});
+		// An absent `images` is the documented text-only frame, not `images: []`.
+		expect(frames[1]).toEqual({ message: "and now just words", streamingBehavior: "steer" });
+		expect(frames[2]).toEqual({ message: "empty array is the same as none", streamingBehavior: "steer" });
+
 		await rpc.stop();
 	});
 });

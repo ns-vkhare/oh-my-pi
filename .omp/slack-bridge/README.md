@@ -142,6 +142,25 @@ agent knows what it could not read. This needs the `files:read` bot scope: if yo
 created the app before that scope existed, re-paste `manifest.json` under
 *App Manifest* and reinstall the app.
 
+### Example: send a screenshot
+
+```
+you   why does this look wrong?  📎 screenshot.png
+bot   _routed → `run`_
+bot   └ ▶ slack:why does this look wrong?
+```
+
+A PNG, JPEG, GIF, or WebP under 8MB is handed to the model *as an image* on the
+same turn — no `read` round trip, and no chance the agent answers without looking.
+Its local path goes in the prompt too, for a re-read or `inspect_image`. Other
+image formats (HEIC from a phone, SVG, TIFF) stay a path, and the prompt says
+why. omp resizes for the active model and skips images entirely on a text-only
+one, so nothing here depends on which model the task runs.
+
+Drop a screenshot in with **no message at all** and it still starts a task: the
+agent describes what it was handed and waits for instructions (needs
+`DEFAULT_REPO`; without it the bridge replies with the file's local path).
+
 ### Missed messages
 
 Slack keeps no backlog for Socket Mode apps, so a DM sent while the bridge is

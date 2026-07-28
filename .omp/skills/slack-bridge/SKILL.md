@@ -86,6 +86,9 @@ driven through the `pi` CLI by `router/route.sh`. Enabled by `ROUTER_MODEL` in
   local model can never swallow a message.
 - The model's `dir` is re-validated through the alias/`$HOME` check — a
   hallucinated path is rejected or falls back to `DEFAULT_REPO`.
+- **Attachments are described, never shown** — `--attachments "shot.png
+  (image/png)"`, names and types only. Shuttle models have no vision. Without it
+  "what's wrong here?" plus a screenshot routes to `help`; with it, to `run`.
 
 Exercise it without Slack (prints exactly one JSON line, exit 0):
 
@@ -100,6 +103,16 @@ No decision printed, in order:
 2. `jq` and `pi` on `PATH`?
 3. is the model id registered under the `shuttle` provider in
    `~/.pi/agent/models.json`?
+
+## Attachments
+
+Downloaded with the bot token into `$TMPDIR/omp-slack-attachments/<ts>/` and
+named by path in the prompt. A `png`/`jpeg`/`gif`/`webp` under 8MB *also* rides
+the `prompt` frame as an `ImageContent` block, so the model sees it without a
+`read` — other `image/*` (HEIC, SVG, TIFF) stays path-only and the note says why.
+A DM of nothing but attachments starts a task in `DEFAULT_REPO` (describe-and-
+wait prompt) instead of falling through to help; with no `DEFAULT_REPO` the
+bridge replies with the local paths.
 
 ## Adding a command
 
