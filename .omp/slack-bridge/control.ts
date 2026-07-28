@@ -11,7 +11,7 @@
  */
 
 import * as fs from "node:fs/promises";
-import type { ControlRequest, ControlResponse, ControlTaskInfo } from "./types";
+import type { ControlRequest, ControlResponse, ControlSubagentInfo, ControlTaskInfo } from "./types";
 
 /** Timeout for the startup ping probe (single-instance detection). */
 const PING_PROBE_MS = 500;
@@ -23,6 +23,7 @@ export interface ControlHost {
 	park(sessionPath: string): Promise<{ parked: boolean; reason?: string }>;
 	steer(sessionPath: string, text: string): Promise<void>;
 	interrupt(sessionPath: string): Promise<void>;
+	subagents(sessionPath: string): Promise<ControlSubagentInfo[]>;
 	notify(event: { sessionPath: string; cwd: string; kind: string; text: string }): Promise<void>;
 }
 
@@ -67,6 +68,12 @@ async function dispatch(host: ControlHost, raw: unknown): Promise<ControlRespons
 				if (typeof raw.sessionPath !== "string") return { ok: false, error: "interrupt: sessionPath required" };
 				await host.interrupt(raw.sessionPath);
 				return { ok: true };
+			}
+			case "subagents": {
+				if (typeof raw.sessionPath !== "string" || raw.sessionPath.length === 0) {
+					return { ok: false, error: "subagents: sessionPath required" };
+				}
+				return { ok: true, subagents: await host.subagents(raw.sessionPath) };
 			}
 			case "notify": {
 				if (

@@ -41,6 +41,15 @@ export interface OmpSessionState {
 	contextUsage?: { tokens: number; contextWindow: number; percent: number } | null;
 }
 
+export interface OmpSubagentSnapshot {
+	id: string;
+	agent: string;
+	status: string;
+	task?: string;
+	sessionFile?: string;
+	lastUpdate: number;
+}
+
 /**
  * Streaming delta carried by `message_update` — the subset the bridge reads.
  * Types mirror `AssistantMessageEvent` in packages/ai: `thinking_start` /
@@ -219,8 +228,8 @@ export interface OmpRpc extends OmpRpcEvents {
 	abort(): Promise<void>;
 	getState(): Promise<OmpSessionState>;
 	getLastAssistantText(): Promise<string | null>;
-	/** Running subagent count (0 when unknown/none). */
-	getSubagents(): Promise<number>;
+	/** Per-subagent snapshots (empty when none). Rejects on a malformed payload so park fails closed. */
+	getSubagents(): Promise<OmpSubagentSnapshot[]>;
 	setSessionName(name: string): Promise<void>;
 	respondUi(response: OmpUiResponse): void;
 	/** Register/replace host-owned tools (id-correlated `set_host_tools`). */
@@ -403,7 +412,8 @@ export type ControlRequest =
 	/** From the slack-notify extension inside a terminal session: post/refresh a
 	 * notification thread for the session. Binds sessionPath ↔ thread in the
 	 * registry so later thread replies attach the session to Slack. */
-	| { op: "notify"; sessionPath: string; cwd: string; kind: "turn_end" | "ask_pending"; text: string };
+	| { op: "notify"; sessionPath: string; cwd: string; kind: "turn_end" | "ask_pending"; text: string }
+	| { op: "subagents"; sessionPath: string };
 
 export interface ControlTaskInfo {
 	sessionPath?: string;
@@ -415,10 +425,20 @@ export interface ControlTaskInfo {
 	subagentsRunning: number;
 }
 
+export interface ControlSubagentInfo {
+	id: string;
+	agent: string;
+	status: string;
+	task?: string;
+	sessionFile?: string;
+	lastUpdate: number;
+}
+
 export type ControlResponse =
 	| { ok: true; pid: number }
 	| { ok: true; tasks: ControlTaskInfo[] }
 	| { ok: true; parked: boolean; reason?: string }
+	| { ok: true; subagents: ControlSubagentInfo[] }
 	| { ok: true }
 	| { ok: false; error: string };
 

@@ -23,6 +23,7 @@ import type {
 	OmpRpc,
 	OmpRpcOptions,
 	OmpSessionState,
+	OmpSubagentSnapshot,
 	OmpUiRequest,
 	OmpUiResponse,
 	RouteMessage,
@@ -178,10 +179,10 @@ class FakeRpc implements OmpRpc {
 		this.commands.push("get_last_assistant_text");
 		return this.lastAssistantText;
 	}
-	subagentsRunning = 0;
-	async getSubagents(): Promise<number> {
+	subagents: OmpSubagentSnapshot[] = [];
+	async getSubagents(): Promise<OmpSubagentSnapshot[]> {
 		this.commands.push("get_subagents");
-		return this.subagentsRunning;
+		return this.subagents;
 	}
 	async setSessionName(name: string): Promise<void> {
 		this.commands.push(`set_session_name:${name}`);
@@ -1035,13 +1036,17 @@ describe("control plane park/steer (regression)", () => {
 	test("park fails CLOSED when the subagent probe errors", async () => {
 		// F1: getSubagents() failure must NOT park (a session may still have live
 		// subagents); it returns {parked:false, reason:"subagent state unknown"}.
-		const h = await makeHarness(makeConfig());
-		const { rpc, sessionPath } = await liveTask(h);
-		await settle();
-		rpc.getSubagents = () => Promise.reject(new Error("rpc down"));
-		const res = await h.bridge.controlHost().park(sessionPath);
-		expect(res).toEqual({ parked: false, reason: "subagent state unknown" });
-		expect(rpc.commands).not.toContain("stop"); // never stopped an unknown-state session
+		// Both causes route here: a dead RPC, and a malformed get_subagents payload
+		// the strict parser rejects rather than mistaking for quiescence.
+		for (const cause of ["rpc down", "get_subagents: malformed response"]) {
+			const h = await makeHarness(makeConfig());
+			const { rpc, sessionPath } = await liveTask(h);
+			await settle();
+			rpc.getSubagents = () => Promise.reject(new Error(cause));
+			const res = await h.bridge.controlHost().park(sessionPath);
+			expect(res).toEqual({ parked: false, reason: "subagent state unknown" });
+			expect(rpc.commands).not.toContain("stop"); // never stopped an unknown-state session
+		}
 	});
 
 	test("a park in progress refuses a concurrent steer (TOCTOU lock)", async () => {
@@ -1050,12 +1055,72 @@ describe("control plane park/steer (regression)", () => {
 		const h = await makeHarness(makeConfig());
 		const { rpc, sessionPath } = await liveTask(h);
 		await settle();
-		const gate = Promise.withResolvers<number>();
+		const gate = Promise.withResolvers<OmpSubagentSnapshot[]>();
 		rpc.getSubagents = () => gate.promise; // park blocks inside the window
 		const parkP = h.bridge.controlHost().park(sessionPath); // sets parking=true now
 		await expect(h.bridge.controlHost().steer(sessionPath, "hi")).rejects.toThrow(/being parked/);
-		gate.resolve(0); // quiescent → park completes
+		gate.resolve([]); // quiescent → park completes
 		expect(await parkP).toEqual({ parked: true });
+	});
+
+	test("park refuses while a subagent is still running", async () => {
+		const h = await makeHarness(makeConfig());
+		const { rpc, sessionPath } = await liveTask(h);
+		await settle();
+		rpc.subagents = [
+			{ id: "Scout", agent: "scout", status: "running", lastUpdate: 7 },
+			{ id: "Writer", agent: "task", status: "completed", lastUpdate: 8 },
+		];
+		expect(await h.bridge.controlHost().park(sessionPath)).toEqual({
+			parked: false,
+			reason: "busy: 1 subagents running",
+		});
+		expect(rpc.commands).not.toContain("stop");
+	});
+
+	test("park refuses while a subagent is queued or in an unrecognised state", async () => {
+		for (const status of ["pending", "queued"]) {
+			const h = await makeHarness(makeConfig());
+			const { rpc, sessionPath } = await liveTask(h);
+			await settle();
+			rpc.subagents = [{ id: "Queued", agent: "task", status, lastUpdate: 3 }];
+			expect(await h.bridge.controlHost().park(sessionPath)).toEqual({
+				parked: false,
+				reason: "busy: 1 subagents running",
+			});
+			expect(rpc.commands).not.toContain("stop");
+		}
+	});
+
+	test("park succeeds once every subagent reached a terminal status", async () => {
+		const h = await makeHarness(makeConfig());
+		const { rpc, sessionPath } = await liveTask(h);
+		await settle();
+		rpc.subagents = [
+			{ id: "Done", agent: "task", status: "completed", lastUpdate: 1 },
+			{ id: "Broke", agent: "task", status: "failed", lastUpdate: 2 },
+			{ id: "Killed", agent: "task", status: "aborted", lastUpdate: 3 },
+		];
+		expect(await h.bridge.controlHost().park(sessionPath)).toEqual({ parked: true });
+		expect(rpc.commands).toContain("stop");
+	});
+
+	test("controlHost().subagents returns the RPC snapshots for a live task", async () => {
+		const h = await makeHarness(makeConfig());
+		const { rpc, sessionPath } = await liveTask(h);
+		await settle();
+		rpc.subagents = [
+			{ id: "Scout", agent: "scout", status: "running", task: "map the repo", sessionFile: "/s/scout.jsonl", lastUpdate: 42 },
+		];
+		expect(await h.bridge.controlHost().subagents(sessionPath)).toEqual(rpc.subagents);
+		expect(rpc.commands).toContain("get_subagents");
+	});
+
+	test("controlHost().subagents rejects for a session the bridge does not own", async () => {
+		const h = await makeHarness(makeConfig());
+		await liveTask(h);
+		await settle();
+		await expect(h.bridge.controlHost().subagents("/nope/absent.jsonl")).rejects.toThrow(/not live/);
 	});
 
 	test("resume <sessionPath> dedups against an existing registry record", async () => {

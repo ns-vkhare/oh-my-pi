@@ -8,7 +8,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { BridgeAlreadyRunningError, type ControlHost, controlRequest, startControlServer } from "./control";
-import type { ControlRequest, ControlTaskInfo } from "./types";
+import type { ControlRequest, ControlSubagentInfo, ControlTaskInfo } from "./types";
 
 let counter = 0;
 function sockPath(): string {
@@ -20,10 +20,12 @@ function sockPath(): string {
 class FakeHost implements ControlHost {
 	pid = 4242;
 	tasks: ControlTaskInfo[] = [];
+	subagentList: ControlSubagentInfo[] = [];
 	parkResult: { parked: boolean; reason?: string } = { parked: true };
 	readonly calls: string[] = [];
 	parkedWith?: string;
 	steeredWith?: { sessionPath: string; text: string };
+	subagentsFor?: string;
 	interruptedWith?: string;
 	notifiedWith?: { sessionPath: string; cwd: string; kind: string; text: string };
 
@@ -43,6 +45,11 @@ class FakeHost implements ControlHost {
 	async interrupt(sessionPath: string): Promise<void> {
 		this.calls.push("interrupt");
 		this.interruptedWith = sessionPath;
+	}
+	async subagents(sessionPath: string): Promise<ControlSubagentInfo[]> {
+		this.calls.push("subagents");
+		this.subagentsFor = sessionPath;
+		return this.subagentList;
 	}
 	async notify(event: { sessionPath: string; cwd: string; kind: string; text: string }): Promise<void> {
 		this.calls.push("notify");
@@ -123,6 +130,32 @@ test("steer and interrupt dispatch to the host", async () => {
 	expect(host.steeredWith).toEqual({ sessionPath: "/s/x.jsonl", text: "go" });
 	expect(await controlRequest(p, { op: "interrupt", sessionPath: "/s/x.jsonl" })).toEqual({ ok: true });
 	expect(host.interruptedWith).toBe("/s/x.jsonl");
+});
+
+test("subagents round-trips the host's list", async () => {
+	const p = sockPath();
+	const host = new FakeHost();
+	host.subagentList = [
+		{ id: "Scout", agent: "scout", status: "running", task: "map the repo", sessionFile: "/s/scout.jsonl", lastUpdate: 42 },
+		{ id: "Writer", agent: "task", status: "completed", lastUpdate: 43 },
+	];
+	track(await startControlServer(p, host));
+	expect(await controlRequest(p, { op: "subagents", sessionPath: "/s/x.jsonl" })).toEqual({
+		ok: true,
+		subagents: host.subagentList,
+	});
+	expect(host.subagentsFor).toBe("/s/x.jsonl");
+});
+
+test("subagents: a blank sessionPath is refused without reaching the host", async () => {
+	const p = sockPath();
+	const host = new FakeHost();
+	track(await startControlServer(p, host));
+	const blank = await controlRequest(p, { op: "subagents", sessionPath: "" });
+	expect(blank.ok).toBe(false);
+	const missing = await controlRequest(p, { op: "subagents" } as unknown as ControlRequest);
+	expect(missing.ok).toBe(false);
+	expect(host.calls).not.toContain("subagents");
 });
 
 test("unknown op → ok:false", async () => {

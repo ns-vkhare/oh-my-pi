@@ -11,7 +11,13 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type BridgeTaskInfo, bridgeStatus, parkBridgeSession } from "../bridge-client";
+import {
+	type BridgeSubagentInfo,
+	type BridgeTaskInfo,
+	bridgeStatus,
+	bridgeSubagents,
+	parkBridgeSession,
+} from "../bridge-client";
 
 let sockDir: string;
 const servers: Bun.UnixSocketListener<undefined>[] = [];
@@ -74,6 +80,41 @@ describe("bridgeStatus", () => {
 
 		expect(tasks).toEqual([task, pending]);
 		expect(tasks?.[1]?.sessionPath).toBeUndefined();
+	});
+
+	it("drops malformed entries from an otherwise valid array", async () => {
+		const keeper: BridgeTaskInfo = {
+			sessionPath: "/home/u/.omp/agent/sessions/proj/keep.jsonl",
+			threadTs: "1712.0003",
+			channel: "D999",
+			name: "slack:keeper",
+			turnActive: false,
+			subagentsRunning: 0,
+		};
+		const sock = startServer("status-mixed", () => ({
+			ok: true,
+			tasks: [
+				null,
+				keeper,
+				"not a task",
+				{ threadTs: "1712.0004", channel: "D999", name: "slack:no-turn-flag", subagentsRunning: 0 },
+			],
+		}));
+
+		const tasks = await bridgeStatus(2000, sock);
+
+		expect(tasks).toEqual([keeper]);
+		expect(() => tasks?.map(task => task.sessionPath)).not.toThrow();
+	});
+
+	it("returns an empty list when every task entry is malformed", async () => {
+		const sock = startServer("status-allbad", () => ({ ok: true, tasks: [null, 7, { threadTs: 5 }] }));
+		expect(await bridgeStatus(2000, sock)).toEqual([]);
+	});
+
+	it("returns null when the task payload is not an array", async () => {
+		const sock = startServer("status-notarray", () => ({ ok: true, tasks: { threadTs: "1712.0005" } }));
+		expect(await bridgeStatus(2000, sock)).toBeNull();
 	});
 
 	it("returns null when the bridge answers with an error", async () => {
@@ -140,6 +181,73 @@ describe("parkBridgeSession failure modes", () => {
 	it("reports `indeterminate` when the daemon answers with an error", async () => {
 		const sock = startServer("park-error", () => ({ ok: false, error: "boom" }));
 		expect(await parkBridgeSession("/s/a.jsonl", 2000, sock)).toEqual({ kind: "indeterminate" });
+	});
+
+	it("reports `indeterminate` when the daemon answers a bare JSON primitive", async () => {
+		const sock = startServer("park-primitive", () => null);
+		expect(await parkBridgeSession("/s/a.jsonl", 2000, sock)).toEqual({ kind: "indeterminate" });
+	});
+});
+
+describe("bridgeSubagents", () => {
+	it("parses the subagent list and echoes the requested session path", async () => {
+		const subagents: BridgeSubagentInfo[] = [
+			{
+				id: "Scout",
+				agent: "scout",
+				status: "running",
+				task: "map the repo",
+				sessionFile: "/s/a/Scout.jsonl",
+				lastUpdate: 1712000000000,
+			},
+			{ id: "Writer", agent: "task", status: "completed", lastUpdate: 1712000000001 },
+		];
+		let seen: unknown;
+		const sock = startServer("subs-ok", req => {
+			seen = req;
+			return { ok: true, subagents };
+		});
+
+		expect(await bridgeSubagents("/s/a.jsonl", 2000, sock)).toEqual(subagents);
+		expect(seen).toEqual({ op: "subagents", sessionPath: "/s/a.jsonl" });
+	});
+
+	it("drops malformed entries from an otherwise valid array", async () => {
+		const sock = startServer("subs-mixed", () => ({
+			ok: true,
+			subagents: [
+				{ id: "Keeper", agent: 7, status: null, task: "", sessionFile: "/s/k.jsonl", lastUpdate: Number.NaN },
+				{ agent: "task", status: "running", lastUpdate: 1 },
+				null,
+				"junk",
+				42,
+			],
+		}));
+
+		expect(await bridgeSubagents("/s/a.jsonl", 2000, sock)).toEqual([
+			{ id: "Keeper", agent: "", status: "unknown", sessionFile: "/s/k.jsonl", lastUpdate: 0 },
+		]);
+	});
+
+	it("returns null when the bridge refuses the op", async () => {
+		const sock = startServer("subs-err", () => ({ ok: false, error: "session not live under the bridge" }));
+		expect(await bridgeSubagents("/s/a.jsonl", 2000, sock)).toBeNull();
+	});
+
+	it("returns null when the payload is not an array", async () => {
+		const sock = startServer("subs-notarray", () => ({ ok: true, subagents: { id: "Scout" } }));
+		expect(await bridgeSubagents("/s/a.jsonl", 2000, sock)).toBeNull();
+	});
+
+	// `null` is valid JSON but not a response: the never-throw contract must hold
+	// for it exactly as it does for an unparseable line.
+	it("returns null when the bridge answers a bare JSON primitive", async () => {
+		const sock = startServer("subs-primitive", () => null);
+		expect(await bridgeSubagents("/s/a.jsonl", 2000, sock)).toBeNull();
+	});
+
+	it("returns null when no socket exists", async () => {
+		expect(await bridgeSubagents("/s/a.jsonl", 2000, path.join(sockDir, "absent.sock"))).toBeNull();
 	});
 });
 

@@ -23,12 +23,22 @@ export interface BridgeTaskInfo {
 	subagentsRunning: number;
 }
 
+export interface BridgeSubagentInfo {
+	id: string;
+	agent: string;
+	status: string;
+	task?: string;
+	sessionFile?: string;
+	lastUpdate: number;
+}
+
 /** Requests this client issues (subset of the bridge's ControlRequest union). */
 type ControlRequest =
 	| { op: "status" }
 	| { op: "park"; sessionPath: string }
 	| { op: "steer"; sessionPath: string; text: string }
-	| { op: "interrupt"; sessionPath: string };
+	| { op: "interrupt"; sessionPath: string }
+	| { op: "subagents"; sessionPath: string };
 
 /**
  * Untrusted parse of the bridge's ControlResponse union — the wire shape is
@@ -37,9 +47,14 @@ type ControlRequest =
 interface ControlResponse {
 	ok?: boolean;
 	error?: string;
-	tasks?: BridgeTaskInfo[];
+	tasks?: unknown;
 	parked?: boolean;
 	reason?: string;
+	subagents?: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
 }
 
 const DEFAULT_SOCKET_PATH = path.join(os.homedir(), ".omp", "slack-bridge", "bridge.sock");
@@ -131,12 +146,18 @@ async function controlRequest(req: ControlRequest, timeoutMs: number, sockPath: 
 		});
 		return result;
 	}
+	let parsed: unknown;
 	try {
-		return { ok: JSON.parse(result.line) as ControlResponse };
+		parsed = JSON.parse(result.line);
 	} catch {
 		logger.debug("Slack bridge control response was not JSON", { op: req.op, sockPath, line: result.line });
 		return { failed: "indeterminate" };
 	}
+	if (!isRecord(parsed)) {
+		logger.debug("Slack bridge control response was not an object", { op: req.op, sockPath, line: result.line });
+		return { failed: "indeterminate" };
+	}
+	return { ok: parsed as ControlResponse };
 }
 
 /**
@@ -154,7 +175,62 @@ export async function bridgeStatus(timeoutMs = 250, sockPath = DEFAULT_SOCKET_PA
 		if (res.error) logger.debug("Slack bridge status failed", { error: res.error });
 		return null;
 	}
-	return res.tasks;
+	const tasks: BridgeTaskInfo[] = [];
+	for (const entry of res.tasks) {
+		if (
+			!isRecord(entry) ||
+			typeof entry.threadTs !== "string" ||
+			typeof entry.channel !== "string" ||
+			typeof entry.name !== "string" ||
+			typeof entry.turnActive !== "boolean" ||
+			typeof entry.subagentsRunning !== "number" ||
+			!Number.isFinite(entry.subagentsRunning) ||
+			(entry.sessionPath !== undefined && typeof entry.sessionPath !== "string")
+		) {
+			continue;
+		}
+		const task: BridgeTaskInfo = {
+			threadTs: entry.threadTs,
+			channel: entry.channel,
+			name: entry.name,
+			turnActive: entry.turnActive,
+			subagentsRunning: entry.subagentsRunning,
+		};
+		if (typeof entry.sessionPath === "string") task.sessionPath = entry.sessionPath;
+		tasks.push(task);
+	}
+	if (tasks.length !== res.tasks.length) {
+		logger.debug("Slack bridge status dropped malformed tasks", { dropped: res.tasks.length - tasks.length });
+	}
+	return tasks;
+}
+
+export async function bridgeSubagents(
+	sessionPath: string,
+	timeoutMs = 500,
+	sockPath = DEFAULT_SOCKET_PATH,
+): Promise<BridgeSubagentInfo[] | null> {
+	const outcome = await controlRequest({ op: "subagents", sessionPath }, timeoutMs, sockPath);
+	if (!("ok" in outcome)) return null;
+	const res = outcome.ok;
+	if (!res.ok || !Array.isArray(res.subagents)) {
+		logger.debug("Slack bridge subagents failed", { sessionPath, error: res.error });
+		return null;
+	}
+	const infos: BridgeSubagentInfo[] = [];
+	for (const entry of res.subagents) {
+		if (!isRecord(entry) || typeof entry.id !== "string") continue;
+		const info: BridgeSubagentInfo = {
+			id: entry.id,
+			agent: typeof entry.agent === "string" ? entry.agent : "",
+			status: typeof entry.status === "string" ? entry.status : "unknown",
+			lastUpdate: typeof entry.lastUpdate === "number" && Number.isFinite(entry.lastUpdate) ? entry.lastUpdate : 0,
+		};
+		if (typeof entry.task === "string" && entry.task.length > 0) info.task = entry.task;
+		if (typeof entry.sessionFile === "string" && entry.sessionFile.length > 0) info.sessionFile = entry.sessionFile;
+		infos.push(info);
+	}
+	return infos;
 }
 
 /**

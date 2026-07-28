@@ -104,6 +104,21 @@ function handle(frame) {
         send({ type: "response", id, command: "set_session_name", success: true });
       }
       break;
+    case "get_subagents": {
+      const mode = process.env.FIXTURE_SUBAGENTS || "";
+      let subagents;
+      if (mode === "not-array") subagents = "not-an-array";
+      else if (mode === "junk-entry") subagents = ["junk"];
+      else if (mode === "no-id") subagents = [{ agent: "task", status: "running" }];
+      else if (mode === "no-status") subagents = [{ id: "Bare", agent: "task" }];
+      else if (mode === "sloppy") subagents = [{ id: "Sloppy", status: "done", lastUpdate: "nope", task: "", sessionFile: "" }];
+      else subagents = [
+        { id: "Scout", agent: "scout", status: "running", task: "map the repo", sessionFile: "/s/scout.jsonl", lastUpdate: 42 },
+        { id: "Sonic", agent: "sonic", status: "done", lastUpdate: 7 },
+      ];
+      send({ type: "response", id, command: "get_subagents", success: true, data: { subagents } });
+      break;
+    }
     case "set_host_tools": {
       const names = Array.isArray(frame.tools) ? frame.tools.map((t) => t && t.name) : [];
       // Prove receipt of the tools array before acking the command.
@@ -180,6 +195,42 @@ describe("OmpRpcClient", () => {
 		expect(error?.message).toBe("name rejected");
 		await failing.stop();
 	});
+
+	test("getSubagents() maps well-formed snapshots", async () => {
+		const rpc = newRpc();
+		await rpc.start();
+		expect(await rpc.getSubagents()).toEqual([
+			{
+				id: "Scout",
+				agent: "scout",
+				status: "running",
+				task: "map the repo",
+				sessionFile: "/s/scout.jsonl",
+				lastUpdate: 42,
+			},
+			{ id: "Sonic", agent: "sonic", status: "done", lastUpdate: 7 },
+		]);
+		await rpc.stop();
+	});
+
+	test("getSubagents() coerces display-only fields instead of rejecting", async () => {
+		const rpc = newRpc({ FIXTURE_SUBAGENTS: "sloppy" });
+		await rpc.start();
+		expect(await rpc.getSubagents()).toEqual([{ id: "Sloppy", agent: "", status: "done", lastUpdate: 0 }]);
+		await rpc.stop();
+	});
+
+	// A malformed payload must not read as quiescence: park counts running entries,
+	// so a dropped/defaulted entry would let the bridge park a busy session.
+	test.each(["not-array", "junk-entry", "no-id", "no-status"])(
+		"getSubagents() rejects a malformed payload (%s)",
+		async (mode) => {
+			const rpc = newRpc({ FIXTURE_SUBAGENTS: mode });
+			await rpc.start();
+			await expect(rpc.getSubagents()).rejects.toThrow(/get_subagents/);
+			await rpc.stop();
+		},
+	);
 
 	test("agent events and ui requests fan out; respondUi write is received", async () => {
 		const rpc = newRpc({ FIXTURE_EMIT: "1" });

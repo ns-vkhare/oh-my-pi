@@ -14,6 +14,7 @@ import type {
 	OmpRpc,
 	OmpRpcOptions,
 	OmpSessionState,
+	OmpSubagentSnapshot,
 	OmpUiRequest,
 	OmpUiResponse,
 } from "./types";
@@ -161,16 +162,27 @@ class OmpRpcClient implements OmpRpc {
 		return null;
 	}
 
-	async getSubagents(): Promise<number> {
+	async getSubagents(): Promise<OmpSubagentSnapshot[]> {
 		const data = await this.#send({ type: "get_subagents" });
-		// Response shape: { subagents: RpcSubagentSnapshot[] }; count status === "running".
-		// Parse defensively — any unexpected shape yields 0.
-		if (!isRecord(data) || !Array.isArray(data.subagents)) return 0;
-		let running = 0;
+		if (!isRecord(data) || !Array.isArray(data.subagents)) throw new Error("get_subagents: malformed response");
+		const snapshots: OmpSubagentSnapshot[] = [];
 		for (const entry of data.subagents) {
-			if (isRecord(entry) && entry.status === "running") running++;
+			if (!isRecord(entry)) throw new Error("get_subagents: malformed subagent entry");
+			const { id, status } = entry;
+			if (typeof id !== "string" || id.length === 0) throw new Error("get_subagents: subagent entry without an id");
+			if (typeof status !== "string" || status.length === 0)
+				throw new Error(`get_subagents: subagent ${id} without a status`);
+			const snapshot: OmpSubagentSnapshot = {
+				id,
+				agent: typeof entry.agent === "string" ? entry.agent : "",
+				status,
+				lastUpdate: typeof entry.lastUpdate === "number" && Number.isFinite(entry.lastUpdate) ? entry.lastUpdate : 0,
+			};
+			if (typeof entry.task === "string" && entry.task.length > 0) snapshot.task = entry.task;
+			if (typeof entry.sessionFile === "string" && entry.sessionFile.length > 0) snapshot.sessionFile = entry.sessionFile;
+			snapshots.push(snapshot);
 		}
-		return running;
+		return snapshots;
 	}
 
 	async setSessionName(name: string): Promise<void> {

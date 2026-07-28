@@ -36,10 +36,12 @@ import type {
 	OmpHostToolDefinition,
 	OmpRpc,
 	OmpRpcOptions,
+	OmpSubagentSnapshot,
 	OmpUiRequest,
 	RouteMessage,
 	RouterDecision,
 	SlackBlockAction,
+	ControlSubagentInfo,
 	ControlTaskInfo,
 	SlackInbound,
 	SlackInboundMessage,
@@ -54,6 +56,7 @@ const FINAL_INLINE_MAX = 2_900;
 const MINUTE_MS = 60_000;
 /** Park's subagent-count probe deadline; a slow/failed probe fails the park CLOSED. */
 const PARK_SUBAGENT_TIMEOUT_MS = 3_000;
+const TERMINAL_SUBAGENT_STATUSES: Record<string, true> = { completed: true, failed: true, aborted: true };
 /**
  * Catch-up cadence — the ceiling on how late a DM can land when Socket Mode
  * silently stops delivering (see #catchUp).
@@ -69,6 +72,14 @@ const SEEN_MESSAGE_CAP = 500;
  * repo's. ROUTER_SCRIPT overrides it.
  */
 const DEFAULT_ROUTER_SCRIPT = new URL("./router/route.sh", import.meta.url).pathname;
+
+function countActiveSubagents(list: readonly OmpSubagentSnapshot[]): number {
+	let active = 0;
+	for (const entry of list) {
+		if (TERMINAL_SUBAGENT_STATUSES[entry.status] !== true) active++;
+	}
+	return active;
+}
 
 /** A UI request awaiting a Slack answer, plus the message showing it. */
 interface PendingUi {
@@ -375,6 +386,7 @@ export class Bridge {
 			park: (sessionPath) => this.#controlPark(sessionPath),
 			steer: (sessionPath, text) => this.#controlSteer(sessionPath, text),
 			interrupt: (sessionPath) => this.#controlInterrupt(sessionPath),
+			subagents: (sessionPath) => this.#controlSubagents(sessionPath),
 			notify: (event) => this.#controlNotify(event),
 		};
 	}
@@ -394,7 +406,10 @@ export class Bridge {
 				channel: task.record.channel,
 				name: task.record.name,
 				turnActive: task.turnActive,
-				subagentsRunning: await task.rpc.getSubagents().catch(() => 0),
+				subagentsRunning: await task.rpc
+					.getSubagents()
+					.then(countActiveSubagents)
+					.catch(() => 0),
 			})),
 		);
 	}
@@ -413,7 +428,9 @@ export class Bridge {
 		try {
 			// Fail CLOSED: an unknown subagent count must NOT park a session that may
 			// still have live subagents. Bound the probe so a hung RPC can't wedge park.
-			const running = await withTimeout(task.rpc.getSubagents(), PARK_SUBAGENT_TIMEOUT_MS).catch(() => undefined);
+			const running = await withTimeout(task.rpc.getSubagents(), PARK_SUBAGENT_TIMEOUT_MS)
+				.then(countActiveSubagents)
+				.catch(() => undefined);
 			if (running === undefined) return { parked: false, reason: "subagent state unknown" };
 			if (running > 0) return { parked: false, reason: `busy: ${running} subagents running` };
 			// Quiescent: stop the proc and dispose listeners now (registry entry +
@@ -447,6 +464,12 @@ export class Bridge {
 		const task = this.#findLiveBySessionPath(sessionPath);
 		if (!task) throw new Error("session not live under the bridge");
 		await task.rpc.abort();
+	}
+
+	async #controlSubagents(sessionPath: string): Promise<ControlSubagentInfo[]> {
+		const task = this.#findLiveBySessionPath(sessionPath);
+		if (!task) throw new Error("session not live under the bridge");
+		return task.rpc.getSubagents();
 	}
 
 	async #controlNotify(event: { sessionPath: string; cwd: string; kind: string; text: string }): Promise<void> {
