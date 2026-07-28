@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { hubTmuxSession, parseHubPanes } from "@oh-my-pi/pi-coding-agent/hub/tmux";
+import { FIELD_SEP, hubTmuxSession, parseHubPanes } from "@oh-my-pi/pi-coding-agent/hub/tmux";
 import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
 import { removeWithRetries } from "../../utils/src/temp";
 
@@ -80,7 +80,9 @@ describe("hubTmuxSession", () => {
 // sessions, count live windows minus the hub window, take the project dir from
 // the hub (lowest-index) window, mark the current project's hub, sort by
 // recency.
-const TAB = "\t";
+// The fixture joins with the production separator: tmux replaces every
+// non-printable-ASCII byte in `-F` output with `_` (3.6a), so a tab-joined
+// format string comes back unsplittable and every field but the first is lost.
 function paneRow(fields: {
 	name: string;
 	windows: number;
@@ -90,7 +92,7 @@ function paneRow(fields: {
 	panePath: string;
 }): string {
 	return [fields.name, fields.windows, fields.attached, fields.activity, fields.windowIndex, fields.panePath].join(
-		TAB,
+		FIELD_SEP,
 	);
 }
 
@@ -174,5 +176,15 @@ describe("parseHubPanes", () => {
 
 	test("returns [] for empty output", () => {
 		expect(parseHubPanes("", "omp-hub-x-1")).toEqual([]);
+	});
+
+	// tmux rewrites every byte outside printable ASCII (tab, \x1f, UTF-8) to `_`
+	// in `-F` output, which collapses a row into one field and silently empties
+	// `omp hub`/`hub list`. The delimiter must stay in the surviving range.
+	test("field separator survives tmux output sanitization", () => {
+		expect(FIELD_SEP).toMatch(/^[\x20-\x7e]+$/);
+		expect(parseHubPanes(["omp-hub-p-1", 2, 0, 5, 0, "/w/p"].join(FIELD_SEP), "")).toEqual([
+			{ session: "omp-hub-p-1", project: "/w/p", sessions: 1, attached: false, activityEpoch: 5, current: false },
+		]);
 	});
 });

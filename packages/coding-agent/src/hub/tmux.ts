@@ -215,16 +215,29 @@ export function ensureBackendSession(): void {
 	if (hubWindowId) tmux(["set-option", "-t", session, HUB_WINDOW_OPT, hubWindowId]);
 }
 
+/**
+ * Field separator for `-F` format strings.
+ *
+ * NOT a tab: tmux sanitizes its command output, replacing every byte that is
+ * not printable ASCII — tab, `\x1f`, and any UTF-8 glyph alike — with `_`
+ * (verified on tmux 3.6a). A tab-joined format therefore comes back as one
+ * unsplittable field, which silently degrades every parse below into
+ * "everything landed in the first field". Printable ASCII survives, so the
+ * delimiter is a short sentinel no session name, window id, title, or path
+ * realistically contains.
+ */
+export const FIELD_SEP = "|:|";
+
 /** Every per-client view session for the current project's backend. */
 export function listHubViews(): HubView[] {
-	const fmt = ["#{session_name}", "#{session_attached}", "#{session_activity}"].join("\t");
+	const fmt = ["#{session_name}", "#{session_attached}", "#{session_activity}"].join(FIELD_SEP);
 	const out = tmux(["list-sessions", "-F", fmt]);
 	if (!out) return [];
 	const base = `${hubViewBase()}-`;
 	const views: HubView[] = [];
 	for (const line of out.split("\n")) {
 		if (!line) continue;
-		const [name, attached, activity] = line.split("\t");
+		const [name, attached, activity] = line.split(FIELD_SEP);
 		if (!name?.startsWith(base)) continue;
 		views.push({ session: name, attached: attached === "1", activityEpoch: Number(activity) || 0 });
 	}
@@ -269,14 +282,14 @@ export function listSessionWindows(): HubWindow[] {
 		`#{${SESSION_TITLE_OPT}}`,
 		`#{${SESSION_PATH_OPT}}`,
 		"#{window_active}",
-	].join("\t");
+	].join(FIELD_SEP);
 	const out = tmux(["list-windows", "-t", hubTmuxSession(), "-F", fmt]);
 	if (!out) return [];
 	const hubTarget = backendHubWindowId();
 	const windows: HubWindow[] = [];
 	for (const line of out.split("\n")) {
 		if (!line) continue;
-		const [windowId, index, name, title, sessionPath, active] = line.split("\t");
+		const [windowId, index, name, title, sessionPath, active] = line.split(FIELD_SEP);
 		if (!windowId) continue;
 		// Skip the supervisor window itself (matched by id or, as a fallback, by name).
 		if (windowId === hubTarget || name === "hub") continue;
@@ -317,14 +330,15 @@ export function listHubs(): HubSummary[] {
 		"#{session_activity}",
 		"#{window_index}",
 		"#{pane_current_path}",
-	].join("\t");
+	].join(FIELD_SEP);
 	const out = tmux(["list-panes", "-a", "-F", fmt]);
 	if (!out) return [];
 	return parseHubPanes(out, hubTmuxSession());
 }
 
 /**
- * Parse the tab-separated `list-panes -a` output into per-hub summaries. Pure
+ * Parse the {@link FIELD_SEP}-separated `list-panes -a` output into per-hub
+ * summaries. Pure
  * (no tmux) so it is unit-testable. Rows are grouped by session; only sessions
  * whose name is exactly the backend prefix segment (`omp-hub-…`, not the
  * `omp-view-…` views) count, the project dir is taken from the lowest-indexed
@@ -338,7 +352,7 @@ export function parseHubPanes(out: string, currentSession: string): HubSummary[]
 	const bySession = new Map<string, { summary: HubSummary; hubWindowIndex: number }>();
 	for (const line of out.split("\n")) {
 		if (!line) continue;
-		const [name, windows, attached, activity, windowIndex, panePath] = line.split("\t");
+		const [name, windows, attached, activity, windowIndex, panePath] = line.split(FIELD_SEP);
 		if (!name?.startsWith(prefix)) continue;
 		const idx = Number(windowIndex);
 		const entry = bySession.get(name);
@@ -479,11 +493,15 @@ export function focusWindowInView(windowId: string): void {
 export function switchViewersHome(): void {
 	const win = currentTmuxWindow();
 	if (!win) return;
-	const clients = tmux(["list-clients", "-F", "#{client_name}\t#{client_session}\t#{window_id}"]);
+	const clients = tmux([
+		"list-clients",
+		"-F",
+		["#{client_name}", "#{client_session}", "#{window_id}"].join(FIELD_SEP),
+	]);
 	if (!clients) return;
 	for (const line of clients.split("\n")) {
 		if (!line) continue;
-		const [client, session, windowId] = line.split("\t");
+		const [client, session, windowId] = line.split(FIELD_SEP);
 		if (windowId !== win) continue;
 		const home = tmux(["show-option", "-qv", "-t", session, HUB_WINDOW_OPT]);
 		if (home) tmux(["switch-client", "-c", client, "-t", `${session}:${home}`]);
