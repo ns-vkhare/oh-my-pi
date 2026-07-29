@@ -451,6 +451,12 @@ export interface CreateAgentSessionOptions {
 	rules?: Rule[];
 	/** Context files (AGENTS.md content). Default: discovered walking up from cwd */
 	contextFiles?: Array<{ path: string; content: string }>;
+	/**
+	 * With `systemPrompt` set, send *only* that prompt: no context files, no
+	 * PROJECT footer (environment, cwd, workspace tree, standing directives).
+	 * For workers whose prompt is the whole contract. Default: false.
+	 */
+	bareSystemPrompt?: boolean;
 	/** Pre-built workspace tree (skips re-scanning; passed by parents to subagents). */
 	workspaceTree?: WorkspaceTree;
 	/** Prompt templates. Default: discovered from cwd/.omp/prompts/ + agentDir/prompts/ */
@@ -2751,6 +2757,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				personality: agentKind === "sub" ? "none" : settings.get("personality"),
 				renderMermaid: settings.get("tui.renderMermaid"),
 				activeRepoContext,
+				bareSystemPrompt: options.bareSystemPrompt,
 			});
 
 			if (options.systemPrompt === undefined) {

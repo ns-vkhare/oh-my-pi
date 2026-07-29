@@ -234,3 +234,49 @@ describe("non-Linux system prompt CPU model", () => {
 		}
 	});
 });
+
+/**
+ * `--bare-system-prompt` exists so a worker whose prompt IS its whole contract —
+ * the Slack bridge's routing classifier, an evaluator — gets exactly the file it
+ * was handed. The contract is byte equality, not "roughly the same".
+ */
+describe("bare system prompt", () => {
+	const baseOptions = {
+		contextFiles: [{ path: "/repo/AGENTS.md", content: "# Repo rules\nAlways use tabs." }],
+		skills: [],
+		rules: [],
+		workspaceTree: {
+			rootPath: import.meta.dir,
+			rendered: "",
+			truncated: false,
+			totalLines: 0,
+			agentsMdFiles: [],
+		},
+		activeRepoContext: null,
+	};
+
+	it("sends the custom prompt alone — no project footer, no context files", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			...baseOptions,
+			resolvedCustomPrompt: "You are a router. Classify and stop.",
+			bareSystemPrompt: true,
+		});
+
+		expect(systemPrompt).toEqual(["You are a router. Classify and stop."]);
+	});
+
+	it("without the flag the same call carries the repo rules and the project footer", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			...baseOptions,
+			resolvedCustomPrompt: "You are a router. Classify and stop.",
+		});
+
+		const whole = systemPrompt.join("\n");
+		expect(whole).toContain("You are a router. Classify and stop.");
+		// Both halves the flag removes: the workspace's own instructions…
+		expect(whole).toContain("Always use tabs.");
+		// …and the environment footer with its standing directives.
+		expect(whole).toContain("<workstation>");
+		expect(whole).toContain("current working directory");
+	});
+});

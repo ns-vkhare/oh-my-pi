@@ -71,6 +71,7 @@ export interface Args {
 	noSkills?: boolean;
 	skills?: string[];
 	noRules?: boolean;
+	bareSystemPrompt?: boolean;
 	noTitle?: boolean;
 	autoApprove?: boolean;
 	approvalMode?: "always-ask" | "write" | "yolo";
@@ -257,6 +258,8 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.noSkills = true;
 		} else if (arg === "--no-rules") {
 			result.noRules = true;
+		} else if (arg === "--bare-system-prompt") {
+			result.bareSystemPrompt = true;
 		} else if (arg === "--no-title") {
 			result.noTitle = true;
 		} else if (arg === "--auto-approve" || arg === "--yolo") {

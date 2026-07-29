@@ -1168,6 +1168,15 @@ export async function buildSessionOptions(
 		options.rules = [];
 	}
 
+	// A bare system prompt is the whole contract: no AGENTS.md context files (an
+	// explicit empty list short-circuits discovery in the SDK) and no PROJECT
+	// footer. For workers — classifiers, routers, evaluators — whose prompt must
+	// be exactly the file they were handed.
+	if (parsed.bareSystemPrompt) {
+		options.contextFiles = [];
+		options.bareSystemPrompt = true;
+	}
+
 	// Additional extension paths from CLI
 	const cliExtensionPaths = parsed.noExtensions ? [] : [...(parsed.extensions ?? []), ...(parsed.hooks ?? [])];
 	if (cliExtensionPaths.length > 0) {

@@ -488,6 +488,13 @@ export interface BuildSystemPromptOptions {
 	appendSystemPrompt?: string;
 	/** Already-loaded append prompt text; bypasses path resolution. */
 	resolvedAppendSystemPrompt?: string;
+	/**
+	 * With a custom prompt, send *only* that prompt: skip the PROJECT footer
+	 * (environment, cwd, workspace tree, standing directives). For workers whose
+	 * prompt is the whole contract — classifiers, routers, evaluators — where the
+	 * footer is noise the model can only be distracted by. Default: false.
+	 */
+	bareSystemPrompt?: boolean;
 	/** Inline full tool descriptors in the system prompt. Default: false */
 	inlineToolDescriptors?: boolean;
 	/**
@@ -594,6 +601,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		xdevDocs = "",
 		autoQaEnabled = false,
 		activeRepoContext: providedActiveRepoContext,
+		bareSystemPrompt = false,
 	} = options;
 	const inlineToolDescriptors = providedInlineToolDescriptors ?? false;
 	const resolvedCwd = cwd ?? getProjectDir();
@@ -874,16 +882,29 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		xdevDocs,
 		autoQaEnabled,
 	};
-	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
+	// A bare prompt is the caller's text and nothing the workspace contributed:
+	// the custom template renders context files itself, so they are cleared here
+	// too — `appendSystemPrompt` survives, being text the caller asked for.
+	const rendered = prompt.render(
+		resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate,
+		bareSystemPrompt ? { ...data, contextFiles: [] } : data,
+	);
 	const systemPrompt = [rendered];
 	if (toolNames.includes("computer")) {
 		systemPrompt.push(computerSafetyPrompt.trim());
 	}
 	// Custom prompt templates already render context files and append text; the
-	// project footer still carries environment, cwd, workspace, and dir-context.
-	const projectPrompt = prompt
-		.render(projectPromptTemplate, resolvedCustomPrompt ? { ...data, contextFiles: [], appendPrompt: "" } : data)
-		.trim();
+	// project footer still carries environment, cwd, workspace, and dir-context —
+	// unless the caller asked for a bare prompt, in which case the custom prompt
+	// is the entire contract and the footer would only add noise.
+	const projectPrompt = bareSystemPrompt
+		? ""
+		: prompt
+				.render(
+					projectPromptTemplate,
+					resolvedCustomPrompt ? { ...data, contextFiles: [], appendPrompt: "" } : data,
+				)
+				.trim();
 	if (projectPrompt) {
 		systemPrompt.push(projectPrompt);
 	}

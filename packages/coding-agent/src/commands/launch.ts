@@ -148,6 +148,9 @@ export default class Index extends Command {
 		"no-skills": Flags.boolean({
 			description: "Disable skills discovery and loading",
 		}),
+		"bare-system-prompt": Flags.boolean({
+			description: "Send only --system-prompt: no AGENTS.md context files, no project/environment footer",
+		}),
 		skills: Flags.string({
 			description: "Comma-separated glob patterns to filter skills (e.g., git-*,docker)",
 		}),
