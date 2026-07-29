@@ -19,6 +19,7 @@ import {
 	escapeMrkdwn,
 	finalTextBlocks,
 	notifyText,
+	routedBlocks,
 	statusText,
 	taskHeaderBlocks,
 	thinkingLine,
@@ -858,13 +859,15 @@ export class Bridge {
 	 * omp's configured roles, so a hallucinated field degrades instead of escaping.
 	 */
 	async #dispatchDecision(msg: SlackInboundMessage, decision: RouterDecision): Promise<void> {
-		// Breadcrumb first: the routing decision is visible before its effects.
+		// Breadcrumb first: the routing decision is visible before its effects, with
+		// the worker's own account of it as a sub-line — the only explanation the
+		// user ever gets for why their message went where it did.
 		const picked = "model" in decision ? decision.model : undefined;
 		await this.#slack
 			.postMessage({
 				channel: msg.channel,
 				threadTs: this.#replyThread(msg),
-				text: `_routed → \`${escapeMrkdwn(decision.command)}\`${picked ? ` on \`${escapeMrkdwn(picked)}\`` : ""}_`,
+				...routedBlocks({ command: decision.command, model: picked, trace: decision.trace }),
 			})
 			.catch(() => {});
 

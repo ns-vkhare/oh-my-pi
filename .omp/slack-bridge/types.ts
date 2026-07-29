@@ -485,13 +485,32 @@ export type ControlResponse =
  * from the offered map** and is re-validated the same way (`#resolveModel`):
  * anything else is dropped, leaving omp's own default.
  */
-export type RouterDecision =
+export type RouterDecision = (
 	| { command: "run"; dir?: string; prompt: string; model?: string }
 	| { command: "orchestrate"; dir?: string; prompt: string; model?: string }
 	| { command: "sessions"; alias?: string }
 	| { command: "resume"; target: string }
 	| { command: "status" }
-	| { command: "help" };
+	| { command: "help" }
+) & { trace?: RouterTrace };
+
+/**
+ * What the routing run says about itself — the only explanation the user gets
+ * for why their message went where it did. Cosmetic by construction: every
+ * field is optional, and a decision with no trace renders exactly as it did
+ * before, so a quiet or confused worker costs a sub-line, never a command.
+ */
+export interface RouterTrace {
+	/**
+	 * The worker's own account of the routing, at most three lines — the
+	 * post-tool reply `router/prompts/entry.md` asks it for. Already clamped and
+	 * trimmed by `parseDecision`; still untrusted model text, so it is escaped
+	 * at render time like any other.
+	 */
+	summary?: string;
+	/** Turns the worker took. Two is the healthy shape: call the command, then explain it. */
+	turns?: number;
+}
 
 /** What the router is told about the message besides its text. */
 export interface RouterContext {

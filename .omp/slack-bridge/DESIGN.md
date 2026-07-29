@@ -38,7 +38,7 @@ flowchart LR
 | `registry.ts` | BridgeCore | Thread↔session registry with JSON persistence. |
 | `router.ts` | Router | `createRouter` — bridge-side client: spawns `router/route.sh`, enforces `routerTimeoutMs`, parses the single JSON line. Fails open (`undefined`). |
 | `agent-model.ts` | Router | `resolveAgentModel` — reads the `orchestrate` agent definition (`<repo>/.omp/agents/`, then `~/.omp/agent/agents/`) for its pinned `model:`. |
-| `router/route.sh` | Router | omp harness invocation: message on stdin, one compact `RouterDecision` JSON line on stdout, exit 0 = decision. |
+| `router/route.sh` | Router | omp harness invocation: message on stdin, one compact `RouterDecision` JSON line on stdout (command + a `trace` of the worker's turn count and three-line self-account), exit 0 = decision. |
 | `router/prompts/entry.md` | Router | System prompt for the routing model. |
 | `router/tools/commands.ts` | Router | omp extension registering the six commands as tools (plain JSON-Schema parameters, no npm deps); each returns `ROUTE <json>` in its result. |
 | `prompts/slack-reply.md` | BridgeCore | Reply guidance appended to every spawned agent's system prompt: attach images, keep the answer in the message, absolute paths. |
@@ -203,6 +203,17 @@ flowchart LR
   Verified against `gemma-4-26b`: "use the planning model to fix the flaky
   bridge test in omp" → `{"command":"run","dir":"omp","model":"plan",…}`, while
   the same sentence without the model clause carries no `model` key.
+- **Every decision explains itself.** `route.sh` reads the worker's turn count
+  (`turn_end` events) and the text of its last assistant message — the post-tool
+  reply `entry.md` asks for — out of the same event stream as the decision, and
+  attaches them as `trace: {turns, summary}`. `parseDecision` clamps the summary
+  to three trimmed, capped lines; `blocks.ts:routedBlocks` renders it as a
+  context sub-line under the `_routed → …_` breadcrumb (`🧭 2 turns`, then one
+  italic line per step). That reply turn already happened and its text was
+  discarded, so the explanation costs no extra call and no latency. Cosmetic by
+  construction: a missing, blank, or malformed trace drops the sub-line and never
+  the command — telemetry must not be able to send a message to the literal
+  parser.
 - **The routing run is an ordinary omp session, and is recorded as one.** The
   worker is `omp`, not `pi`: same binary the bridge spawns for tasks, so the
   `shuttle` provider lives in `~/.omp/agent/models.yml`, the transcript lands in

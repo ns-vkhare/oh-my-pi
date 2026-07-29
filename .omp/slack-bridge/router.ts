@@ -13,10 +13,15 @@
  * a Slack message.
  */
 
-import type { BridgeConfig, RouteMessage, RouterContext, RouterDecision } from "./types";
+import { truncate } from "./blocks";
+import type { BridgeConfig, RouteMessage, RouterContext, RouterDecision, RouterTrace } from "./types";
 
 /** Child stderr echoed on a failed run, truncated so one bad run cannot flood the log. */
 const STDERR_LOG_CAP = 512;
+/** Sub-lines of `trace.summary` kept — entry.md asks the worker for one step per line, three at most. */
+const SUMMARY_MAX_LINES = 3;
+/** Per-line budget, so one runaway line cannot stretch the Slack context block. */
+const SUMMARY_LINE_MAX = 220;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -37,11 +42,40 @@ export function formatPairs(pairs: Record<string, string>): string {
 }
 
 /**
+ * `trace` → a clamped RouterTrace, or `undefined` when it carries nothing usable.
+ *
+ * Written by route.sh from the worker's event stream, but arriving over the same
+ * untrusted stdout as the decision, so it is validated like everything else and
+ * bounded HERE — the parse boundary — leaving renderers to render. A summary is
+ * kept to its first `SUMMARY_MAX_LINES` non-blank lines, each capped; a blank or
+ * non-string one is dropped, as is a `turns` that is not a positive integer.
+ */
+function parseTrace(value: unknown): RouterTrace | undefined {
+	if (!isRecord(value)) return undefined;
+	const trace: RouterTrace = {};
+	const summary = nonEmpty(value.summary);
+	if (summary !== undefined) {
+		const lines = summary
+			.split("\n")
+			.map(line => line.trim())
+			.filter(line => line.length > 0)
+			.slice(0, SUMMARY_MAX_LINES)
+			.map(line => truncate(line, SUMMARY_LINE_MAX));
+		if (lines.length > 0) trace.summary = lines.join("\n");
+	}
+	const { turns } = value;
+	if (typeof turns === "number" && Number.isInteger(turns) && turns > 0) trace.turns = turns;
+	return trace.summary === undefined && trace.turns === undefined ? undefined : trace;
+}
+
+/**
  * One stdout line → a validated RouterDecision, or `undefined`.
  *
  * The input is a local model's output: fully untrusted. Every variant is
  * rebuilt field by field rather than spread through, so unknown keys are
- * dropped and a partially-valid variant never escapes.
+ * dropped and a partially-valid variant never escapes. `trace` is the one
+ * non-command field carried over, and it is cosmetic: a malformed one is
+ * dropped without touching the command it came with.
  */
 export function parseDecision(line: string): RouterDecision | undefined {
 	let parsed: unknown;
@@ -51,7 +85,14 @@ export function parseDecision(line: string): RouterDecision | undefined {
 		return undefined;
 	}
 	if (!isRecord(parsed)) return undefined;
+	const decision = parseCommand(parsed);
+	if (decision === undefined) return undefined;
+	const trace = parseTrace(parsed.trace);
+	return trace === undefined ? decision : { ...decision, trace };
+}
 
+/** The command half of `parseDecision`: one variant, rebuilt field by field. */
+function parseCommand(parsed: Record<string, unknown>): RouterDecision | undefined {
 	const { command } = parsed;
 	switch (command) {
 		case "run":

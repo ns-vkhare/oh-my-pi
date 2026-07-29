@@ -152,6 +152,10 @@ created the app before that scope existed, re-paste `manifest.json` under
 ```
 you   why does this look wrong?  📎 screenshot.png
 bot   _routed → `run`_
+bot   🧭 2 turns
+      _You want to know why the attached screenshot looks wrong._
+      _Called run in omp._
+      _No model specified, so using the default model._
 bot   └ ▶ slack:why does this look wrong?
 ```
 
@@ -235,6 +239,16 @@ configured in omp (`omp config get modelRoles`): "plan this out on the planning
 model" starts the task on your `plan` role, "keep it cheap" on `smol`/`tiny`. Say
 nothing about models and the task runs on your default. A model the router
 invents is discarded, never passed to `omp --model`.
+
+Every routing decision is **explained**. Under the `_routed → …_` breadcrumb the
+bridge shows how many turns the worker took and its own account of the routing,
+at most three lines: what it read the message as asking, the call it made *by
+value* (`Called run in omp on the plan model.` — the repo alias and model role it
+actually passed, never a paraphrase), and what it left out so you know which
+defaults you are getting. That is the post-tool reply the model already wrote
+(see the last section of `router/prompts/entry.md`), harvested from the same
+event stream as the decision — no second model call, no added latency. A worker
+that skips it just loses the sub-line; the command dispatches either way.
 
 Routing runs are **recorded**. The router worker is `omp` itself — the same binary
 that runs your tasks — so a routing run is an ordinary omp session: its transcript

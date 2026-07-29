@@ -19,6 +19,12 @@
 #   empty extraction) goes to stderr. The caller parses stdout blindly and
 #   falls back to its literal parser on any non-zero exit, so a dead or
 #   confused model can never swallow a Slack message.
+#
+#   The decision carries a `trace` object alongside the command: `turns` (how
+#   many turns the worker took) and `summary` (its own three-line account of the
+#   routing, i.e. the post-tool reply entry.md asks for). Both are read out of
+#   the same event stream, cost no extra model call, and are never allowed to
+#   cost a decision — see the harvest at the bottom.
 # arguments: "--model <spec> [--omp-bin <path>] [--repos \"a=p,b=q\"] [--default-repo <alias>] [--models \"role=spec,role=spec\"] [--attachments \"a.png (image/png)\"] [--session-dir <dir>] [--timeout <sec>]  # message on stdin"
 # ---
 #
@@ -222,6 +228,42 @@ DECISION=$(printf '%s' "$DECISION" | jq -c . 2>/dev/null || true)
 if [[ -z "$DECISION" ]]; then
   echo "route.sh: no routing decision in worker output" >&2
   exit 1
+fi
+
+# The worker's own account of the run, harvested from the SAME event stream the
+# decision came from, and attached to it as `trace` so the bridge can show the
+# user why their message went where it did:
+#
+#   * `turns` — one per `turn_end`. Two is the healthy shape (the turn that calls
+#     the command, then the turn that explains it); one means the model never got
+#     to explain itself, and more means it argued with itself on the way.
+#   * `summary` — the text of the LAST assistant message, i.e. the post-tool reply
+#     prompts/entry.md asks for. That turn already happens today and its text was
+#     discarded, so this costs nothing: no extra call, no extra latency. Emitted
+#     as a JSON string (`jq -c`) so its newlines survive `tail -1` intact.
+#
+# Both are telemetry and MUST never cost a decision: TURNS is range-checked, and
+# a failed enrichment leaves the plain decision standing rather than blanking it
+# (an empty stdout would send the bridge to its literal parser over a cosmetic
+# field). Clamping to three lines is the bridge's business — it owns the display
+# contract — so nothing here truncates the model's text.
+TURNS=$(printf '%s\n' "$OUTPUT" | jq -c -R 'fromjson? // empty | select(.type=="turn_end")' | wc -l | tr -d '[:space:]')
+[[ "$TURNS" =~ ^[0-9]+$ ]] || TURNS=0
+SUMMARY=$(printf '%s\n' "$OUTPUT" \
+  | jq -c -R 'fromjson? // empty
+      | select(.type=="message_end")
+      | .message
+      | select(.role=="assistant")
+      | [.content[]? | select(.type=="text") | .text]
+      | join("\n")
+      | select(length > 0)' \
+  | tail -1)
+ENRICHED=$(printf '%s' "$DECISION" \
+  | jq -c --argjson turns "$TURNS" --argjson summary "${SUMMARY:-null}" \
+      '. + {trace: ({turns: $turns} + (if ($summary | type) == "string" then {summary: $summary} else {} end))}' \
+      2>/dev/null || true)
+if [[ -n "$ENRICHED" ]]; then
+  DECISION="$ENRICHED"
 fi
 
 printf '%s\n' "$DECISION"

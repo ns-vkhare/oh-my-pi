@@ -5,7 +5,7 @@
  * escaped and long content is chunked/truncated to Slack limits.
  */
 
-import type { OmpUiRequest, SlackBlock } from "./types";
+import type { OmpUiRequest, RouterTrace, SlackBlock } from "./types";
 
 /** Slack section text hard limit is 3000 chars; leave headroom. */
 const DEFAULT_CHUNK_SIZE = 2900;
@@ -75,6 +75,32 @@ export function chunkText(text: string, chunkSize: number = DEFAULT_CHUNK_SIZE):
 
 function section(text: string): SlackBlock {
 	return { type: "section", text: { type: "mrkdwn", text } };
+}
+
+/**
+ * The routing breadcrumb: the decision on top, the router's own account of it in
+ * a context sub-line underneath.
+ *
+ * `text` stays the one-line form every notification and test already reads, so
+ * the blocks are pure enrichment — a decision with no trace renders as the bare
+ * line it always did. The summary is the worker's untrusted text: already clamped
+ * to three short lines by `parseDecision`, escaped here, and italicised per line
+ * so a multi-line account still reads as one aside rather than as agent output.
+ */
+export function routedBlocks(args: { command: string; model?: string; trace?: RouterTrace }): { text: string; blocks?: SlackBlock[] } {
+	const text = `_routed → \`${escapeMrkdwn(args.command)}\`${args.model ? ` on \`${escapeMrkdwn(args.model)}\`` : ""}_`;
+	const details: string[] = [];
+	if (args.trace?.turns !== undefined) {
+		details.push(`🧭 ${args.trace.turns} ${args.trace.turns === 1 ? "turn" : "turns"}`);
+	}
+	for (const line of args.trace?.summary?.split("\n") ?? []) {
+		details.push(`_${escapeMrkdwn(line)}_`);
+	}
+	if (details.length === 0) return { text };
+	return {
+		text,
+		blocks: [section(text), { type: "context", elements: [{ type: "mrkdwn", text: details.join("\n") }] }],
+	};
 }
 
 /**

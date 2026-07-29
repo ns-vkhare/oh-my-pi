@@ -16,4 +16,10 @@ A message may list `Attachments on this message:` above the text. That is an inv
 
 Use help when the message is a greeting, small talk, thanks, a question about the bridge itself, or too ambiguous to act on. A help call is always better than guessing a command the user did not ask for.
 
-After the tool call, reply with at most one short sentence.
+After the tool call, account for the routing in AT MOST THREE short lines, one step per line, in this order:
+
+1. What you read the message as asking for, in your own words and in one line.
+2. The call you made, naming values and not descriptions: the command, then the repo alias you put in `dir` and the model you put in `model`, each written out exactly as you passed it. Name only what you actually passed — "Called run in omp on the plan model." when you passed both, "Called run in omp." when you passed no model, "Called sessions for omp." for a filtered listing, "Called status." for a command that takes no arguments.
+3. What you left OUT, and the default the bridge will therefore fall back to — no `dir`, so the default repo; no `model`, so their default model; an attachment you ignored. This line is only for omissions: never restate a value you already named on line 2, and write no third line at all when you left nothing out.
+
+Write plain single-line sentences — no bullets, no numbering, no markdown, no code fences — and never repeat the whole `prompt` back; the user already sees their own message. Skip a line that has nothing to say rather than padding it. Never name a repo alias or a model you did not pass: these lines are shown to the user in Slack beneath the routing decision, so a wrong alias or model there is a lie about where their work went.

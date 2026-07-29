@@ -4,7 +4,7 @@
  * intermediate prefix of a reasoning summary is a legal input.
  */
 import { describe, expect, test } from "bun:test";
-import { statusText, thinkingLine } from "./blocks";
+import { routedBlocks, statusText, thinkingLine } from "./blocks";
 
 describe("thinkingLine", () => {
 	test("uses the newest complete reasoning-summary headline", () => {
@@ -64,5 +64,44 @@ describe("statusText", () => {
 
 	test("escapes mrkdwn control characters in timeline lines", () => {
 		expect(statusText({ phase: "working", lines: ["⏵ bash echo <a> & <b>"] })).toContain("&lt;a&gt; &amp; &lt;b&gt;");
+	});
+});
+
+describe("routedBlocks", () => {
+	// No trace ⇒ no blocks at all: the breadcrumb stays the one-line message it
+	// has always been, so a silent worker costs nothing.
+	test("a traceless decision renders as the bare breadcrumb line", () => {
+		expect(routedBlocks({ command: "run" })).toEqual({ text: "_routed → `run`_" });
+		expect(routedBlocks({ command: "run", model: "plan" })).toEqual({ text: "_routed → `run` on `plan`_" });
+	});
+
+	test("a trace becomes a context sub-line: turn count, then one italic line per step", () => {
+		const { text, blocks } = routedBlocks({
+			command: "run",
+			model: "plan",
+			trace: { turns: 2, summary: "read it as a fix request\ncalled run in omp" },
+		});
+
+		expect(text).toBe("_routed → `run` on `plan`_");
+		expect(blocks).toEqual([
+			{ type: "section", text: { type: "mrkdwn", text: "_routed → `run` on `plan`_" } },
+			{
+				type: "context",
+				elements: [{ type: "mrkdwn", text: "🧭 2 turns\n_read it as a fix request_\n_called run in omp_" }],
+			},
+		]);
+	});
+
+	test("a lone turn count still renders, singular", () => {
+		const { blocks } = routedBlocks({ command: "help", trace: { turns: 1 } });
+		expect(blocks?.at(-1)).toEqual({ type: "context", elements: [{ type: "mrkdwn", text: "🧭 1 turn" }] });
+	});
+
+	test("escapes mrkdwn control characters in the worker's own text", () => {
+		const { blocks } = routedBlocks({ command: "run", trace: { summary: "read <a> & <b> as a fix" } });
+		expect(blocks?.at(-1)).toEqual({
+			type: "context",
+			elements: [{ type: "mrkdwn", text: "_read &lt;a&gt; &amp; &lt;b&gt; as a fix_" }],
+		});
 	});
 });

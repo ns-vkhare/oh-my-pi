@@ -114,6 +114,32 @@ describe("parseDecision", () => {
 		});
 		expect(parseDecision('{"command":"resume","target":" 3 "}')).toEqual({ command: "resume", target: "3" });
 	});
+
+	// `trace` is what Slack shows under the breadcrumb, so its bounds are the
+	// contract: three lines at most, each trimmed and capped.
+	test("a trace is kept clamped to three trimmed lines plus a turn count", () => {
+		expect(
+			parseDecision(
+				'{"command":"run","prompt":"go","trace":{"turns":2,"summary":"  read it as a fix request  \\n\\ncalled run in omp\\nomitted model\\nfourth line dropped"}}',
+			),
+		).toEqual({
+			command: "run",
+			prompt: "go",
+			trace: { summary: "read it as a fix request\ncalled run in omp\nomitted model", turns: 2 },
+		});
+		const long = parseDecision(`{"command":"help","trace":{"summary":"${"x".repeat(400)}"}}`);
+		expect(long).toEqual({ command: "help", trace: { summary: `${"x".repeat(219)}…` } });
+	});
+
+	test("an unusable trace is dropped without costing the command", () => {
+		expect(parseDecision('{"command":"help","trace":{"summary":"   ","turns":0}}')).toEqual({ command: "help" });
+		expect(parseDecision('{"command":"help","trace":{"summary":42,"turns":"two"}}')).toEqual({ command: "help" });
+		expect(parseDecision('{"command":"help","trace":{"turns":1.5}}')).toEqual({ command: "help" });
+		expect(parseDecision('{"command":"help","trace":"nonsense"}')).toEqual({ command: "help" });
+		expect(parseDecision('{"command":"help","trace":{"evil":"x"}}')).toEqual({ command: "help" });
+		// A turn count with no summary still stands on its own.
+		expect(parseDecision('{"command":"status","trace":{"turns":1}}')).toEqual({ command: "status", trace: { turns: 1 } });
+	});
 });
 
 describe("formatPairs", () => {

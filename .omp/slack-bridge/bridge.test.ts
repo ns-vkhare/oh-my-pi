@@ -1312,6 +1312,28 @@ describe("front-door router", () => {
 		expect(h.rpcs[0]!.prompts).toEqual(["fix the thing"]);
 	});
 
+	// The routing worker's account of itself has to reach Slack, not just the log:
+	// it is the only explanation the user ever sees for where their message went.
+	test("a decision's trace rides along as the breadcrumb's sub-line", async () => {
+		const route = fakeRoute({
+			command: "run",
+			dir: "omp",
+			prompt: "fix the thing",
+			trace: { turns: 2, summary: "read it as a fix request\ncalled run in omp\nomitted model" },
+		});
+		const h = await makeHarness(makeConfig(), [], undefined, route);
+		await h.slack.inject(dm("could you please fix the thing over in omp"));
+
+		const breadcrumb = h.slack.posted[0]!.args;
+		expect(breadcrumb.text).toBe("_routed → `run`_");
+		expect(breadcrumb.blocks?.at(-1)).toEqual({
+			type: "context",
+			elements: [{ type: "mrkdwn", text: "🧭 2 turns\n_read it as a fix request_\n_called run in omp_\n_omitted model_" }],
+		});
+		// Cosmetic only: the command still dispatches exactly as it did before.
+		expect(h.rpcs[0]!.prompts).toEqual(["fix the thing"]);
+	});
+
 	test("`orchestrate` pins the orchestrator model and prefixes the prompt", async () => {
 		// orchestrateModel is set explicitly so the assertion never depends on the
 		// developer's ~/.omp/agent/agents/orchestrate.md.
