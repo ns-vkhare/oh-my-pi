@@ -49,7 +49,7 @@ CustomTool.execute(toolCallId, params, onUpdate, ctx, signal)
    - Claude config (`~/.claude/tools`, `.claude/tools`)
    - Codex config (`~/.codex/tools`, `.codex/tools`)
    - Claude marketplace plugin cache provider
-2. Installed plugin manifests (`~/.omp/plugins/node_modules/*` via plugin loader)
+2. Installed plugin manifests (`~/.omp/plugins/node_modules/*` via plugin loader, plus the `~/.pi/agent` fallback packages the loader appends for names omp does not provide)
 3. Explicit configured paths passed to the loader
 
 ### Important behavior
