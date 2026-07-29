@@ -10,6 +10,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import SLACK_REPLY_GUIDANCE from "./prompts/slack-reply.md" with { type: "text" };
+import SLACK_REPOS_GUIDANCE from "./prompts/slack-repos.md" with { type: "text" };
 import { ORCHESTRATE_FALLBACK_MODEL, resolveAgentModel } from "./agent-model";
 import {
 	answeredBlocks,
@@ -251,6 +252,8 @@ export function loadConfig(env: Record<string, string | undefined>, home: string
 /** Newest sessions listed per repo. */
 const SESSIONS_PER_REPO = 8;
 const SESSIONS_LIST_TIMEOUT_MS = 10_000;
+/** How long `modelRoles` is trusted before another `omp config` spawn. */
+const MODEL_ROLES_TTL_MS = 5 * MINUTE_MS;
 
 /** One `omp sessions --json` row, narrowed to the fields the bridge renders. */
 export interface StoreSession {
@@ -293,6 +296,37 @@ export function spawnSessionLister(ompBin: string): ListSessions {
 	};
 }
 
+/**
+ * Model-role lister seam — tests inject a fake, production shells out.
+ *
+ * The map is omp's own `modelRoles` setting (role → model spec), i.e. the models
+ * the user already configured. It is the *only* set the router may pick from, so
+ * a routed task can never land on an invented model id.
+ */
+export type ListModelRoles = () => Promise<Record<string, string>>;
+
+/** Production `ListModelRoles`: `omp config get modelRoles`, killed after 10s. */
+export function spawnModelRoleLister(ompBin: string): ListModelRoles {
+	return async () => {
+		const proc = Bun.spawn([ompBin, "config", "get", "modelRoles"], { stdout: "pipe", stderr: "ignore" });
+		const timer = setTimeout(() => proc.kill(), SESSIONS_LIST_TIMEOUT_MS);
+		try {
+			const stdout = await new Response(proc.stdout).text();
+			const code = await proc.exited;
+			if (code !== 0) throw new Error(`omp config get modelRoles exited ${code}`);
+			const parsed: unknown = JSON.parse(stdout);
+			if (!isRecord(parsed)) throw new Error("omp config get modelRoles did not return an object");
+			const roles: Record<string, string> = {};
+			for (const [role, spec] of Object.entries(parsed)) {
+				if (typeof spec === "string" && spec.trim().length > 0) roles[role] = spec.trim();
+			}
+			return roles;
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+}
+
 // ============================================================================
 // Bridge
 // ============================================================================
@@ -304,6 +338,8 @@ export interface BridgeDeps {
 	createRpc: (opts: OmpRpcOptions) => OmpRpc;
 	/** Session-store lister; defaults to shelling out to `omp sessions --json`. */
 	listSessions?: ListSessions;
+	/** Model-role lister; defaults to shelling out to `omp config get modelRoles`. */
+	listModelRoles?: ListModelRoles;
 	/** Front-door intent router; defaults to the local-model router (fails open). */
 	route?: RouteMessage;
 }
@@ -401,6 +437,18 @@ const ATTACH_HOST_TOOL: OmpHostToolDefinition = {
 	},
 };
 
+/**
+ * The `REPOS` inventory appended to a spawned agent's system prompt: every alias
+ * with its absolute path, the task's own checkout marked. Those aliases are the
+ * vocabulary the person uses in Slack, so an agent that never sees them has to
+ * guess which directory "nomad" is. Empty string when nothing is configured —
+ * the section drops entirely rather than shipping a heading over an empty list.
+ */
+function repoInventory(repos: Record<string, string>, cwd: string): string {
+	const lines = Object.entries(repos).map(([alias, dir]) => `- \`${alias}\` → \`${dir}\`${dir === cwd ? " — this session's cwd" : ""}`);
+	return lines.length === 0 ? "" : SLACK_REPOS_GUIDANCE.replace("{{repos}}", lines.join("\n")).trim();
+}
+
 export class Bridge {
 	readonly #config: BridgeConfig;
 	readonly #slack: SlackTransport;
@@ -408,6 +456,7 @@ export class Bridge {
 	readonly #createRpc: (opts: OmpRpcOptions) => OmpRpc;
 	readonly #listSessions: ListSessions;
 	readonly #route: RouteMessage;
+	readonly #listModelRoles: ListModelRoles;
 	readonly #live = new Map<string, LiveTask>();
 	readonly #startedAt = Date.now();
 	#reaperTimer: ReturnType<typeof setInterval> | undefined;
@@ -422,6 +471,8 @@ export class Bridge {
 	#dmChannel: string | undefined;
 	/** channel → (index → session) from that channel's last `sessions` listing, consumed by `resume <n>`. */
 	#lastListing = new Map<string, Map<number, { path: string; cwd: string }>>();
+	/** `modelRoles` from omp's config, re-read at most every MODEL_ROLES_TTL_MS. */
+	#modelRolesCache: { roles: Record<string, string>; at: number } | undefined;
 
 	constructor(deps: BridgeDeps) {
 		this.#config = deps.config;
@@ -429,6 +480,7 @@ export class Bridge {
 		this.#registry = deps.registry;
 		this.#createRpc = deps.createRpc;
 		this.#listSessions = deps.listSessions ?? spawnSessionLister(deps.config.ompBin);
+		this.#listModelRoles = deps.listModelRoles ?? spawnModelRoleLister(deps.config.ompBin);
 		this.#route = deps.route ?? createRouter(deps.config);
 	}
 
@@ -787,6 +839,8 @@ export class Bridge {
 		const decision = await this.#route(text, {
 			repos: this.#config.repos,
 			defaultRepo: this.#config.defaultRepo,
+			models: await this.#modelRoles(),
+			...this.#routerLocation(),
 			attachments,
 		});
 		if (decision) {
@@ -800,24 +854,26 @@ export class Bridge {
 	 * Execute one router decision by handing it to the very command method the
 	 * literal parser would have called. Nothing here trusts the model: `#cmdRun`
 	 * re-resolves `dir` and falls back to DEFAULT_REPO when it names neither an
-	 * alias nor a path, so a hallucinated field degrades instead of escaping.
+	 * alias nor a path, and `#resolveModel` drops a `model` that is not one of
+	 * omp's configured roles, so a hallucinated field degrades instead of escaping.
 	 */
 	async #dispatchDecision(msg: SlackInboundMessage, decision: RouterDecision): Promise<void> {
 		// Breadcrumb first: the routing decision is visible before its effects.
+		const picked = "model" in decision ? decision.model : undefined;
 		await this.#slack
 			.postMessage({
 				channel: msg.channel,
 				threadTs: this.#replyThread(msg),
-				text: `_routed → \`${escapeMrkdwn(decision.command)}\`_`,
+				text: `_routed → \`${escapeMrkdwn(decision.command)}\`${picked ? ` on \`${escapeMrkdwn(picked)}\`` : ""}_`,
 			})
 			.catch(() => {});
 
 		switch (decision.command) {
 			case "run":
-				await this.#cmdRun(msg, [decision.dir, decision.prompt].filter(Boolean).join(" "));
+				await this.#cmdRun(msg, [decision.dir, decision.prompt].filter(Boolean).join(" "), decision.model);
 				return;
 			case "orchestrate":
-				await this.#cmdOrchestrate(msg, [decision.dir, decision.prompt].filter(Boolean).join(" "));
+				await this.#cmdOrchestrate(msg, [decision.dir, decision.prompt].filter(Boolean).join(" "), decision.model);
 				return;
 			case "sessions":
 				await this.#cmdSessions(msg, decision.alias);
@@ -834,8 +890,59 @@ export class Bridge {
 		}
 	}
 
-	async #cmdRun(msg: SlackInboundMessage, rest: string): Promise<void> {
-		await this.#startTask(msg, rest, { orchestrate: false });
+	/** omp's configured role → spec map, cached: one `omp config` spawn per TTL. */
+	async #modelRoles(): Promise<Record<string, string>> {
+		const cached = this.#modelRolesCache;
+		if (cached && Date.now() - cached.at < MODEL_ROLES_TTL_MS) return cached.roles;
+		try {
+			const roles = await this.#listModelRoles();
+			this.#modelRolesCache = { roles, at: Date.now() };
+			return roles;
+		} catch (err) {
+			// Cache the failure too: a broken `omp config` must not cost a spawn per
+			// DM. An empty map simply drops `model` from what the router is offered.
+			console.error(`bridge: model roles unavailable: ${String(err)}`);
+			this.#modelRolesCache = { roles: {}, at: Date.now() };
+			return {};
+		}
+	}
+
+	/**
+	 * A router-chosen model token → a spec the user actually configured, else
+	 * undefined (omp's own default). Accepts a `modelRoles` role name
+	 * (case-insensitive) or a spec already in that map; an invented id is dropped
+	 * rather than handed to `omp --model`.
+	 */
+	async #resolveModel(token: string | undefined): Promise<string | undefined> {
+		const wanted = token?.trim();
+		if (!wanted) return undefined;
+		const roles = await this.#modelRoles();
+		const byRole = Object.entries(roles).find(([role]) => role.toLowerCase() === wanted.toLowerCase());
+		if (byRole) return byRole[1];
+		if (Object.values(roles).includes(wanted)) return wanted;
+		console.error(`bridge: router asked for unknown model ${wanted} — using omp's default`);
+		return undefined;
+	}
+
+	/**
+	 * Where a routing run lives: the cwd it runs in and the session dir it
+	 * persists into — `<repo's omp session dir>/router`. Same tree as the agent
+	 * sessions the routing starts (so cc-callbacks audits both from one place and
+	 * `project_root` is the repo), one level down so `omp sessions --dir <repo>`,
+	 * and therefore Slack's `sessions` listing, never shows routing transcripts
+	 * beside resumable work.
+	 *
+	 * The repo is only known *after* routing, so the target is the best guess
+	 * available: DEFAULT_REPO, else home.
+	 */
+	#routerLocation(): { cwd: string; sessionDir: string } {
+		const home = this.#home();
+		const target = (this.#config.defaultRepo ? this.#resolveDir(this.#config.defaultRepo) : undefined) ?? home;
+		return { cwd: target, sessionDir: `${ompSessionDir(home, target)}/router` };
+	}
+
+	async #cmdRun(msg: SlackInboundMessage, rest: string, model?: string): Promise<void> {
+		await this.#startTask(msg, rest, { orchestrate: false, model });
 	}
 
 	/**
@@ -843,11 +950,11 @@ export class Bridge {
 	 * the prompt is prefixed so omp's `orchestrator-identity` skill triggers, and
 	 * the child is pinned to the orchestrator's model instead of omp's default.
 	 */
-	async #cmdOrchestrate(msg: SlackInboundMessage, rest: string): Promise<void> {
-		await this.#startTask(msg, rest, { orchestrate: true });
+	async #cmdOrchestrate(msg: SlackInboundMessage, rest: string, model?: string): Promise<void> {
+		await this.#startTask(msg, rest, { orchestrate: true, model });
 	}
 
-	async #startTask(msg: SlackInboundMessage, rest: string, opts: { orchestrate: boolean }): Promise<void> {
+	async #startTask(msg: SlackInboundMessage, rest: string, opts: { orchestrate: boolean; model?: string }): Promise<void> {
 		const verb = opts.orchestrate ? "orchestrate" : "run";
 		const sp = rest.indexOf(" ");
 		let dirToken = (sp === -1 ? rest : rest.slice(0, sp)).trim();
@@ -892,7 +999,7 @@ export class Bridge {
 		// The task thread IS the user's message: the header is its first reply, so
 		// everything about the task reads as an answer to what they asked for.
 		const threadTs = this.#replyThread(msg);
-		await this.#slack.postMessage({
+		const headerTs = await this.#slack.postMessage({
 			channel: msg.channel,
 			threadTs,
 			text: name,
@@ -907,11 +1014,14 @@ export class Bridge {
 			lastActivityAt: Date.now(),
 		};
 		this.#registry.upsert(record);
-		// Resolved once per task: the config override, else the agent definition on
-		// disk, else the pin the orchestrator agent ships with.
-		const model = opts.orchestrate
-			? this.#config.orchestrateModel || (await resolveAgentModel("orchestrate", record.cwd, this.#home())) || ORCHESTRATE_FALLBACK_MODEL
-			: undefined;
+		// An explicitly routed model wins; otherwise `orchestrate` falls back to its
+		// own pin (config override, else the agent definition on disk, else the pin
+		// the orchestrator agent ships with) and `run` to omp's default.
+		const model =
+			(await this.#resolveModel(opts.model)) ??
+			(opts.orchestrate
+				? this.#config.orchestrateModel || (await resolveAgentModel("orchestrate", record.cwd, this.#home())) || ORCHESTRATE_FALLBACK_MODEL
+				: undefined);
 		// The skill keys on the word "orchestrate", so the prompt must carry it.
 		const message = opts.orchestrate ? `orchestrate: ${prompt}` : prompt;
 		const attached = await this.#attachmentNote(msg);
@@ -922,6 +1032,7 @@ export class Bridge {
 			images: attached.images,
 			sessionName: name,
 			model,
+			headerTs,
 		});
 	}
 
@@ -1045,11 +1156,11 @@ export class Bridge {
 		const cwd = listedCwd ?? this.#home();
 		// Same as `run`: the resumed task's thread hangs under the user's message.
 		const threadTs = this.#replyThread(msg);
-		await this.#slack.postMessage({
+		const headerTs = await this.#slack.postMessage({
 			channel: msg.channel,
 			threadTs,
 			text: name,
-			blocks: taskHeaderBlocks({ name, cwd, sessionPath }),
+			blocks: taskHeaderBlocks({ name, cwd, sessionPath, sessionId: sessionIdOf(sessionPath) }),
 		});
 		const record: TaskRecord = {
 			threadTs,
@@ -1061,7 +1172,7 @@ export class Bridge {
 			lastActivityAt: Date.now(),
 		};
 		this.#registry.upsert(record);
-		await this.#spawn({ record, isNew: false, resumeSessionPath: sessionPath });
+		await this.#spawn({ record, isNew: false, resumeSessionPath: sessionPath, headerTs });
 	}
 
 	async #cmdStatus(msg: SlackInboundMessage): Promise<void> {
@@ -1237,8 +1348,13 @@ export class Bridge {
 		sessionName?: string;
 		/** Pin the child to a model spec (`omp --model <spec>`); omp's default when absent. */
 		model?: string;
+		/** Task header message to edit once the session identity is known. */
+		headerTs?: string;
 	}): Promise<void> {
 		const { record, isNew } = args;
+		// Reply guidance plus the repo inventory, in one flag: --append-system-prompt
+		// is last-wins, not repeatable.
+		const guidance = [SLACK_REPLY_GUIDANCE.trim(), repoInventory(this.#config.repos, record.cwd)].filter(Boolean).join("\n\n");
 		const rpc = this.#createRpc({
 			ompBin: this.#config.ompBin,
 			cwd: record.cwd,
@@ -1253,7 +1369,7 @@ export class Bridge {
 			extraArgs: [
 				...(args.model ? ["--model", args.model] : []),
 				"--append-system-prompt",
-				SLACK_REPLY_GUIDANCE,
+				guidance,
 			],
 		});
 
@@ -1286,15 +1402,37 @@ export class Bridge {
 		if (isNew && args.sessionName) {
 			await rpc.setSessionName(args.sessionName).catch(() => {});
 		}
+		let model: string | undefined;
 		try {
 			const state = await rpc.getState();
 			if (state.sessionFile) record.sessionPath = state.sessionFile;
 			if (state.sessionName) record.name = state.sessionName;
+			if (state.model) model = `${state.model.provider}/${state.model.id}`;
 		} catch {
 			// Non-fatal: sessionPath fills in on a later get_state.
 		}
 		record.lastActivityAt = Date.now();
 		this.#registry.upsert(record);
+
+		// The session file is minted by the child, so the header was posted before
+		// its id existed: edit the identity in now that the handshake is done. A
+		// failed edit costs a header line, never the task.
+		if (args.headerTs) {
+			await this.#slack
+				.updateMessage({
+					channel: record.channel,
+					ts: args.headerTs,
+					text: record.name,
+					blocks: taskHeaderBlocks({
+						name: record.name,
+						cwd: record.cwd,
+						sessionPath: record.sessionPath,
+						sessionId: sessionIdOf(record.sessionPath),
+						model,
+					}),
+				})
+				.catch((err) => console.error(`bridge: header update failed: ${String(err)}`));
+		}
 
 		await rpc
 			.setHostTools([ASK_HOST_TOOL, ATTACH_HOST_TOOL])
@@ -1863,9 +2001,42 @@ function headOf(prompt: string): string {
 	return oneLine.length > 60 ? `${oneLine.slice(0, 59)}…` : oneLine;
 }
 
+/**
+ * omp's session directory for a cwd, mirroring `getDefaultSessionDirName`
+ * (`packages/coding-agent/src/session/session-paths.ts:43`): a cwd inside $HOME
+ * encodes home-relative (`/Users/me/oh-my-pi-src` → `-oh-my-pi-src`), anything
+ * else falls back to the legacy absolute form. Bridge repos are always under
+ * $HOME — `#resolveDir` enforces it — so the first branch is the live one.
+ *
+ * This is what puts a gemma routing transcript in omp's tree instead of pi's
+ * (`~/.pi/agent/sessions/<slug>`, only reachable there through hand-made
+ * symlinks): one location for every transcript, so cc-callbacks audits the
+ * routing run and the agent session it starts from the same place.
+ */
+export function ompSessionDir(home: string, cwd: string): string {
+	const root = `${home}/.omp/agent/sessions`;
+	const relative = cwd === home ? "" : cwd.startsWith(`${home}/`) ? cwd.slice(home.length + 1) : undefined;
+	if (relative === undefined) return `${root}/--${cwd.replace(/^\//, "").replace(/[/:]/g, "-")}--`;
+	const encoded = relative.replace(/[/:]/g, "-");
+	return `${root}/${encoded.length > 0 ? `-${encoded}` : "-"}`;
+}
+
 function basename(path: string): string {
 	const parts = path.split("/");
 	return parts[parts.length - 1] || path;
+}
+
+/**
+ * The storage session id behind a session file: omp writes
+ * `<timestamp>_<sessionId>.jsonl`, and that id is what `omp --resume <id>`
+ * accepts. Deliberately not `get_state`'s `sessionId`, which is the *provider*
+ * session id and can diverge from the on-disk one.
+ */
+function sessionIdOf(sessionPath: string | undefined): string | undefined {
+	if (!sessionPath) return undefined;
+	const file = basename(sessionPath).replace(/\.jsonl$/, "");
+	const split = file.indexOf("_");
+	return split > 0 ? file.slice(split + 1) || undefined : undefined;
 }
 
 /** Slack filenames are user-controlled: keep the name readable, keep it one path segment. */

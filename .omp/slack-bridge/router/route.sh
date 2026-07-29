@@ -3,19 +3,23 @@
 # name: route.sh
 # brief: Classify one Slack message into a single bridge command (local model via Shuttle).
 # description: |
-#   Spawns a restricted pi session on a Shuttle-served local model whose only
+#   Spawns a restricted omp session on a Shuttle-served local model whose only
 #   tools are the six bridge commands (run, orchestrate, sessions, resume,
 #   status, help). The model calls exactly one of them; that call IS the
 #   routing decision. The worker's fixed role comes from prompts/entry.md and
 #   the tools from tools/commands.ts; the Slack message arrives on STDIN and is
 #   passed as the user turn, never as an argv word — it is untrusted text.
 #
+#   The harness is omp, not pi, so a routing run is an ordinary omp session:
+#   its transcript lands in omp's own session tree and the omp plugins —
+#   cc-callbacks above all — audit it exactly like an agent session.
+#
 #   stdout carries EXACTLY ONE line — the decision as compact JSON — or nothing
-#   at all. Everything else (health failures, timeouts, pi's own stderr, an
+#   at all. Everything else (health failures, timeouts, omp's own stderr, an
 #   empty extraction) goes to stderr. The caller parses stdout blindly and
 #   falls back to its literal parser on any non-zero exit, so a dead or
 #   confused model can never swallow a Slack message.
-# arguments: "--model <spec> [--repos \"a=p,b=q\"] [--default-repo <alias>] [--attachments \"a.png (image/png)\"] [--timeout <sec>]  # message on stdin"
+# arguments: "--model <spec> [--omp-bin <path>] [--repos \"a=p,b=q\"] [--default-repo <alias>] [--models \"role=spec,role=spec\"] [--attachments \"a.png (image/png)\"] [--session-dir <dir>] [--timeout <sec>]  # message on stdin"
 # ---
 #
 # Usage:
@@ -25,27 +29,41 @@
 #   --model <spec>        Model to route through Shuttle. A full provider/model
 #                         id (e.g. shuttle/gemma-4-26b) is used verbatim; a bare
 #                         name resolves to shuttle/<name>. Required.
+#   --omp-bin <path>      omp binary to run (default: $OMP_BIN, else `omp`).
 #   --repos <list>        Comma-separated alias=path pairs offered to the model
 #                         as the legal values for `dir`. May be empty.
 #   --default-repo <a>    Alias the bridge falls back to when `dir` is omitted.
+#   --models <list>       Comma-separated role=spec pairs (omp's own `modelRoles`)
+#                         offered as the legal values for `model`. May be empty,
+#                         in which case the model argument is never mentioned.
 #   --attachments <list>  One-line inventory of the message's attachments (names
 #                         and types only — the model never sees bytes or paths).
 #                         Without it an uncaptioned screenshot reads as ambiguity.
 #   --timeout <seconds>   Kill the worker after N seconds (default: 60).
+#   --session-dir <dir>   Where to persist this routing run's transcript. The
+#                         bridge points it at `<repo session dir>/router` so gemma
+#                         runs sit in the same tree as the agent sessions they
+#                         start without crowding the resumable listing. omp has no
+#                         session-name flag, so the directory is the marker.
+#                         Default: omp's own per-cwd session dir.
 #
 # Notes:
 #   Requires Shuttle (or a compatible local server) serving the target model at
-#   http://127.0.0.1:8780/v1, a matching `shuttle` pi provider entry, and jq.
+#   http://127.0.0.1:8780/v1, a `shuttle` provider in ~/.omp/agent/models.yml,
+#   and jq.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+OMP_BIN_ARG=""
 MODEL=""
 REPOS=""
 DEFAULT_REPO=""
+MODELS=""
 ATTACHMENTS=""
 TIMEOUT=60
+SESSION_DIR=""
 SHUTTLE_ENDPOINT="${SHUTTLE_ENDPOINT:-http://127.0.0.1:8780}"
 
 PROMPT_FILE="$SCRIPT_DIR/prompts/entry.md"
@@ -57,8 +75,11 @@ while [[ $# -gt 0 ]]; do
     --model)        MODEL="$2"; shift 2 ;;
     --repos)        REPOS="$2"; shift 2 ;;
     --default-repo) DEFAULT_REPO="$2"; shift 2 ;;
+    --models)       MODELS="$2"; shift 2 ;;
     --attachments)  ATTACHMENTS="$2"; shift 2 ;;
     --timeout)      TIMEOUT="$2"; shift 2 ;;
+    --session-dir)  SESSION_DIR="$2"; shift 2 ;;
+    --omp-bin)      OMP_BIN_ARG="$2"; shift 2 ;;
     *)              echo "route.sh: unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -84,15 +105,21 @@ if [[ ! -f "$COMMANDS_TOOL" ]]; then
 fi
 
 # The message is untrusted user text, so it only ever travels on stdin and, from
-# there, as a single argv value to pi's -p — never as shell-parsed words.
+# there, as a single argv value to omp's -p — never as shell-parsed words.
 MESSAGE=$(cat)
 if [[ -z "${MESSAGE//[[:space:]]/}" ]]; then
   echo "route.sh: empty message on stdin" >&2
   exit 1
 fi
 
+OMP="${OMP_BIN_ARG:-${OMP_BIN:-omp}}"
+if ! command -v "$OMP" >/dev/null 2>&1 && [[ ! -x "$OMP" ]]; then
+  echo "route.sh: omp binary not found: $OMP" >&2
+  exit 1
+fi
+
 if ! command -v jq >/dev/null 2>&1; then
-  echo "route.sh: jq is required to extract the routing decision from pi's event stream" >&2
+  echo "route.sh: jq is required to extract the routing decision from omp's event stream" >&2
   exit 1
 fi
 
@@ -122,44 +149,64 @@ fi
 if [[ -n "$DEFAULT_REPO" ]]; then
   USER_TURN="$USER_TURN"$'\n'"Default repo alias: $DEFAULT_REPO"
 fi
+if [[ -n "$MODELS" ]]; then
+  USER_TURN="$USER_TURN"$'\n'"Model roles: ${MODELS//,/, }"
+fi
 if [[ -n "$ATTACHMENTS" ]]; then
   USER_TURN="$USER_TURN"$'\n'"Attachments on this message: $ATTACHMENTS"
 fi
 USER_TURN="$USER_TURN"$'\n\n'"$MESSAGE"
 
-# pi's --tools is a single allowlist over builtin AND extension tools, so an
-# empty value ("") disables the six command tools along with the builtins and
-# the model can never route. Verified against pi 0.80.7: with --tools "" the
-# request carries no tool schemas (~544 prompt tokens, the model answers in
-# prose); with the six names it carries them (~1200) and the model calls one.
-# Naming them explicitly also pins the surface to exactly these six.
-TOOLS="run,orchestrate,sessions,resume,status,help"
+# omp validates `--tools` against BUILTIN names only (extension tools are not
+# registered at parse time), so naming the six commands there is an error —
+# `--no-tools` is the omp spelling of the same intent: zero builtins, while
+# extension-registered tools are always included (sdk.ts: "Custom tools and
+# extension-registered tools are always included regardless of toolNames
+# filter"). The routing surface is therefore exactly the six commands, and the
+# prompt carries only their schemas.
 
-PI_ARGS=(
+# Extension/plugin discovery stays ON: cc-callbacks is an omp plugin and is what
+# turns this run into an audited transcript. `--no-tools` still keeps every
+# builtin out, so a discovered extension cannot hand the router a file-editing
+# tool. OMP_SLACK_BRIDGE=1 marks the child as bridge-owned, which is what makes
+# the slack-notify extension skip itself — without it every routing run would
+# post a turn-end notification into Slack.
+#
+# `--bare-system-prompt` + omp-config.yml make prompts/entry.md the ENTIRE system
+# prompt: no AGENTS.md context files, no PROJECT footer, no memory guidance, no
+# MCP instructions, and no learn/manage_skill/mcp_* tools. Verified via
+# `get_state`: one segment, byte-identical to entry.md, and exactly the six
+# command tools (58k chars and 11 tools before).
+#
+# The session is persisted (no --no-session) into --session-dir, which the bridge
+# points at a `router/` dir inside the repo's own session dir: same tree as the
+# agent sessions it starts, one level down so it cannot crowd out `sessions`.
+OMP_ARGS=(
   --model "$MODEL_ID"
-  --tools "$TOOLS"
-  --no-extensions
-  --no-context-files
+  --no-tools
   --no-skills
-  --no-prompt-templates
-  --no-session
+  --bare-system-prompt
+  --config "$SCRIPT_DIR/omp-config.yml"
   --extension "$COMMANDS_TOOL"
   --system-prompt "$PROMPT_FILE"
   --mode json
-  -p "$USER_TURN"
 )
+if [[ -n "$SESSION_DIR" ]]; then
+  OMP_ARGS+=(--session-dir "$SESSION_DIR")
+fi
+OMP_ARGS+=(-p "$USER_TURN")
 
-# pi's stderr is left attached to ours: it is diagnostics, and merging it into
+# omp's stderr is left attached to ours: it is diagnostics, and merging it into
 # the captured stream would both hide it and pollute the event lines.
 EXIT_CODE=0
-OUTPUT=$(perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" pi "${PI_ARGS[@]}") || EXIT_CODE=$?
+OUTPUT=$(OMP_SLACK_BRIDGE=1 perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$OMP" "${OMP_ARGS[@]}") || EXIT_CODE=$?
 if [[ $EXIT_CODE -eq 142 ]]; then
   echo "route.sh: worker timed out after ${TIMEOUT}s" >&2
 elif [[ $EXIT_CODE -ne 0 ]]; then
-  echo "route.sh: pi exited $EXIT_CODE" >&2
+  echo "route.sh: omp exited $EXIT_CODE" >&2
 fi
 
-# pi exits 0 even when the model call itself fails (that surfaces as an
+# omp exits 0 even when the model call itself fails (that surfaces as an
 # assistant message with stopReason:"error"), and a killed worker may still have
 # emitted its decision before dying. So the extraction — not the exit code — is
 # what decides whether there is a decision. `-R … fromjson? // empty` keeps a

@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, type Mock, spyOn, test } from "bun:test";
-import { Bridge, loadConfig, type ListSessions, type StoreSession } from "./bridge";
+import { Bridge, loadConfig, ompSessionDir, type ListModelRoles, type ListSessions, type StoreSession } from "./bridge";
 import { TaskRegistry } from "./registry";
 import { ORCHESTRATE_FALLBACK_MODEL } from "./agent-model";
 import type {
@@ -174,7 +174,13 @@ class FakeRpc implements OmpRpc {
 	readonly hostTools: OmpHostToolDefinition[][] = [];
 	readonly hostToolResults: OmpHostToolResult[] = [];
 	lastAssistantText: string | null = "done";
-	state: OmpSessionState = { isStreaming: false, sessionFile: `${HOME}/.omp/agent/sessions/x.jsonl`, sessionName: "sess" };
+	/** Shaped like a real session file — `<timestamp>_<sessionId>.jsonl` — so the id is derivable. */
+	state: OmpSessionState = {
+		isStreaming: false,
+		sessionFile: `${HOME}/.omp/agent/sessions/2026-07-29T12-00-00_9f3c1a2b.jsonl`,
+		sessionName: "sess",
+		model: { provider: "anthropic", id: "claude-opus-5" },
+	};
 	startError?: Error;
 	#promptWaiters: Array<(prompt: SentPrompt) => void> = [];
 	#hostResultWaiters: Array<(result: OmpHostToolResult) => void> = [];
@@ -352,11 +358,22 @@ afterEach(async () => {
 	while (liveHarnesses.length > 0) await liveHarnesses.pop()!.shutdown();
 });
 
+/**
+ * Stand-in for `omp config get modelRoles`. Injected by default so no test ever
+ * shells out to the developer's real omp config.
+ */
+const MODEL_ROLES: Record<string, string> = {
+	default: "amazon-bedrock/claude-opus-5",
+	plan: "openai-codex/gpt-5.6-sol:xhigh",
+	smol: "anthropic/claude-haiku-4-5",
+};
+
 async function makeHarness(
 	config: BridgeConfig,
 	seed: TaskRecord[] = [],
 	listSessions?: ListSessions,
 	route?: RouteMessage,
+	listModelRoles: ListModelRoles = async () => MODEL_ROLES,
 ): Promise<Harness> {
 	const slack = new FakeSlack();
 	const dir = `/tmp/bridge-test-${Math.random().toString(36).slice(2)}`;
@@ -370,7 +387,7 @@ async function makeHarness(
 		waiters.splice(0).forEach((resolve) => resolve(rpc));
 		return rpc;
 	};
-	const bridge = new Bridge({ config, slack, registry, createRpc, listSessions, route });
+	const bridge = new Bridge({ config, slack, registry, createRpc, listSessions, route, listModelRoles });
 	bridge.start();
 	// start() kicks a catch-up sweep; drain it so a test's own sweep is not
 	// swallowed by the overlap guard.
@@ -1348,6 +1365,69 @@ describe("front-door router", () => {
 			await fs.rm(tmpHome, { recursive: true, force: true });
 		}
 	});
+
+	// The model the router may pick from is omp's own `modelRoles`, so a routed
+	// task can only ever land on a model the user already configured.
+	test("a routed role becomes `--model <spec>` and shows in the breadcrumb", async () => {
+		const route = fakeRoute({ command: "run", dir: "omp", prompt: "fix the thing", model: "plan" });
+		const h = await makeHarness(makeConfig(), [], undefined, route);
+		await h.slack.inject(dm("plan out the fix for the thing in omp"));
+		const rpc = await h.nextRpc();
+
+		expect(route.calls[0]!.ctx.models).toEqual(MODEL_ROLES);
+		expect(h.slack.posted[0]!.args.text).toBe("_routed → `run` on `plan`_");
+		expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--model", MODEL_ROLES.plan!]);
+	});
+
+	test("an exact configured spec is accepted, an invented one is dropped", async () => {
+		const exact = fakeRoute({ command: "run", dir: "omp", prompt: "fix it", model: MODEL_ROLES.smol! });
+		const hExact = await makeHarness(makeConfig(), [], undefined, exact);
+		await hExact.slack.inject(dm("fix it on the cheap model"));
+		expect((await hExact.nextRpc()).opts.extraArgs?.slice(0, 2)).toEqual(["--model", MODEL_ROLES.smol!]);
+
+		const invented = fakeRoute({ command: "run", dir: "omp", prompt: "fix it", model: "gpt-9-ultra" });
+		const hInvented = await makeHarness(makeConfig(), [], undefined, invented);
+		await hInvented.slack.inject(dm("fix it with gpt-9-ultra"));
+		// Unknown model → no pin at all, so the child runs on omp's own default.
+		expect((await hInvented.nextRpc()).opts.extraArgs).not.toContain("--model");
+	});
+
+	test("a routed model outranks the orchestrator's pin", async () => {
+		const route = fakeRoute({ command: "orchestrate", dir: "omp", prompt: "split this up", model: "smol" });
+		const h = await makeHarness(makeConfig({ orchestrateModel: "anthropic/claude-fable-5" }), [], undefined, route);
+		await h.slack.inject(dm("fan this out but keep it cheap"));
+		const rpc = await h.nextRpc();
+
+		expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--model", MODEL_ROLES.smol!]);
+		expect(rpc.prompts[0]!.startsWith("orchestrate: split this up")).toBe(true);
+	});
+
+	test("roles are read once and cached across messages", async () => {
+		let reads = 0;
+		const route = fakeRoute({ command: "status" });
+		const h = await makeHarness(makeConfig(), [], undefined, route, async () => {
+			reads++;
+			return MODEL_ROLES;
+		});
+		await h.slack.inject(dm("is the bridge up?"));
+		await h.slack.inject(dm("still up?"));
+
+		expect(route.calls).toHaveLength(2);
+		expect(reads).toBe(1);
+	});
+
+	// Routing runs are persisted so cc-callbacks audits them: same tree as the
+	// agent sessions they start (so `project_root` is the repo), but under
+	// `router/` so they never appear beside resumable work in `sessions`.
+	test("the routing run is pointed at the repo's router session dir", async () => {
+		const route = fakeRoute({ command: "status" });
+		const h = await makeHarness(makeConfig({ defaultRepo: "omp" }), [], undefined, route);
+		await h.slack.inject(dm("is anything running?"));
+
+		expect(route.calls[0]!.ctx.sessionDir).toBe(`${HOME}/.omp/agent/sessions/-oh-my-pi-src/router`);
+		// cwd is what cc-callbacks records as project_root for the routing turn.
+		expect(route.calls[0]!.ctx.cwd).toBe(REPO);
+	});
 });
 
 /**
@@ -1594,5 +1674,107 @@ describe("replying with files", () => {
 		const result = await rpc.nextHostToolResult();
 		expect(result.isError).toBe(true);
 		expect(result.result.content[0]!.text).toContain("expected paths: string[]");
+	});
+});
+
+/**
+ * The `REPOS` aliases are the vocabulary the person types in Slack, so a spawned
+ * agent that never sees them has to guess which directory a name refers to.
+ */
+describe("repo inventory in the system prompt", () => {
+	const REPO = `${HOME}/oh-my-pi-src`;
+	const SHUTTLE = `${HOME}/shuttle`;
+
+	function appendedPrompt(rpc: FakeRpc): string {
+		const args = rpc.opts.extraArgs ?? [];
+		const flag = args.indexOf("--append-system-prompt");
+		return flag === -1 ? "" : (args[flag + 1] ?? "");
+	}
+
+	test("every configured alias and path rides the spawn, with the task's own repo marked", async () => {
+		const h = await makeHarness(makeConfig({ repos: { omp: REPO, shuttle: SHUTTLE } }));
+		await h.slack.inject(dm("run shuttle fix the thing"));
+		const prompt = appendedPrompt(await h.nextRpc());
+
+		expect(prompt).toContain(`\`omp\` → \`${REPO}\``);
+		expect(prompt).toContain(`\`shuttle\` → \`${SHUTTLE}\``);
+		// The cwd marker lands on the repo this task actually runs in, not the first.
+		expect(prompt).toContain(`\`${SHUTTLE}\` — this session's cwd`);
+		expect(prompt).not.toContain(`\`${REPO}\` — this session's cwd`);
+		// The reply guidance is still there: one flag carries both.
+		expect(prompt).toContain("attach_file");
+	});
+
+	test("no configured repos means no inventory section, not an empty list", async () => {
+		const h = await makeHarness(makeConfig({ repos: {} }));
+		await h.slack.inject(dm(`run ${REPO} fix the thing`));
+		const prompt = appendedPrompt(await h.nextRpc());
+
+		expect(prompt).toContain("attach_file");
+		expect(prompt).not.toContain("Repos the bridge knows");
+	});
+});
+
+/**
+ * The thread header is the one place a reader can pick the session up from —
+ * `omp --resume <id>` in a terminal, or `resume <path>` back in Slack. The id
+ * only exists once the child has minted its session file, so the header is
+ * posted first and edited after the handshake.
+ */
+describe("session identity in the task header", () => {
+	const SESSION_ID = "9f3c1a2b";
+
+	test("the header is edited with the session id, path and model once the child is up", async () => {
+		const h = await makeHarness(makeConfig());
+		await h.slack.inject(dm("run omp do work"));
+		const rpc = await h.nextRpc();
+
+		const headerTs = h.slack.posted[0]!.ts;
+		const update = h.slack.updated.find((u) => u.ts === headerTs);
+		expect(update).toBeDefined();
+		const rendered = JSON.stringify(update!.blocks);
+		expect(rendered).toContain(`🆔 \`${SESSION_ID}\``);
+		expect(rendered).toContain(rpc.state.sessionFile!);
+		expect(rendered).toContain("🧠 anthropic/claude-opus-5");
+	});
+
+	test("`resume <path>` shows the id in the first header post, before any child answers", async () => {
+		const h = await makeHarness(makeConfig());
+		const resumed = `${HOME}/.omp/agent/sessions/2026-01-01T00-00-00_deadbeef.jsonl`;
+		await h.slack.inject(dm(`resume ${resumed}`));
+
+		const rendered = JSON.stringify(h.slack.posted[0]!.args.blocks);
+		expect(rendered).toContain("🆔 `deadbeef`");
+		expect(rendered).toContain(resumed);
+	});
+
+	test("a session file that carries no id shows the path alone", async () => {
+		const h = await makeHarness(makeConfig());
+		const legacy = `${HOME}/.omp/agent/sessions/legacy.jsonl`;
+		await h.slack.inject(dm(`resume ${legacy}`));
+
+		const rendered = JSON.stringify(h.slack.posted[0]!.args.blocks);
+		expect(rendered).toContain(legacy);
+		expect(rendered).not.toContain("🆔");
+	});
+});
+
+/**
+ * The encoding omp itself uses (`session-paths.ts:43`). It decides where a
+ * routing transcript lands, so a drift here silently sends gemma runs to a
+ * directory no `omp sessions` listing and no audit sweep looks at.
+ */
+describe("ompSessionDir", () => {
+	test("a repo under $HOME encodes home-relative", () => {
+		expect(ompSessionDir("/Users/me", "/Users/me/oh-my-pi-src")).toBe("/Users/me/.omp/agent/sessions/-oh-my-pi-src");
+		expect(ompSessionDir("/Users/me", "/Users/me/src/deep/repo")).toBe("/Users/me/.omp/agent/sessions/-src-deep-repo");
+	});
+
+	test("$HOME itself is the bare `-` dir", () => {
+		expect(ompSessionDir("/Users/me", "/Users/me")).toBe("/Users/me/.omp/agent/sessions/-");
+	});
+
+	test("a path outside $HOME falls back to the absolute form", () => {
+		expect(ompSessionDir("/Users/me", "/srv/checkout")).toBe("/Users/me/.omp/agent/sessions/--srv-checkout--");
 	});
 });

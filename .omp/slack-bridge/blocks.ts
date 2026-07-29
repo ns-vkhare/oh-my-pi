@@ -77,18 +77,25 @@ function section(text: string): SlackBlock {
 	return { type: "section", text: { type: "mrkdwn", text } };
 }
 
-/** Header for a newly dispatched task: name, context line, interaction hint. */
-export function taskHeaderBlocks(args: { name: string; cwd: string; sessionPath?: string; model?: string }): SlackBlock[] {
+/**
+ * Header for a newly dispatched task: name, context line, session identity,
+ * interaction hint. `sessionId` is the id `omp --resume <id>` takes, so the
+ * thread opens with the handle a reader needs to pick the session up elsewhere.
+ */
+export function taskHeaderBlocks(args: { name: string; cwd: string; sessionPath?: string; sessionId?: string; model?: string }): SlackBlock[] {
 	const contextParts = [`📁 \`${escapeMrkdwn(args.cwd)}\``];
 	if (args.model) contextParts.push(`🧠 ${escapeMrkdwn(args.model)}`);
 	const blocks: SlackBlock[] = [
 		section(`*${escapeMrkdwn(args.name)}*`),
 		{ type: "context", elements: [{ type: "mrkdwn", text: contextParts.join("  ·  ") }] },
 	];
-	if (args.sessionPath) {
+	const sessionParts: string[] = [];
+	if (args.sessionId) sessionParts.push(`🆔 \`${escapeMrkdwn(args.sessionId)}\``);
+	if (args.sessionPath) sessionParts.push(`🗂️ \`${escapeMrkdwn(args.sessionPath)}\``);
+	if (sessionParts.length > 0) {
 		blocks.push({
 			type: "context",
-			elements: [{ type: "mrkdwn", text: `🗂️ \`${escapeMrkdwn(args.sessionPath)}\`` }],
+			elements: [{ type: "mrkdwn", text: sessionParts.join("  ·  ") }],
 		});
 	}
 	blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: "💬 _reply in this thread to interact_" }] });

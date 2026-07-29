@@ -86,6 +86,11 @@ happens in that thread.
 | `status` | Bridge health: live tasks, registry size. |
 | `help` (or anything else) | This command list. |
 
+The thread's first message is the task header: repo, model, session id and session
+file. The id is the one `omp --resume <id>` takes, so a task started from Slack can
+be picked up in a terminal — it appears a second after the header, once the child
+has minted its session.
+
 ### Inside a task thread (drive the task)
 
 | Message | What it does |
@@ -181,6 +186,11 @@ A reply over 2900 characters cannot render as a Slack message and gets uploaded
 as a `response.md` file instead — the guidance tells agents to stay under that,
 which is why answers here read tighter than in a terminal session.
 
+Agents are also told the `REPOS` map — alias → path for every configured repo,
+with their own cwd marked — so "check what shuttle does here" resolves to
+`~/shuttle` instead of a filesystem hunt. Add a repo to `REPOS` and every task
+spawned afterwards knows the name.
+
 ### Missed messages
 
 Slack keeps no backlog for Socket Mode apps, so a DM sent while the bridge is
@@ -220,11 +230,29 @@ Talk to the bridge in plain English instead of remembering the command list:
 `run omp fix the flaky watcher test` by a **local** model — the message never
 leaves your machine.
 
+It can also pick the **model** for the task, but only from the roles you already
+configured in omp (`omp config get modelRoles`): "plan this out on the planning
+model" starts the task on your `plan` role, "keep it cheap" on `smol`/`tiny`. Say
+nothing about models and the task runs on your default. A model the router
+invents is discarded, never passed to `omp --model`.
+
+Routing runs are **recorded**. The router worker is `omp` itself — the same binary
+that runs your tasks — so a routing run is an ordinary omp session: its transcript
+goes to `~/.omp/agent/sessions/<repo-slug>/router/`, and cc-callbacks audits the
+gemma turn just like the agent turns it starts (`usage.model=gemma-4-26b`,
+`provider=shuttle`, `project_root` = the repo). The `router/` subdirectory keeps
+them out of `sessions`, so they cannot crowd out resumable work.
+
+The router model is handed **only** `router/prompts/entry.md` — no repo `AGENTS.md`,
+no environment footer, no memory or MCP guidance, and no tools beyond the six
+commands (`--bare-system-prompt` plus the `router/omp-config.yml` overlay). A
+classifier that reads your coding conventions is slower and easier to distract.
+
 Prerequisites:
 
 - Shuttle running on `127.0.0.1:8780`, serving the model.
-- `pi` and `jq` on `PATH`.
-- a `shuttle` provider in `~/.pi/agent/models.json` with that model id
+- `jq` on `PATH` (the router runs the same `omp` the bridge already uses).
+- a `shuttle` provider in `~/.omp/agent/models.yml` with that model id
   registered under it.
 
 Turn it on in `.env` (then restart the bridge):

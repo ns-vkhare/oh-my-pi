@@ -11,7 +11,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createRouter, formatRepos, parseDecision } from "./router";
+import { createRouter, formatPairs, parseDecision } from "./router";
 import type { BridgeConfig, RouterContext } from "./types";
 
 const MISSING_SCRIPT = "/nonexistent/omp-router/route.sh";
@@ -116,13 +116,13 @@ describe("parseDecision", () => {
 	});
 });
 
-describe("formatRepos", () => {
-	test("joins alias=path pairs in insertion order", () => {
-		expect(formatRepos({ a: "/p", b: "/q" })).toBe("a=/p,b=/q");
+describe("formatPairs", () => {
+	test("joins key=value pairs in insertion order", () => {
+		expect(formatPairs({ a: "/p", b: "/q" })).toBe("a=/p,b=/q");
 	});
 
 	test("an empty map yields an empty string", () => {
-		expect(formatRepos({})).toBe("");
+		expect(formatPairs({})).toBe("");
 	});
 });
 
@@ -221,5 +221,64 @@ describe("createRouter", () => {
 			"--timeout",
 			"5",
 		]);
+	});
+
+	test("--models is passed only when roles are offered, and the pick survives parsing", async () => {
+		const withRoles = await makeStub(
+			'#!/bin/sh\ncat >/dev/null\nprintf \'%s\\n\' "$@" >> "__ARGV__"\necho \'{"command":"run","dir":"omp","prompt":"fix it","model":"plan"}\'\n',
+		);
+		const routeA = createRouter(makeConfig({ routerScript: withRoles.script }));
+		expect(await routeA("plan this out", { repos: { omp: "/src/omp" }, models: { plan: "openai/gpt-5", smol: "anthropic/haiku" } })).toEqual({
+			command: "run",
+			dir: "omp",
+			prompt: "fix it",
+			model: "plan",
+		});
+		expect((await Bun.file(withRoles.argv).text()).trim().split("\n")).toEqual([
+			"--model",
+			MODEL,
+			"--repos",
+			"omp=/src/omp",
+			"--models",
+			"plan=openai/gpt-5,smol=anthropic/haiku",
+			"--timeout",
+			"5",
+		]);
+
+		// No roles configured: the flag is omitted entirely rather than sent empty.
+		const empty = await makeStub(RECORDING_STUB);
+		const routeB = createRouter(makeConfig({ routerScript: empty.script }));
+		expect(await routeB("hi", { repos: { omp: "/src/omp" }, models: {} })).toEqual({ command: "help" });
+		expect((await Bun.file(empty.argv).text()).trim().split("\n")).toEqual([
+			"--model",
+			MODEL,
+			"--repos",
+			"omp=/src/omp",
+			"--timeout",
+			"5",
+		]);
+	});
+
+	test("--session-dir is passed when the context sets one, omitted when it does not", async () => {
+		const persisted = await makeStub(RECORDING_STUB);
+		const routeA = createRouter(makeConfig({ routerScript: persisted.script }));
+		expect(await routeA("what is running?", { repos: {}, sessionDir: "/home/tester/.omp/agent/sessions/-src-omp/router" })).toEqual({
+			command: "help",
+		});
+		expect((await Bun.file(persisted.argv).text()).trim().split("\n")).toEqual([
+			"--model",
+			MODEL,
+			"--repos",
+			"",
+			"--session-dir",
+			"/home/tester/.omp/agent/sessions/-src-omp/router",
+			"--timeout",
+			"5",
+		]);
+
+		const ephemeral = await makeStub(RECORDING_STUB);
+		const routeB = createRouter(makeConfig({ routerScript: ephemeral.script }));
+		expect(await routeB("hi", { repos: {} })).toEqual({ command: "help" });
+		expect(await Bun.file(ephemeral.argv).text()).not.toContain("--session-dir");
 	});
 });

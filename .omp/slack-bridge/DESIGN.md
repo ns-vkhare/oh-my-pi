@@ -38,10 +38,11 @@ flowchart LR
 | `registry.ts` | BridgeCore | Thread↔session registry with JSON persistence. |
 | `router.ts` | Router | `createRouter` — bridge-side client: spawns `router/route.sh`, enforces `routerTimeoutMs`, parses the single JSON line. Fails open (`undefined`). |
 | `agent-model.ts` | Router | `resolveAgentModel` — reads the `orchestrate` agent definition (`<repo>/.omp/agents/`, then `~/.omp/agent/agents/`) for its pinned `model:`. |
-| `router/route.sh` | Router | pi harness invocation: message on stdin, one compact `RouterDecision` JSON line on stdout, exit 0 = decision. |
+| `router/route.sh` | Router | omp harness invocation: message on stdin, one compact `RouterDecision` JSON line on stdout, exit 0 = decision. |
 | `router/prompts/entry.md` | Router | System prompt for the routing model. |
-| `router/tools/commands.ts` | Router | pi extension registering the six commands as tools; each returns `ROUTE <json>` in its result. |
+| `router/tools/commands.ts` | Router | omp extension registering the six commands as tools (plain JSON-Schema parameters, no npm deps); each returns `ROUTE <json>` in its result. |
 | `prompts/slack-reply.md` | BridgeCore | Reply guidance appended to every spawned agent's system prompt: attach images, keep the answer in the message, absolute paths. |
+| `prompts/slack-repos.md` | BridgeCore | The `REPOS` inventory template (`{{repos}}`), appended to the same system prompt: alias → path for every configured repo, the task's own cwd marked. |
 | `omp-rpc.test.ts` | RpcCore | Unit tests against a fake child (`bun test`). |
 | `slack.test.ts` | SlackTransport | Unit tests against a local mock WS server (`bun test`). |
 | `bridge.test.ts` | BridgeCore | Unit tests for command parsing + registry (`bun test`). |
@@ -59,7 +60,7 @@ Runtime: **Bun only, zero npm dependencies.** `fetch`, `WebSocket`, `Bun.file`,
 - UI responses (stdin): `{type:"extension_ui_response", id, value:string}` (select → chosen **label**, input/editor → text), `{..., confirmed:boolean}`, `{..., cancelled:true}`.
 - **Ask questions**: the builtin `ask` tool does NOT register in RPC mode (`AskTool.createIf` requires interactive UI at tool-registry construction — verified empirically: `get_state.dumpTools` lacks `ask`). The bridge therefore registers its own `ask` **host tool** (`set_host_tools`, schema mirroring the builtin: `questions[]` with `id`/`question`/`options{label,description}`/`multi`/`recommended`). Agent calls → `host_tool_call` → bridge renders Slack blocks per question, collects answers (buttons or free-text thread reply), then sends `host_tool_result` with a text summary (`User answers:` lines). `host_tool_cancel` withdraws pending questions. The `extension_ui_request` select/confirm/input relay stays for extensions and login flows.
 - **Attaching files**: the bridge also registers an `attach_file` host tool (`paths[]` + optional `comment`). The agent calls it → the bridge reads each path (≤10 files, ≤32MB each), uploads them in one `files.completeUploadExternal` so Slack posts a single message, and answers with a sentence naming what landed and what did not. A bad path is a note in that sentence, never a failed batch; nothing readable is `isError`. This exists because Slack renders an *uploaded* image inline and renders a filesystem path as dead text — it is the only way a screenshot the agent produced reaches the user.
-- **Reply guidance**: every spawn passes `--append-system-prompt` with `prompts/slack-reply.md`. It rides the system prompt rather than the first user message so it applies to later steers too, never lands in the transcript as words the user appears to have said, and never pollutes the session name. Content: attach images instead of naming them, keep the answer under `FINAL_INLINE_MAX` or it becomes a `response.md` upload, never answer by pointing at a file, and make every path absolute.
+- **Reply guidance**: every spawn passes `--append-system-prompt` with `prompts/slack-reply.md`, plus `prompts/slack-repos.md` rendered from `REPOS` when any alias is configured — one flag, since the CLI's `--append-system-prompt` is last-wins rather than repeatable. It rides the system prompt rather than the first user message so it applies to later steers too, never lands in the transcript as words the user appears to have said, and never pollutes the session name. Content: attach images instead of naming them, keep the answer under `FINAL_INLINE_MAX` or it becomes a `response.md` upload, never answer by pointing at a file, make every path absolute — and the alias vocabulary the user types in Slack, so `look at nomad` resolves to a path instead of a search.
 
 ## Slack app (Socket Mode — no public URL)
 
@@ -135,7 +136,7 @@ thread hangs under what the user asked for:
 
 | Command | Behavior |
 |---|---|
-| `run <alias\|path> <prompt…>` | New task: resolve dir (alias from `REPOS` config, else absolute path under `$HOME`), spawn RPC proc, `set_session_name` from prompt, post the task header as the first reply under the user's message — that message's `ts` is the thread id, register thread. |
+| `run <alias\|path> <prompt…>` | New task: resolve dir (alias from `REPOS` config, else absolute path under `$HOME`), spawn RPC proc, `set_session_name` from prompt, post the task header as the first reply under the user's message — that message's `ts` is the thread id, register thread. The header is posted before the child exists, then edited from the post-handshake `get_state`: session id (parsed out of `<timestamp>_<id>.jsonl`, the id `omp --resume <id>` takes), session path, active model. |
 | `orchestrate <alias\|path> <prompt…>` | Same as `run`, except the prompt is prefixed `orchestrate: ` (so omp's `orchestrator-identity` skill triggers) and omp is spawned with `--model <orchestrator model>`, resolved from the `orchestrate` agent definition. |
 | `sessions` | List registry entries (live ⏵ / idle ⏸, dir, name, age) + how to continue (`reply in thread`) . |
 | `resume <sessionPath>` | Attach an existing on-disk session (e.g. one started in terminal): spawn `--resume`, post header, register thread. |
@@ -161,8 +162,8 @@ Agent → Slack rendering:
 A free-form DM ("start a task in omp to fix the flaky watcher test") is
 classified into exactly one top-level command by a **local** model — default
 target `shuttle/gemma-4-26b`, served by Shuttle on `127.0.0.1:8780` and driven
-through the `pi` CLI harness by `router/route.sh`. `router/prompts/entry.md` is
-the system prompt; `router/tools/commands.ts` is a pi extension registering the
+through the `omp` CLI harness by `router/route.sh`. `router/prompts/entry.md` is
+the system prompt; `router/tools/commands.ts` is an omp extension registering the
 six commands (`run`, `orchestrate`, `sessions`, `resume`, `status`, `help`) as
 tools, so the model *calls* a command instead of describing one. The
 bridge-side client is `router.ts` (`createRouter`).
@@ -172,7 +173,7 @@ flowchart LR
   D[Slack DM] --> L{literal first token?}
   L -->|yes| C[command]
   L -->|no| R[router/route.sh]
-  R --> P[pi] --> G[gemma-4-26b @ Shuttle :8780]
+  R --> P[omp] --> G[gemma-4-26b @ Shuttle :8780]
   G -->|ROUTE json| C
   R -.->|no decision| F[literal parser]
 ```
@@ -182,16 +183,56 @@ flowchart LR
   model — zero added latency for power users.
 - Anything else that reaches the top-level command surface goes to the model,
   which calls exactly one command tool. The tool returns `ROUTE <json>` in its
-  result; `route.sh` extracts that with `jq` from pi's `--mode json` event
+  result; `route.sh` extracts that with `jq` from omp's `--mode json` event
   stream and prints one JSON line on stdout.
 - **Steers are never routed.** A reply inside a live task thread still goes
   straight to the agent as a prompt; the router only sees true top-level DMs
   plus thread replies whose thread has no bound session.
-- **Fail-open.** Router disabled, Shuttle down, `jq`/`pi` missing, timeout, or
+- **Fail-open.** Router disabled, Shuttle down, `jq`/`omp` missing, timeout, or
   an unparseable answer → the bridge falls back to the literal parser (which
   posts the help text). A dead local model can never swallow a message.
 - The model's `dir` is re-validated through the existing alias/`$HOME` check: a
   hallucinated path is rejected or falls back to `DEFAULT_REPO`, never trusted.
+- **The model is pickable, from the user's own roles.** The bridge offers
+  `modelRoles` (from `omp config get modelRoles`, cached 5 min) as `role=spec`
+  pairs; the model may answer with `model` on `run`/`orchestrate`, and
+  `#resolveModel` re-validates it against that map (role name, case-insensitive,
+  or an exact configured spec) before it becomes `omp --model <spec>`. Anything
+  else is dropped and the child runs on omp's default — an invented id never
+  reaches argv. An explicitly routed model outranks the `orchestrate` pin.
+  Verified against `gemma-4-26b`: "use the planning model to fix the flaky
+  bridge test in omp" → `{"command":"run","dir":"omp","model":"plan",…}`, while
+  the same sentence without the model clause carries no `model` key.
+- **The routing run is an ordinary omp session, and is recorded as one.** The
+  worker is `omp`, not `pi`: same binary the bridge spawns for tasks, so the
+  `shuttle` provider lives in `~/.omp/agent/models.yml`, the transcript lands in
+  omp's own session storage, and the omp plugins — cc-callbacks above all — audit
+  it exactly like an agent session (`turns_main.jsonl` carries
+  `usage.model=gemma-4-26b`, `provider=shuttle`). `--session-dir` points at
+  `<repo session dir>/router` and cwd is that repo, so the audit's `project_root`
+  is the repo rather than the bridge's install dir, while `omp sessions --dir
+  <repo>` — and therefore Slack's `sessions` listing — never shows routing
+  transcripts beside resumable work. `OMP_SLACK_BRIDGE=1` marks the child so the
+  `slack-notify` extension self-skips instead of posting a turn-end ping per
+  route.
+  Two consequences of the harness swap, both deliberate: the routing surface is
+  pinned with `--no-tools` rather than `--tools <six names>` (omp validates
+  `--tools` against *builtin* names at parse time, and extension-registered tools
+  are always active regardless of that filter — sdk.ts), and the harness's own
+  prompt contributions have to be turned off explicitly. `--bare-system-prompt`
+  (omp flag) plus `router/omp-config.yml` (`--config` overlay: memory off,
+  autolearn off, no workspace tree, `disabledProviders: [codex]`) reduce the
+  worker's system prompt to **exactly `prompts/entry.md`** and its tools to
+  exactly the six commands — verified through `get_state`: one segment, byte-equal
+  to entry.md. Before the overlay it was 58k chars across two segments (memory
+  guidance, auto-learn, MCP instructions, both `AGENTS.md` files, the PROJECT
+  footer) and 11 tools including `learn` and `mcp__node_repl_js`; the routing turn
+  went from ~18.9k to ~3.6k tokens.
+  Limit: cc-callbacks nests a child *into a parent's audit folder* only when the
+  session header carries **both** `parentSession` and `agentId`. omp stamps those
+  on spawned sub-agents, but the task session does not exist yet when routing
+  runs, so a routing run is audited as its own flat session — colocated, not
+  nested.
 - **Attachments are described, never shown.** The model gets a one-line
   inventory (`screenshot.png (image/png)`) — names and types only, no bytes and
   no local paths, because a Shuttle-served local model has no vision and its only
@@ -203,9 +244,10 @@ flowchart LR
 `route.sh` contract:
 
 ```
-router/route.sh --model <pi-model-spec> --repos "alias=path,alias=path" \
-                [--default-repo <alias>] [--attachments "name (type), …"] \
-                [--timeout <seconds>]
+router/route.sh --model <omp-model-spec> --repos "alias=path,alias=path" \
+                [--default-repo <alias>] [--models "role=spec,role=spec"] \
+                [--attachments "name (type), …"] \
+                [--session-dir <dir>] [--session-name <name>] [--timeout <seconds>]
 ```
 
 - The Slack message text arrives on **stdin**, never as an argv word (it is
@@ -244,7 +286,7 @@ orchestrator identity comes from the skill, the model from `--model`.
 `DEFAULT_REPO` (alias used when `run` gets no dir), `MAX_TASKS` (default 4),
 `IDLE_TTL_MIN` (default 30), `SESSION_NAME_PREFIX` (default `slack:`),
 `CATCHUP_WINDOW_MIN` (default 60, 0 disables the missed-DM sweep),
-`ROUTER_MODEL` (pi model spec for the router, e.g. `shuttle/gemma-4-26b`;
+`ROUTER_MODEL` (omp model spec for the router, e.g. `shuttle/gemma-4-26b`;
 empty — the default — disables the router), `ROUTER_TIMEOUT_MS` (per-message
 routing deadline, default 60000), `ROUTER_SCRIPT` (override the path to
 `route.sh`; defaults to the `router/route.sh` beside the installed bridge),

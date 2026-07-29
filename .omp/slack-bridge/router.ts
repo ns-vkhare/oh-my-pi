@@ -30,9 +30,9 @@ function nonEmpty(value: unknown): string | undefined {
 }
 
 /** `{a: "/p", b: "/q"}` → `"a=/p,b=/q"`; insertion order, empty object → `""`. */
-export function formatRepos(repos: Record<string, string>): string {
-	return Object.entries(repos)
-		.map(([alias, path]) => `${alias}=${path}`)
+export function formatPairs(pairs: Record<string, string>): string {
+	return Object.entries(pairs)
+		.map(([key, value]) => `${key}=${value}`)
 		.join(",");
 }
 
@@ -59,7 +59,10 @@ export function parseDecision(line: string): RouterDecision | undefined {
 			const prompt = nonEmpty(parsed.prompt);
 			if (prompt === undefined) return undefined;
 			const dir = nonEmpty(parsed.dir);
-			const args: { dir?: string; prompt: string } = dir === undefined ? { prompt } : { dir, prompt };
+			const model = nonEmpty(parsed.model);
+			const args: { dir?: string; prompt: string; model?: string } = { prompt };
+			if (dir !== undefined) args.dir = dir;
+			if (model !== undefined) args.model = model;
 			return command === "run" ? { command: "run", ...args } : { command: "orchestrate", ...args };
 		}
 		case "sessions": {
@@ -86,17 +89,27 @@ export function createRouter(config: BridgeConfig): RouteMessage {
 		if (model.length === 0) return undefined;
 
 		try {
-			const args = [config.routerScript, "--model", model, "--repos", formatRepos(ctx.repos)];
+			const args = [config.routerScript, "--model", model, "--repos", formatPairs(ctx.repos)];
 			const defaultRepo = nonEmpty(ctx.defaultRepo);
 			if (defaultRepo !== undefined) args.push("--default-repo", defaultRepo);
+			// The models the user already configured (omp's `modelRoles`): offered as
+			// role=spec so the model can answer with a role name it can reason about.
+			const models = ctx.models === undefined ? "" : formatPairs(ctx.models);
+			if (models.length > 0) args.push("--models", models);
 			// Names and types only, and already collapsed to one line by the caller:
 			// argv is safe here (no shell between us and the script) and it keeps the
 			// inventory out of the message the model must restate verbatim.
 			const attachments = nonEmpty(ctx.attachments);
 			if (attachments !== undefined) args.push("--attachments", attachments);
+			// Persist the routing transcript in omp's own session tree — the bridge
+			// points this at a `router/` dir inside the repo's session dir.
+			const sessionDir = nonEmpty(ctx.sessionDir);
+			if (sessionDir !== undefined) args.push("--session-dir", sessionDir);
 			args.push("--timeout", String(Math.ceil(config.routerTimeoutMs / 1000)));
 
-			const child = Bun.spawn(args, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+			// cwd is what cc-callbacks records as the audited run's project_root, so
+			// the routing turn is attributed to the repo, not the bridge's install dir.
+			const child = Bun.spawn(args, { cwd: nonEmpty(ctx.cwd), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
 			// The message is untrusted user text: it travels over stdin, never argv.
 			child.stdin.write(text);
 			child.stdin.end();

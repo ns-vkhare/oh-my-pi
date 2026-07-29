@@ -481,11 +481,13 @@ export type ControlResponse =
  * Mirrors the top-level command surface one-for-one: the router picks the
  * command and its arguments, the bridge executes it. `dir` is a REPOS alias or
  * an absolute path under $HOME — the bridge re-validates it via `#resolveDir`
- * and never trusts the model's choice.
+ * and never trusts the model's choice. `model` is a **role name or exact spec
+ * from the offered map** and is re-validated the same way (`#resolveModel`):
+ * anything else is dropped, leaving omp's own default.
  */
 export type RouterDecision =
-	| { command: "run"; dir?: string; prompt: string }
-	| { command: "orchestrate"; dir?: string; prompt: string }
+	| { command: "run"; dir?: string; prompt: string; model?: string }
+	| { command: "orchestrate"; dir?: string; prompt: string; model?: string }
 	| { command: "sessions"; alias?: string }
 	| { command: "resume"; target: string }
 	| { command: "status" }
@@ -496,6 +498,25 @@ export interface RouterContext {
 	/** alias → absolute path, from `REPOS`. */
 	repos: Record<string, string>;
 	defaultRepo?: string;
+	/**
+	 * role → model spec, from omp's own `modelRoles` setting (`omp config get
+	 * modelRoles`). The only models the router may pick from, so a task lands on
+	 * a model the user already configured rather than an invented id.
+	 */
+	models?: Record<string, string>;
+	/**
+	 * Where the routing run persists its own transcript: the **omp** session dir
+	 * for the repo, so a gemma routing run lands beside the agent sessions it
+	 * starts and cc-callbacks audits both from one tree. Absent → pi's own
+	 * per-cwd dir.
+	 */
+	sessionDir?: string;
+	/**
+	 * Working directory for the routing run. cc-callbacks records the process cwd
+	 * as the audited run's `project_root`, so pointing it at the repo attributes
+	 * the routing turn to that project instead of the bridge's install dir.
+	 */
+	cwd?: string;
 	/**
 	 * One-line inventory of the message's attachments (`screenshot.png
 	 * (image/png)`), or absent when it carries none. The router model gets the
