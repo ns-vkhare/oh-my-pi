@@ -1298,6 +1298,17 @@ describe("front-door router", () => {
 		expect(h.rpcs).toHaveLength(0);
 	});
 
+	test("an enabled router that declines says so above the help card", async () => {
+		const route = fakeRoute(undefined);
+		const h = await makeHarness(makeConfig({ routerModel: "shuttle/gemma-4-26b" }), [], undefined, route);
+		await h.slack.inject(dm("in the verification steps PR, add these changes to the UI"));
+
+		const posted = h.slack.posted.at(-1)!.args.text ?? "";
+		expect(posted).toContain("The routing model did not answer");
+		expect(posted).toContain("*omp slack bridge*");
+		expect(h.rpcs).toHaveLength(0);
+	});
+
 	test("a `run` decision spawns one rpc in the alias cwd, with omp's default model", async () => {
 		const route = fakeRoute({ command: "run", dir: "omp", prompt: "fix the thing" });
 		const h = await makeHarness(makeConfig(), [], undefined, route);

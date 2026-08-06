@@ -190,7 +190,17 @@ flowchart LR
   plus thread replies whose thread has no bound session.
 - **Fail-open.** Router disabled, Shuttle down, `jq`/`omp` missing, timeout, or
   an unparseable answer → the bridge falls back to the literal parser (which
-  posts the help text). A dead local model can never swallow a message.
+  posts the help text, prefixed with a line saying the routing model did not
+  answer whenever the router was *enabled* — a routing failure must not read as
+  "your message made no sense"). A dead local model can never swallow a message.
+- **Two staggered deadlines, worker first.** `route.sh` gets `--timeout`
+  = `ROUTER_TIMEOUT_MS` minus a 15s grace, so its own SIGALRM fires before the
+  bridge's `child.kill()`. That is what makes the harvest in `route.sh` reachable:
+  the tool call IS the decision, the summary turn after it is cosmetic, so a
+  worker killed mid-explanation still prints a valid decision (`trace.turns` 0/1).
+  With equal deadlines the bridge always won the race — its timer starts before
+  the spawn — and an over-thinking local model that had already routed still
+  fell through to help.
 - The model's `dir` is re-validated through the existing alias/`$HOME` check: a
   hallucinated path is rejected or falls back to `DEFAULT_REPO`, never trusted.
 - **The model is pickable, from the user's own roles.** The bridge offers

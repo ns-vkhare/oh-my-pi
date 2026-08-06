@@ -356,6 +356,14 @@ const HELP_TEXT = [
 ].join("\n");
 
 /**
+ * Prefixed to the help fallback when the router was *enabled* and still produced
+ * nothing (dead model, blown deadline, unparseable answer). Without it a routing
+ * failure is indistinguishable from "I could not understand you", so a detailed
+ * request silently becomes a help card and the user retypes it minutes later.
+ */
+const ROUTER_FAILED_NOTE = "_The routing model did not answer, so this fell through to the literal parser — retry, or name the command yourself._";
+
+/**
  * Prompt used when a DM is nothing but attachments. Deliberately does no work:
  * the user said nothing, so the agent describes what it was handed and waits.
  * That single turn is enough to bind the thread, and every reply after it is a
@@ -848,7 +856,10 @@ export class Bridge {
 			await this.#dispatchDecision(msg, decision);
 			return;
 		}
-		await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: HELP_TEXT });
+		// An enabled router that answered nothing is a failure, not ambiguity: say so
+		// above the help card, or the user reads their request as unintelligible.
+		const fallback = this.#config.routerModel.trim().length > 0 ? `${ROUTER_FAILED_NOTE}\n${HELP_TEXT}` : HELP_TEXT;
+		await this.#slack.postMessage({ channel: msg.channel, threadTs: this.#replyThread(msg), text: fallback });
 	}
 
 	/**

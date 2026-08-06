@@ -189,6 +189,18 @@ describe("createRouter", () => {
 		expect(Date.now() - started).toBeLessThan(4000);
 	});
 
+	test("the worker's own deadline lands under the bridge's, so a killed run can still be harvested", async () => {
+		const stub = await makeStub(RECORDING_STUB);
+		const route = createRouter(makeConfig({ routerScript: stub.script, routerTimeoutMs: 150_000 }));
+		expect(await route("hi", CTX)).toEqual({ command: "help" });
+
+		const argv = (await Bun.file(stub.argv).text()).trim().split("\n");
+		// 150s bridge deadline − 15s grace: route.sh's alarm fires first, so its jq
+		// harvest of an already-emitted decision runs instead of being killed away.
+		expect(argv.at(-2)).toBe("--timeout");
+		expect(Number(argv.at(-1))).toBe(135);
+	});
+
 	test("--default-repo is passed only when the context sets one", async () => {
 		const withDefault = await makeStub(RECORDING_STUB);
 		const routeA = createRouter(makeConfig({ routerScript: withDefault.script }));

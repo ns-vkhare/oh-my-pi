@@ -22,6 +22,12 @@ const STDERR_LOG_CAP = 512;
 const SUMMARY_MAX_LINES = 3;
 /** Per-line budget, so one runaway line cannot stretch the Slack context block. */
 const SUMMARY_LINE_MAX = 220;
+/**
+ * Head room reserved out of the bridge deadline for the worker's own SIGALRM
+ * path: omp startup runs inside that alarm, and after it fires `route.sh` still
+ * has to jq-harvest the captured event stream. 15s covers both on a loaded box.
+ */
+const WORKER_GRACE_MS = 15_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -146,7 +152,14 @@ export function createRouter(config: BridgeConfig): RouteMessage {
 			// points this at a `router/` dir inside the repo's session dir.
 			const sessionDir = nonEmpty(ctx.sessionDir);
 			if (sessionDir !== undefined) args.push("--session-dir", sessionDir);
-			args.push("--timeout", String(Math.ceil(config.routerTimeoutMs / 1000)));
+			// The worker's alarm must fire BEFORE the bridge's deadline: `route.sh`
+			// harvests a decision a killed worker already emitted (the tool call IS the
+			// decision; the summary turn after it is cosmetic), whereas `child.kill()`
+			// below throws that stdout away. Equal deadlines meant the bridge always won
+			// the race, so an over-thinking local model that had already routed still
+			// fell through to the literal parser and posted help. The floor keeps a
+			// deadline at or under the grace from becoming a non-positive `--timeout`.
+			args.push("--timeout", String(Math.max(5, Math.floor((config.routerTimeoutMs - WORKER_GRACE_MS) / 1000))));
 
 			// cwd is what cc-callbacks records as the audited run's project_root, so
 			// the routing turn is attributed to the repo, not the bridge's install dir.
