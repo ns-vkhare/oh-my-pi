@@ -1234,11 +1234,12 @@ export class Bridge {
 
 		const command = text.toLowerCase();
 		if (task.pendingAsk && command !== "abort" && command !== "kill" && command !== "status") {
-			const idx = task.pendingAsk.answers.findIndex((a) => a === undefined);
-			if (idx !== -1) {
-				await this.#answerAskQuestion(task, idx, text, msg.user);
-				return;
-			}
+			// A typed reply means "here is my actual answer" — cancel the structured
+			// ask and submit the freeform text as the tool result, rather than filling
+			// one question at a time and leaving the turn blocked on the rest. Option
+			// buttons remain the per-question path (#handleAskAction).
+			await this.#answerAskFreeform(task, text, msg.user);
+			return;
 		}
 		if (command === "abort") {
 			await task.rpc.abort().catch((err) => this.#note(task!, `abort failed: ${String(err)}`));
@@ -1809,6 +1810,36 @@ export class Bridge {
 		}
 	}
 
+	/**
+	 * A typed thread reply resolves a pending ask with freeform text: submit the
+	 * reply as the tool result and drop the ask. Any options already clicked are
+	 * folded into the result so they are not lost; the still-open question messages
+	 * are collapsed to a plain answered marker (the user's reply is already visible
+	 * in the thread right below them).
+	 */
+	async #answerAskFreeform(task: LiveTask, text: string, user: string): Promise<void> {
+		const pending = task.pendingAsk;
+		if (!pending) return;
+		task.pendingAsk = undefined;
+		task.rpc.respondHostTool({
+			type: "host_tool_result",
+			id: pending.callId,
+			result: { content: [{ type: "text", text: formatAskFreeform(pending, text) }] },
+		});
+		for (let i = 0; i < pending.messageTs.length; i++) {
+			if (pending.answers[i] !== undefined) continue;
+			await this.#slack
+				.updateMessage({
+					channel: task.record.channel,
+					ts: pending.messageTs[i]!,
+					text: "✅ answered in thread",
+					blocks: askAnsweredBlocks({ question: pending.questions[i]!.question, answer: text, user }),
+				})
+				.catch(() => {});
+		}
+		this.#registry.touch(task.record.threadTs);
+	}
+
 	/** Edit unanswered ask messages to `label` and drop pendingAsk. */
 	async #clearPendingAsk(task: LiveTask, label: string): Promise<void> {
 		const pending = task.pendingAsk;
@@ -1981,6 +2012,19 @@ function formatAskResult(pending: PendingAsk): string {
 	}
 	const lines = pending.questions.map((q, i) => `${i + 1}. ${q.question} → ${pending.answers[i] ?? ""}`);
 	return `User answers:\n${lines.join("\n")}`;
+}
+
+/**
+ * Result text when the user answered an ask with a freeform thread reply instead
+ * of choosing options. Any options clicked before the reply are preserved so the
+ * agent still sees them.
+ */
+function formatAskFreeform(pending: PendingAsk, reply: string): string {
+	const clicked = pending.questions
+		.map((q, i) => (pending.answers[i] !== undefined ? `${q.question} → ${pending.answers[i]}` : undefined))
+		.filter((line): line is string => line !== undefined);
+	const prefix = clicked.length > 0 ? `Options selected before replying:\n${clicked.join("\n")}\n\n` : "";
+	return `${prefix}User replied directly instead of choosing options: ${reply}`;
 }
 
 function uiTitle(req: OmpUiRequest): string {

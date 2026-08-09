@@ -997,7 +997,7 @@ describe("ask host tool", () => {
 		expect(rpc.hostTools.at(-1)?.some((t) => t.name === "ask")).toBe(true);
 	});
 
-	test("two questions: button answers Q1 without completing; thread reply answers Q2 and completes", async () => {
+	test("two questions: a typed reply cancels the ask and submits freeform, preserving prior clicks", async () => {
 		const h = await makeHarness(makeConfig());
 		const { rpc, threadTs } = await runningTask(h);
 
@@ -1023,14 +1023,36 @@ describe("ask host tool", () => {
 		expect(h.slack.updated.some((u) => u.ts === q0Post!.ts)).toBe(true);
 		expect(rpc.hostToolResults).toHaveLength(0);
 
-		// Answer Q2 via thread reply → completes with both → lines.
+		// Typed reply → cancels the ask and submits freeform. The earlier click is
+		// preserved in the result; the reply text is submitted as the answer.
 		await h.slack.inject(dm("Large", "UALICE", threadTs));
 		expect(rpc.hostToolResults).toHaveLength(1);
 		const text = rpc.hostToolResults[0]!.result.content[0]!.text;
 		expect(text).toContain("Pick a color → Red");
-		expect(text).toContain("Pick a size → Large");
+		expect(text).toContain("User replied directly instead of choosing options: Large");
 
 		// pendingAsk cleared → a later thread reply becomes a prompt.
+		rpc.prompts.length = 0;
+		await h.slack.inject(dm("carry on", "UALICE", threadTs));
+		expect(rpc.prompts).toEqual(["carry on"]);
+	});
+
+	test("multi-question ask: a typed reply with no clicks cancels and submits immediately", async () => {
+		const h = await makeHarness(makeConfig());
+		const { rpc, threadTs } = await runningTask(h);
+
+		rpc.emitHostToolCall({ type: "host_tool_call", id: "host_f", toolCallId: "tcf", toolName: "ask", arguments: twoQuestions });
+		await settle();
+		expect(askPostFor(h, "ask:host_f:0:")).toBeDefined();
+		expect(askPostFor(h, "ask:host_f:1:")).toBeDefined();
+
+		// No button click at all — one typed reply completes the whole ask.
+		await h.slack.inject(dm("just do the safe thing for both", "UALICE", threadTs));
+		expect(rpc.hostToolResults).toHaveLength(1);
+		const text = rpc.hostToolResults[0]!.result.content[0]!.text;
+		expect(text).toBe("User replied directly instead of choosing options: just do the safe thing for both");
+
+		// pendingAsk cleared → a later thread reply becomes a prompt, not an answer.
 		rpc.prompts.length = 0;
 		await h.slack.inject(dm("carry on", "UALICE", threadTs));
 		expect(rpc.prompts).toEqual(["carry on"]);
