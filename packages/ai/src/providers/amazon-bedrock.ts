@@ -7,8 +7,13 @@
  * Bun's native `HTTPS_PROXY` support.
  */
 
-import type { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { isOpenAIBedrockModelId } from "@oh-my-pi/pi-catalog/identity";
+import {
+	mapEffortToAnthropicAdaptiveEffort,
+	mapEffortToWireEffort,
+	requireSupportedEffort,
+} from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { $env, $flag, fetchWithRetry, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
 import { renderDemotedThinking } from "../dialect/demotion";
@@ -751,16 +756,6 @@ function supportsThinkingSignature(model: Model<"bedrock-converse-stream">): boo
 	return id.includes("anthropic.claude") || id.includes("anthropic/claude");
 }
 
-/**
- * Detects OpenAI-family models served through Bedrock (`openai.gpt-*`,
- * `openai.gpt-oss-*`), with or without a geo/global inference-profile prefix
- * (`us.openai.*`, `global.openai.*`). These accept OpenAI's `reasoning.effort`
- * in `additionalModelRequestFields`, not Anthropic thinking blocks.
- */
-function isOpenAiBedrockModel(modelId: string): boolean {
-	return modelId.toLowerCase().includes("openai.");
-}
-
 function buildSystemPrompt(
 	systemPrompt: readonly string[] | undefined,
 	promptCachePolicy: BedrockPromptCachePolicy,
@@ -1004,13 +999,14 @@ function buildAdditionalModelRequestFields(
 	if (!reasoning || !model.reasoning) return undefined;
 
 	// OpenAI models on Bedrock (openai.gpt-5.6-*, openai.gpt-oss-*, behind
-	// us./eu./global. geo prefixes or bare) take OpenAI's `reasoning.effort`
-	// surface — Anthropic thinking blocks/budgets are rejected with a
-	// ValidationException. Bedrock accepts none/low/medium/high/xhigh/max, so
-	// `minimal` needs an effortMap (models.yml) to a supported value.
-	if (isOpenAiBedrockModel(model.id)) {
-		const level = requireSupportedEffort(model, reasoning);
-		return { reasoning: { effort: model.thinking?.effortMap?.[level] ?? level } };
+	// us./eu./global. geo prefixes, inference-profile ARNs, or bare) take
+	// OpenAI's `reasoning.effort` surface — Anthropic thinking blocks/budgets
+	// are rejected with a ValidationException. Bedrock's OpenAI surface has no
+	// `minimal` tier (none/low/medium/high/xhigh/max), so remap it to low; a
+	// models.yml `thinking.effortMap` entry still wins via mapEffortToWireEffort.
+	if (isOpenAIBedrockModelId(model.id)) {
+		const effort = mapEffortToWireEffort(model, reasoning);
+		return { reasoning: { effort: effort === Effort.Minimal ? Effort.Low : effort } };
 	}
 
 	const mode = model.thinking?.mode;

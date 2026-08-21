@@ -288,6 +288,37 @@ describe("Bedrock OpenAI reasoning effort", () => {
 		expect(fields).toMatchObject({ thinking: { type: "adaptive" } });
 		expect(fields).not.toHaveProperty("reasoning");
 	});
+
+	// The detector matches the `openai` id segment, never a substring inside
+	// another token — a lookalike id must keep the Anthropic thinking payload.
+	test.each(["contoso.openai-clone-1", "notopenai.gpt-5.6-sol"])(
+		"does not route lookalike id %s to the OpenAI effort surface",
+		async id => {
+			const fields = await capturedAdditionalFields(openAiBedrockModel(id), Effort.High);
+			expect(fields).toMatchObject({ thinking: { type: "enabled" } });
+			expect(fields).not.toHaveProperty("reasoning");
+		},
+	);
+
+	// An effortMap key is legal even off the declared ladder (the remap escape
+	// hatch): it must remap instead of throwing "effort not supported".
+	test("honors an effortMap remap for a level outside the declared ladder", async () => {
+		const model = openAiBedrockModel("global.openai.gpt-5.6-sol", {
+			mode: "effort",
+			efforts: [Effort.Low, Effort.Medium],
+			effortMap: { [Effort.Minimal]: "low" },
+		});
+		expect(await capturedAdditionalFields(model, Effort.Minimal)).toEqual({ reasoning: { effort: "low" } });
+	});
+
+	// Bundled openai.gpt-oss-* entries ship `minimal` on the ladder with no
+	// effortMap; Bedrock's OpenAI surface rejects `minimal`, so the provider
+	// remaps it to low instead of sending a value the wire rejects.
+	test("remaps minimal to low for derived gpt-oss thinking (no explicit effortMap)", async () => {
+		const model = openAiBedrockModel("openai.gpt-oss-120b");
+		expect(await capturedAdditionalFields(model, Effort.Minimal)).toEqual({ reasoning: { effort: "low" } });
+		expect(await capturedAdditionalFields(model, Effort.High)).toEqual({ reasoning: { effort: "high" } });
+	});
 });
 
 describe("Bedrock error handling", () => {
