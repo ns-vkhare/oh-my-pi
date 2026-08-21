@@ -751,6 +751,16 @@ function supportsThinkingSignature(model: Model<"bedrock-converse-stream">): boo
 	return id.includes("anthropic.claude") || id.includes("anthropic/claude");
 }
 
+/**
+ * Detects OpenAI-family models served through Bedrock (`openai.gpt-*`,
+ * `openai.gpt-oss-*`), with or without a geo/global inference-profile prefix
+ * (`us.openai.*`, `global.openai.*`). These accept OpenAI's `reasoning.effort`
+ * in `additionalModelRequestFields`, not Anthropic thinking blocks.
+ */
+function isOpenAiBedrockModel(modelId: string): boolean {
+	return modelId.toLowerCase().includes("openai.");
+}
+
 function buildSystemPrompt(
 	systemPrompt: readonly string[] | undefined,
 	promptCachePolicy: BedrockPromptCachePolicy,
@@ -992,6 +1002,16 @@ function buildAdditionalModelRequestFields(
 ): Record<string, unknown> | undefined {
 	const reasoning = options.reasoning;
 	if (!reasoning || !model.reasoning) return undefined;
+
+	// OpenAI models on Bedrock (openai.gpt-5.6-*, openai.gpt-oss-*, behind
+	// us./eu./global. geo prefixes or bare) take OpenAI's `reasoning.effort`
+	// surface — Anthropic thinking blocks/budgets are rejected with a
+	// ValidationException. Bedrock accepts none/low/medium/high/xhigh/max, so
+	// `minimal` needs an effortMap (models.yml) to a supported value.
+	if (isOpenAiBedrockModel(model.id)) {
+		const level = requireSupportedEffort(model, reasoning);
+		return { reasoning: { effort: model.thinking?.effortMap?.[level] ?? level } };
+	}
 
 	const mode = model.thinking?.mode;
 	if (mode === "anthropic-adaptive") {

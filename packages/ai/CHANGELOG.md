@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added OpenAI `reasoning.effort` support for OpenAI-family models served through Amazon Bedrock (`openai.gpt-5.6-*`, `openai.gpt-oss-*`, with or without a `us.`/`eu.`/`global.` inference-profile prefix): thinking requests now send `additionalModelRequestFields: { reasoning: { effort } }` instead of Anthropic thinking blocks, which these models reject with a ValidationException. Declare the model in models.yml with `reasoning: true` and a `thinking` block (mode `effort`; Bedrock accepts `none`/`low`/`medium`/`high`/`xhigh`/`max`, so remap `minimal` via `thinking.effortMap`).
 - Added silent AWS SSO token refresh for the Bedrock provider: an expired `~/.aws/sso/cache` token is now automatically renewed via the SSO-OIDC CreateToken API using the cached refresh token and client registration (and written back to the cache for other AWS tools), matching the AWS SDK/CLI, instead of failing with "Run 'aws sso login' to refresh." The error is only surfaced when the refresh token or client registration is missing/expired.
 ## [17.1.8] - 2026-07-28
 

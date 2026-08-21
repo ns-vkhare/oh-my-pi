@@ -221,6 +221,75 @@ describe("Bedrock cross-region inference-profile geo routing", () => {
 	});
 });
 
+describe("Bedrock OpenAI reasoning effort", () => {
+	function openAiBedrockModel(
+		id: string,
+		thinking?: Model<"bedrock-converse-stream">["thinking"],
+	): Model<"bedrock-converse-stream"> {
+		return buildModel({
+			id,
+			name: id,
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+			baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 10, output: 45, cacheRead: 1, cacheWrite: 12.5 },
+			contextWindow: 1050000,
+			maxTokens: 128000,
+			...(thinking ? { thinking } : {}),
+		});
+	}
+
+	async function capturedAdditionalFields(
+		model: Model<"bedrock-converse-stream">,
+		reasoning: Effort,
+	): Promise<Record<string, unknown> | undefined> {
+		const controller = new AbortController();
+		controller.abort();
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		void streamBedrock(model, userContext(), {
+			signal: controller.signal,
+			reasoning,
+			maxTokens: 16,
+			onPayload: payload => resolve(payload),
+		});
+		const payload = (await promise) as { additionalModelRequestFields?: Record<string, unknown> };
+		return payload.additionalModelRequestFields;
+	}
+
+	const effortThinking = {
+		mode: "effort",
+		efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
+	} as const;
+
+	// OpenAI models on Bedrock reject Anthropic thinking blocks with a
+	// ValidationException; they take OpenAI's `reasoning.effort` surface.
+	test.each(["openai.gpt-5.6-sol", "us.openai.gpt-5.6-sol", "global.openai.gpt-5.6-sol"])(
+		"sends reasoning.effort (never Anthropic thinking blocks) for %s",
+		async id => {
+			const fields = await capturedAdditionalFields(openAiBedrockModel(id, effortThinking), Effort.Max);
+			expect(fields).toEqual({ reasoning: { effort: "max" } });
+		},
+	);
+
+	test("applies thinking.effortMap remaps to the wire value", async () => {
+		const model = openAiBedrockModel("global.openai.gpt-5.6-sol", {
+			mode: "effort",
+			efforts: [Effort.Minimal, Effort.Low],
+			effortMap: { [Effort.Minimal]: "low" },
+		});
+		// Bedrock rejects `minimal` for gpt-5.6 (supported: none/low/medium/high/xhigh/max).
+		expect(await capturedAdditionalFields(model, Effort.Minimal)).toEqual({ reasoning: { effort: "low" } });
+	});
+
+	test("keeps Anthropic budget thinking for non-OpenAI bedrock models", async () => {
+		const fields = await capturedAdditionalFields(profileModel, Effort.High);
+		expect(fields).toMatchObject({ thinking: { type: "adaptive" } });
+		expect(fields).not.toHaveProperty("reasoning");
+	});
+});
+
 describe("Bedrock error handling", () => {
 	const circular: Record<string, unknown> = {};
 	circular.self = circular;
