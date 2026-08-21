@@ -6,10 +6,38 @@ import {
 	getSupportedEfforts,
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
+	mapEffortToWireEffort,
 	minimumSupportedEffort,
 	requireSupportedEffort,
 } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Api, Model, ModelSpec, Provider } from "@oh-my-pi/pi-catalog/types";
+
+describe("mapEffortToWireEffort", () => {
+	// A thinking.effortMap key is the remap escape hatch: legal even off the
+	// declared ladder; unmapped efforts must be on the ladder and pass through.
+	const model = createModel({
+		id: "global.openai.gpt-5.6-sol",
+		api: "bedrock-converse-stream",
+		provider: "amazon-bedrock",
+		thinking: {
+			mode: "effort",
+			efforts: [Effort.Low, Effort.Medium],
+			effortMap: { [Effort.Minimal]: "low" },
+		},
+	});
+
+	it("prefers an explicit effortMap entry, even for an off-ladder effort", () => {
+		expect(mapEffortToWireEffort(model, Effort.Minimal)).toBe("low");
+	});
+
+	it("passes on-ladder unmapped efforts through verbatim", () => {
+		expect(mapEffortToWireEffort(model, Effort.Medium)).toBe("medium");
+	});
+
+	it("throws for unmapped efforts outside the ladder", () => {
+		expect(() => mapEffortToWireEffort(model, Effort.Max)).toThrow(/not supported/);
+	});
+});
 
 function createModel<TApi extends Api>(overrides: {
 	id: string;

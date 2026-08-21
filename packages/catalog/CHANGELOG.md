@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `isOpenAIBedrockModelId` identity predicate (segment-exact `openai` match covering geo-prefixed ids and inference-profile ARNs) and `mapEffortToWireEffort` (effortMap-first wire effort resolution; `mapEffortToAnthropicAdaptiveEffort` is now expressed on top of it).
+
 ## [17.1.8] - 2026-07-28
 
 ### Added

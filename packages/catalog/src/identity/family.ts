@@ -135,6 +135,19 @@ export const isOpenAIGptOssModelId = memo((modelId: string): boolean => {
 	return /(^|\/)gpt-oss[-:]/i.test(modelId);
 });
 
+/**
+ * OpenAI-family model served through Amazon Bedrock (`openai.gpt-*`,
+ * `openai.gpt-oss-*`), with or without a geo/global inference-profile prefix
+ * (`us.openai.*`, `global.openai.*`) or wrapped in an inference-profile ARN
+ * (`arn:aws:bedrock:…:inference-profile/us.openai.gpt-5.6-sol`). Matches the
+ * `openai` id segment exactly — a bare substring would also fire on ids that
+ * merely contain "openai" inside another token (`notopenai.*`,
+ * `*.openai-compatible`).
+ */
+export const isOpenAIBedrockModelId = memo((modelId: string): boolean => {
+	return modelId.toLowerCase().split(/[./:]/).includes("openai");
+});
+
 /** OpenAI model ids (gpt-*, chatgpt-*, o1/o3/o4 SKUs, codex-*, or openai/*). */
 export const isOpenAIModelId = memo((modelId: string): boolean => {
 	return (

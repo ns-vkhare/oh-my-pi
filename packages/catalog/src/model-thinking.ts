@@ -774,6 +774,19 @@ export function mapEffortToGoogleThinkingLevel(effort: Effort): "MINIMAL" | "LOW
 }
 
 /**
+ * Maps a normalized thinking effort to the provider's wire value. An explicit
+ * `thinking.effortMap` entry wins — its keys are legal even off the declared
+ * `efforts` ladder (that remap is the escape hatch for wire shapes the ladder
+ * cannot express, e.g. `minimal` → `low` on Bedrock's OpenAI surface);
+ * anything unmapped must be on the ladder and passes through verbatim.
+ */
+export function mapEffortToWireEffort<TApi extends Api>(model: ApiModel<TApi>, effort: Effort): string {
+	const mapped = model.thinking?.effortMap?.[effort];
+	if (mapped !== undefined) return mapped;
+	return requireSupportedEffort(model, effort);
+}
+
+/**
  * Maps a normalized thinking effort to Anthropic adaptive effort values via
  * the model's baked `thinking.effortMap` (identity for unmapped efforts).
  */
@@ -781,14 +794,7 @@ export function mapEffortToAnthropicAdaptiveEffort<TApi extends Api>(
 	model: ApiModel<TApi>,
 	effort: Effort,
 ): "low" | "medium" | "high" | "xhigh" | "max" | "adaptive" {
-	const supported = requireSupportedEffort(model, effort);
-	return (model.thinking?.effortMap?.[supported] ?? supported) as
-		| "low"
-		| "medium"
-		| "high"
-		| "xhigh"
-		| "max"
-		| "adaptive";
+	return mapEffortToWireEffort(model, effort) as "low" | "medium" | "high" | "xhigh" | "max" | "adaptive";
 }
 
 /**
