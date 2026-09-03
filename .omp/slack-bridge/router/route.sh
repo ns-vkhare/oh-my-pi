@@ -4,9 +4,10 @@
 # brief: Classify one Slack message into a single bridge command (local model via Shuttle).
 # description: |
 #   Spawns a restricted omp session on a Shuttle-served local model whose only
-#   tools are the six bridge commands (run, orchestrate, sessions, resume,
-#   status, help). The model calls exactly one of them; that call IS the
-#   routing decision. The worker's fixed role comes from prompts/entry.md and
+#   tools are the five bridge commands (run, sessions, resume, status, help).
+#   The model calls exactly one of them; that call IS the routing decision. An
+#   orchestration request is a `run` with `agent: orchestrate`, not a command of
+#   its own. The worker's fixed role comes from prompts/entry.md and
 #   the tools from tools/commands.ts; the Slack message arrives on STDIN and is
 #   passed as the user turn, never as an argv word — it is untrusted text.
 #
@@ -25,7 +26,7 @@
 #   routing, i.e. the post-tool reply entry.md asks for). Both are read out of
 #   the same event stream, cost no extra model call, and are never allowed to
 #   cost a decision — see the harvest at the bottom.
-# arguments: "--model <spec> [--omp-bin <path>] [--repos \"a=p,b=q\"] [--default-repo <alias>] [--models \"role=spec,role=spec\"] [--attachments \"a.png (image/png)\"] [--session-dir <dir>] [--timeout <sec>]  # message on stdin"
+# arguments: "--model <spec> [--omp-bin <path>] [--repos \"a=p,b=q\"] [--default-repo <alias>] [--agents \"name: description\\nname: description\"] [--attachments \"a.png (image/png)\"] [--session-dir <dir>] [--timeout <sec>]  # message on stdin"
 # ---
 #
 # Usage:
@@ -39,9 +40,11 @@
 #   --repos <list>        Comma-separated alias=path pairs offered to the model
 #                         as the legal values for `dir`. May be empty.
 #   --default-repo <a>    Alias the bridge falls back to when `dir` is omitted.
-#   --models <list>       Comma-separated role=spec pairs (omp's own `modelRoles`)
-#                         offered as the legal values for `model`. May be empty,
-#                         in which case the model argument is never mentioned.
+#   --agents <text>       The agents installable on this box, ONE argv value
+#                         holding newline-separated `name: description` lines,
+#                         offered as the legal values for `agent` on run. May be
+#                         empty or absent, in which case agents are never
+#                         mentioned and the router never picks one.
 #   --attachments <list>  One-line inventory of the message's attachments (names
 #                         and types only — the model never sees bytes or paths).
 #                         Without it an uncaptioned screenshot reads as ambiguity.
@@ -66,7 +69,7 @@ OMP_BIN_ARG=""
 MODEL=""
 REPOS=""
 DEFAULT_REPO=""
-MODELS=""
+AGENTS=""
 ATTACHMENTS=""
 TIMEOUT=60
 SESSION_DIR=""
@@ -81,7 +84,7 @@ while [[ $# -gt 0 ]]; do
     --model)        MODEL="$2"; shift 2 ;;
     --repos)        REPOS="$2"; shift 2 ;;
     --default-repo) DEFAULT_REPO="$2"; shift 2 ;;
-    --models)       MODELS="$2"; shift 2 ;;
+    --agents)       AGENTS="$2"; shift 2 ;;
     --attachments)  ATTACHMENTS="$2"; shift 2 ;;
     --timeout)      TIMEOUT="$2"; shift 2 ;;
     --session-dir)  SESSION_DIR="$2"; shift 2 ;;
@@ -155,8 +158,8 @@ fi
 if [[ -n "$DEFAULT_REPO" ]]; then
   USER_TURN="$USER_TURN"$'\n'"Default repo alias: $DEFAULT_REPO"
 fi
-if [[ -n "$MODELS" ]]; then
-  USER_TURN="$USER_TURN"$'\n'"Model roles: ${MODELS//,/, }"
+if [[ -n "$AGENTS" ]]; then
+  USER_TURN="$USER_TURN"$'\n'"Agents (pass one as \`agent\` on run, or omit it for the default worker):"$'\n'"$AGENTS"
 fi
 if [[ -n "$ATTACHMENTS" ]]; then
   USER_TURN="$USER_TURN"$'\n'"Attachments on this message: $ATTACHMENTS"
@@ -164,11 +167,11 @@ fi
 USER_TURN="$USER_TURN"$'\n\n'"$MESSAGE"
 
 # omp validates `--tools` against BUILTIN names only (extension tools are not
-# registered at parse time), so naming the six commands there is an error —
+# registered at parse time), so naming the five commands there is an error —
 # `--no-tools` is the omp spelling of the same intent: zero builtins, while
 # extension-registered tools are always included (sdk.ts: "Custom tools and
 # extension-registered tools are always included regardless of toolNames
-# filter"). The routing surface is therefore exactly the six commands, and the
+# filter"). The routing surface is therefore exactly the five commands, and the
 # prompt carries only their schemas.
 
 # Extension/plugin discovery stays ON: cc-callbacks is an omp plugin and is what
@@ -181,7 +184,7 @@ USER_TURN="$USER_TURN"$'\n\n'"$MESSAGE"
 # `--bare-system-prompt` + omp-config.yml make prompts/entry.md the ENTIRE system
 # prompt: no AGENTS.md context files, no PROJECT footer, no memory guidance, no
 # MCP instructions, and no learn/manage_skill/mcp_* tools. Verified via
-# `get_state`: one segment, byte-identical to entry.md, and exactly the six
+# `get_state`: one segment, byte-identical to entry.md, and exactly the five
 # command tools (58k chars and 11 tools before).
 #
 # The session is persisted (no --no-session) into --session-dir, which the bridge

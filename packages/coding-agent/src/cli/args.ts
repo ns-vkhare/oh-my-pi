@@ -39,6 +39,8 @@ export interface Args {
 	apiKey?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
+	/** `--agent <name>`: run the top-level session as a discovered task agent (model, thinking, tools, spawns, skills, prompt body). */
+	agent?: string;
 	thinking?: ConfiguredThinkingLevel;
 	hideThinking?: boolean;
 	advisor?: boolean;

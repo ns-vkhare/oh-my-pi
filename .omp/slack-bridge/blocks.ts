@@ -87,8 +87,8 @@ function section(text: string): SlackBlock {
  * to three short lines by `parseDecision`, escaped here, and italicised per line
  * so a multi-line account still reads as one aside rather than as agent output.
  */
-export function routedBlocks(args: { command: string; model?: string; trace?: RouterTrace }): { text: string; blocks?: SlackBlock[] } {
-	const text = `_routed → \`${escapeMrkdwn(args.command)}\`${args.model ? ` on \`${escapeMrkdwn(args.model)}\`` : ""}_`;
+export function routedBlocks(args: { command: string; agent?: string; trace?: RouterTrace }): { text: string; blocks?: SlackBlock[] } {
+	const text = `_routed → \`${escapeMrkdwn(args.command)}\`${args.agent ? ` as \`${escapeMrkdwn(args.agent)}\`` : ""}_`;
 	const details: string[] = [];
 	if (args.trace?.turns !== undefined) {
 		details.push(`🧭 ${args.trace.turns} ${args.trace.turns === 1 ? "turn" : "turns"}`);

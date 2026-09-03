@@ -10,10 +10,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, type Mock, spyOn, test } from "bun:test";
-import { Bridge, loadConfig, ompSessionDir, type ListModelRoles, type ListSessions, type StoreSession } from "./bridge";
+import { Bridge, loadConfig, ompSessionDir, type ListAgents, type ListSessions, type StoreSession } from "./bridge";
 import { TaskRegistry } from "./registry";
-import { ORCHESTRATE_FALLBACK_MODEL } from "./agent-model";
 import type {
+	AgentOption,
 	BridgeConfig,
 	ImageContent,
 	OmpAgentEvent,
@@ -332,7 +332,6 @@ function makeConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
 		routerModel: "",
 		routerTimeoutMs: 60_000,
 		routerScript: "/nonexistent/route.sh",
-		orchestrateModel: "",
 		stateDir: `${HOME}/.omp/slack-bridge`,
 		...overrides,
 	};
@@ -345,9 +344,9 @@ interface Harness {
 	rpcs: FakeRpc[];
 	/**
 	 * Resolves with the next RPC the bridge spawns. `settle()` only drains
-	 * microtasks, so a spawn gated on real filesystem I/O — the `orchestrate`
-	 * model lookup reads agent definitions from disk — needs the actual signal
-	 * rather than a wall-clock wait.
+	 * microtasks, so a spawn gated on real filesystem I/O — the agent inventory
+	 * scan reads agent definitions from disk — needs the actual signal rather
+	 * than a wall-clock wait.
 	 */
 	nextRpc: () => Promise<FakeRpc>;
 }
@@ -359,21 +358,21 @@ afterEach(async () => {
 });
 
 /**
- * Stand-in for `omp config get modelRoles`. Injected by default so no test ever
- * shells out to the developer's real omp config.
+ * Stand-in for the agent definitions under `.omp/agents` / `~/.omp/agent/agents`.
+ * Injected by default so no test ever reads the developer's real inventory.
  */
-const MODEL_ROLES: Record<string, string> = {
-	default: "amazon-bedrock/claude-opus-5",
-	plan: "openai-codex/gpt-5.6-sol:xhigh",
-	smol: "anthropic/claude-haiku-4-5",
-};
+const AGENTS: AgentOption[] = [
+	{ name: "orchestrate", description: "decompose the work and fan it out to parallel subagents" },
+	{ name: "planner", description: "plan and scope a change before any code is written" },
+	{ name: "scout", description: "read-only research in this codebase" },
+];
 
 async function makeHarness(
 	config: BridgeConfig,
 	seed: TaskRecord[] = [],
 	listSessions?: ListSessions,
 	route?: RouteMessage,
-	listModelRoles: ListModelRoles = async () => MODEL_ROLES,
+	listAgents: ListAgents = async () => AGENTS,
 ): Promise<Harness> {
 	const slack = new FakeSlack();
 	const dir = `/tmp/bridge-test-${Math.random().toString(36).slice(2)}`;
@@ -387,7 +386,7 @@ async function makeHarness(
 		waiters.splice(0).forEach((resolve) => resolve(rpc));
 		return rpc;
 	};
-	const bridge = new Bridge({ config, slack, registry, createRpc, listSessions, route, listModelRoles });
+	const bridge = new Bridge({ config, slack, registry, createRpc, listSessions, route, listAgents });
 	bridge.start();
 	// start() kicks a catch-up sweep; drain it so a test's own sweep is not
 	// swallowed by the overlap guard.
@@ -1331,7 +1330,7 @@ describe("front-door router", () => {
 		expect(h.rpcs).toHaveLength(0);
 	});
 
-	test("a `run` decision spawns one rpc in the alias cwd, with omp's default model", async () => {
+	test("a `run` decision with no agent spawns one rpc in the alias cwd, on the default worker", async () => {
 		const route = fakeRoute({ command: "run", dir: "omp", prompt: "fix the thing" });
 		const h = await makeHarness(makeConfig(), [], undefined, route);
 		await h.slack.inject(dm("could you please fix the thing over in omp"));
@@ -1340,8 +1339,8 @@ describe("front-door router", () => {
 		expect(h.slack.posted[0]!.args.text).toBe("_routed → `run`_");
 		expect(h.rpcs).toHaveLength(1);
 		expect(h.rpcs[0]!.opts.cwd).toBe(REPO);
-		// `run` pins no model; the trailing reply guidance is asserted in its own test.
-		expect(h.rpcs[0]!.opts.extraArgs?.[0]).not.toBe("--model");
+		// No agent named ⇒ no `--agent`; the trailing reply guidance has its own test.
+		expect(h.rpcs[0]!.opts.extraArgs).not.toContain("--agent");
 		expect(h.rpcs[0]!.prompts).toEqual(["fix the thing"]);
 	});
 
@@ -1352,7 +1351,7 @@ describe("front-door router", () => {
 			command: "run",
 			dir: "omp",
 			prompt: "fix the thing",
-			trace: { turns: 2, summary: "read it as a fix request\ncalled run in omp\nomitted model" },
+			trace: { turns: 2, summary: "read it as a fix request\ncalled run in omp\nno agent, so the default worker" },
 		});
 		const h = await makeHarness(makeConfig(), [], undefined, route);
 		await h.slack.inject(dm("could you please fix the thing over in omp"));
@@ -1361,108 +1360,99 @@ describe("front-door router", () => {
 		expect(breadcrumb.text).toBe("_routed → `run`_");
 		expect(breadcrumb.blocks?.at(-1)).toEqual({
 			type: "context",
-			elements: [{ type: "mrkdwn", text: "🧭 2 turns\n_read it as a fix request_\n_called run in omp_\n_omitted model_" }],
+			elements: [{ type: "mrkdwn", text: "🧭 2 turns\n_read it as a fix request_\n_called run in omp_\n_no agent, so the default worker_" }],
 		});
 		// Cosmetic only: the command still dispatches exactly as it did before.
 		expect(h.rpcs[0]!.prompts).toEqual(["fix the thing"]);
 	});
 
-	test("`orchestrate` pins the orchestrator model and prefixes the prompt", async () => {
-		// orchestrateModel is set explicitly so the assertion never depends on the
-		// developer's ~/.omp/agent/agents/orchestrate.md.
-		const h = await makeHarness(makeConfig({ orchestrateModel: "anthropic/claude-fable-5" }));
+	// The literal Slack word still works: `parseDecision` rejects an "orchestrate"
+	// command, so this path exists only in the bridge's own parser.
+	test("literal `orchestrate` runs the orchestrate agent and prefixes the prompt", async () => {
+		const h = await makeHarness(makeConfig());
 		await h.slack.inject(dm("orchestrate omp fix the thing"));
+		const rpc = await h.nextRpc();
 
 		expect(h.rpcs).toHaveLength(1);
-		expect(h.rpcs[0]!.opts.cwd).toBe(REPO);
-		expect(h.rpcs[0]!.opts.extraArgs?.slice(0, 2)).toEqual(["--model", "anthropic/claude-fable-5"]);
-		expect(h.rpcs[0]!.prompts[0]!.startsWith("orchestrate: fix the thing")).toBe(true);
+		expect(rpc.opts.cwd).toBe(REPO);
+		expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--agent", "orchestrate"]);
+		// The `orchestrator-identity` skill keys on the word, so the prompt carries it.
+		expect(rpc.prompts[0]!.startsWith("orchestrate: fix the thing")).toBe(true);
 	});
 
 	test("`orchestrate` with no prompt posts its own usage line", async () => {
-		const h = await makeHarness(makeConfig({ orchestrateModel: "anthropic/claude-fable-5" }));
+		const h = await makeHarness(makeConfig());
 		await h.slack.inject(dm("orchestrate"));
 
 		expect(h.rpcs).toHaveLength(0);
 		expect(h.slack.posted.at(-1)!.args.text).toBe("Usage: `orchestrate <alias|path> <prompt…>`");
 	});
 
-	// The production path: ORCHESTRATE_MODEL unset, so the model comes from the
-	// `orchestrate` agent definition on disk. #home() is derived from stateDir,
-	// so a temp stateDir gives the lookup a temp home to read.
-	test("`orchestrate` with no ORCHESTRATE_MODEL reads the model from the agent definition", async () => {
-		const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bridge-agentdef-"));
-		try {
-			await Bun.write(
-				path.join(tmpHome, ".omp/agent/agents/orchestrate.md"),
-				"---\nname: orchestrate\nmodel: anthropic/claude-fable-5\nthinkingLevel: high\n---\n\nbody\n",
-			);
-			const h = await makeHarness(makeConfig({ orchestrateModel: "", stateDir: path.join(tmpHome, ".omp/slack-bridge") }));
-			await h.slack.inject(dm("orchestrate omp fix the thing"));
-			const rpc = await h.nextRpc();
+	// Routed orchestration is an ordinary `run` with `agent: orchestrate`, and must
+	// come out identical to the literal command — same flag, same prompt prefix.
+	test("a routed `orchestrate` agent prefixes the prompt just like the literal command", async () => {
+		const route = fakeRoute({ command: "run", dir: "omp", prompt: "split this up", agent: "orchestrate" });
+		const h = await makeHarness(makeConfig(), [], undefined, route);
+		await h.slack.inject(dm("fan this out across a few agents"));
+		const rpc = await h.nextRpc();
 
-			expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--model", "anthropic/claude-fable-5"]);
-		} finally {
-			await fs.rm(tmpHome, { recursive: true, force: true });
-		}
+		expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--agent", "orchestrate"]);
+		expect(rpc.prompts[0]!.startsWith("orchestrate: split this up")).toBe(true);
 	});
 
-	// No agent file anywhere → the last-resort constant, never omp's default model.
-	test("`orchestrate` falls back to the pinned constant when no agent definition exists", async () => {
-		const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bridge-nodef-"));
-		try {
-			const h = await makeHarness(makeConfig({ orchestrateModel: "", stateDir: path.join(tmpHome, ".omp/slack-bridge") }));
-			await h.slack.inject(dm("orchestrate omp fix the thing"));
-			const rpc = await h.nextRpc();
+	// The identity comes from the `orchestrator-identity` skill, not the agent file:
+	// with no `orchestrate` definition the default worker still gets the prompt that
+	// triggers it, rather than an `--agent` omp would refuse to start.
+	test("`orchestrate` without a definition still prefixes the prompt, on the default worker", async () => {
+		const h = await makeHarness(makeConfig(), [], undefined, undefined, async () => []);
+		await h.slack.inject(dm("orchestrate omp fix the thing"));
+		const rpc = await h.nextRpc();
 
-			expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--model", ORCHESTRATE_FALLBACK_MODEL]);
-		} finally {
-			await fs.rm(tmpHome, { recursive: true, force: true });
-		}
+		expect(rpc.opts.extraArgs).not.toContain("--agent");
+		expect(rpc.prompts[0]!.startsWith("orchestrate: fix the thing")).toBe(true);
 	});
 
-	// The model the router may pick from is omp's own `modelRoles`, so a routed
-	// task can only ever land on a model the user already configured.
-	test("a routed role becomes `--model <spec>` and shows in the breadcrumb", async () => {
-		const route = fakeRoute({ command: "run", dir: "omp", prompt: "fix the thing", model: "plan" });
+	// The agents the router may pick from are the definitions on disk, so a routed
+	// task can only ever land on an agent that exists.
+	test("a routed agent becomes `--agent <name>` and shows in the breadcrumb", async () => {
+		const route = fakeRoute({ command: "run", dir: "omp", prompt: "plan the fix", agent: "planner" });
 		const h = await makeHarness(makeConfig(), [], undefined, route);
 		await h.slack.inject(dm("plan out the fix for the thing in omp"));
 		const rpc = await h.nextRpc();
 
-		expect(route.calls[0]!.ctx.models).toEqual(MODEL_ROLES);
-		expect(h.slack.posted[0]!.args.text).toBe("_routed → `run` on `plan`_");
-		expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--model", MODEL_ROLES.plan!]);
+		expect(route.calls[0]!.ctx.agents).toEqual(AGENTS);
+		expect(h.slack.posted[0]!.args.text).toBe("_routed → `run` as `planner`_");
+		expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--agent", "planner"]);
+		// The agent file pins the model now; the bridge never passes one.
+		expect(rpc.opts.extraArgs).not.toContain("--model");
 	});
 
-	test("an exact configured spec is accepted, an invented one is dropped", async () => {
-		const exact = fakeRoute({ command: "run", dir: "omp", prompt: "fix it", model: MODEL_ROLES.smol! });
-		const hExact = await makeHarness(makeConfig(), [], undefined, exact);
-		await hExact.slack.inject(dm("fix it on the cheap model"));
-		expect((await hExact.nextRpc()).opts.extraArgs?.slice(0, 2)).toEqual(["--model", MODEL_ROLES.smol!]);
+	test("a differently-cased agent name resolves to the canonical one", async () => {
+		const route = fakeRoute({ command: "run", dir: "omp", prompt: "look around", agent: "SCOUT" });
+		const h = await makeHarness(makeConfig(), [], undefined, route);
+		await h.slack.inject(dm("where does the bridge parse commands?"));
 
-		const invented = fakeRoute({ command: "run", dir: "omp", prompt: "fix it", model: "gpt-9-ultra" });
-		const hInvented = await makeHarness(makeConfig(), [], undefined, invented);
-		await hInvented.slack.inject(dm("fix it with gpt-9-ultra"));
-		// Unknown model → no pin at all, so the child runs on omp's own default.
-		expect((await hInvented.nextRpc()).opts.extraArgs).not.toContain("--model");
+		expect((await h.nextRpc()).opts.extraArgs?.slice(0, 2)).toEqual(["--agent", "scout"]);
 	});
 
-	test("a routed model outranks the orchestrator's pin", async () => {
-		const route = fakeRoute({ command: "orchestrate", dir: "omp", prompt: "split this up", model: "smol" });
-		const h = await makeHarness(makeConfig({ orchestrateModel: "anthropic/claude-fable-5" }), [], undefined, route);
-		await h.slack.inject(dm("fan this out but keep it cheap"));
+	// An invented name would make `omp --agent` exit 2 and the task never start, so
+	// it is dropped: the work still happens, on the default worker.
+	test("an agent that does not exist is dropped and the task still starts", async () => {
+		const route = fakeRoute({ command: "run", dir: "omp", prompt: "fix it", agent: "wizard" });
+		const h = await makeHarness(makeConfig(), [], undefined, route);
+		await h.slack.inject(dm("fix it with the wizard"));
 		const rpc = await h.nextRpc();
 
-		expect(rpc.opts.extraArgs?.slice(0, 2)).toEqual(["--model", MODEL_ROLES.smol!]);
-		expect(rpc.prompts[0]!.startsWith("orchestrate: split this up")).toBe(true);
+		expect(rpc.opts.extraArgs).not.toContain("--agent");
+		expect(rpc.prompts).toEqual(["fix it"]);
 	});
 
-	test("roles are read once and cached across messages", async () => {
+	test("the agent inventory is read once and cached across messages", async () => {
 		let reads = 0;
 		const route = fakeRoute({ command: "status" });
 		const h = await makeHarness(makeConfig(), [], undefined, route, async () => {
 			reads++;
-			return MODEL_ROLES;
+			return AGENTS;
 		});
 		await h.slack.inject(dm("is the bridge up?"));
 		await h.slack.inject(dm("still up?"));
@@ -1640,13 +1630,13 @@ describe("replying with files", () => {
 		};
 	}
 
-	test("every bridge child is told how to answer into Slack, alongside its model pin", async () => {
-		const h = await makeHarness(makeConfig({ orchestrateModel: "anthropic/claude-fable-5" }));
+	test("every bridge child is told how to answer into Slack, alongside its agent flag", async () => {
+		const h = await makeHarness(makeConfig());
 		await h.slack.inject(dm("orchestrate omp fix the thing"));
 		const rpc = await h.nextRpc();
 
 		const args = rpc.opts.extraArgs ?? [];
-		expect(args.slice(0, 2)).toEqual(["--model", "anthropic/claude-fable-5"]);
+		expect(args.slice(0, 2)).toEqual(["--agent", "orchestrate"]);
 		const flag = args.indexOf("--append-system-prompt");
 		expect(flag).toBeGreaterThan(-1);
 		const guidance = args[flag + 1] ?? "";

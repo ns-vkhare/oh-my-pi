@@ -101,16 +101,17 @@ export function parseDecision(line: string): RouterDecision | undefined {
 function parseCommand(parsed: Record<string, unknown>): RouterDecision | undefined {
 	const { command } = parsed;
 	switch (command) {
-		case "run":
-		case "orchestrate": {
+		case "run": {
 			const prompt = nonEmpty(parsed.prompt);
 			if (prompt === undefined) return undefined;
 			const dir = nonEmpty(parsed.dir);
-			const model = nonEmpty(parsed.model);
-			const args: { dir?: string; prompt: string; model?: string } = { prompt };
-			if (dir !== undefined) args.dir = dir;
-			if (model !== undefined) args.model = model;
-			return command === "run" ? { command: "run", ...args } : { command: "orchestrate", ...args };
+			// The agent the router picked. Re-validated against the live inventory by
+			// the bridge (`#resolveAgent`); an unlisted one costs the agent, not the run.
+			const agent = nonEmpty(parsed.agent);
+			const decision: { command: "run"; dir?: string; prompt: string; agent?: string } = { command: "run", prompt };
+			if (dir !== undefined) decision.dir = dir;
+			if (agent !== undefined) decision.agent = agent;
+			return decision;
 		}
 		case "sessions": {
 			const alias = nonEmpty(parsed.alias);
@@ -129,6 +130,24 @@ function parseCommand(parsed: Record<string, unknown>): RouterDecision | undefin
 	}
 }
 
+/** Longest agent line offered to the router; entry.md carries the real routing rules. */
+const AGENT_DESCRIPTION_MAX = 200;
+
+/**
+ * First sentence of an agent's frontmatter description, whitespace-collapsed
+ * and capped at {@link AGENT_DESCRIPTION_MAX}. A sentence ends at `. ` or `.`
+ * followed by end of text; parenthesised asides and em-dash clauses inside it
+ * survive, so "Runs X (judges configured in ~/foo.json) over a diff." stays whole.
+ */
+export function summarizeAgentDescription(description: string): string {
+	const flat = description.replace(/\s+/g, " ").trim();
+	const end = flat.search(/\.(?:\s|$)/);
+	const sentence = end === -1 ? flat : flat.slice(0, end + 1);
+	if (sentence.length <= AGENT_DESCRIPTION_MAX) return sentence;
+	const cut = sentence.lastIndexOf(" ", AGENT_DESCRIPTION_MAX - 1);
+	return `${sentence.slice(0, cut > 0 ? cut : AGENT_DESCRIPTION_MAX)}…`;
+}
+
 export function createRouter(config: BridgeConfig): RouteMessage {
 	return async (text: string, ctx: RouterContext): Promise<RouterDecision | undefined> => {
 		// Read per call: an empty model means "router off" — no child at all.
@@ -139,10 +158,16 @@ export function createRouter(config: BridgeConfig): RouteMessage {
 			const args = [config.routerScript, "--model", model, "--repos", formatPairs(ctx.repos)];
 			const defaultRepo = nonEmpty(ctx.defaultRepo);
 			if (defaultRepo !== undefined) args.push("--default-repo", defaultRepo);
-			// The models the user already configured (omp's `modelRoles`): offered as
-			// role=spec so the model can answer with a role name it can reason about.
-			const models = ctx.models === undefined ? "" : formatPairs(ctx.models);
-			if (models.length > 0) args.push("--models", models);
+			// The agents installed on this box, one `name: description` per line.
+			// Descriptions are the agents' own frontmatter prose, written for the
+			// task tool's frontier models: 300+ chars each. The router is a 26B local
+			// model with entry.md's own per-shape rules, so it gets the first
+			// sentence only, whitespace-collapsed and capped — enough to recognise
+			// the agent, not enough to bury the message under the inventory.
+			const agents = (ctx.agents ?? [])
+				.map(agent => `${agent.name}: ${summarizeAgentDescription(agent.description)}`)
+				.join("\n");
+			if (agents.length > 0) args.push("--agents", agents);
 			// Names and types only, and already collapsed to one line by the caller:
 			// argv is safe here (no shell between us and the script) and it keeps the
 			// inventory out of the message the model must restate verbatim.

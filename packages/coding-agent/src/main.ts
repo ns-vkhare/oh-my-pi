@@ -24,12 +24,14 @@ import {
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { reset as resetCapabilities } from "./capability";
+import { applyAgentToArgs, applyAgentToSessionOptions, autoloadAgentSkills, resolveCliAgent } from "./cli/agent-flag";
 import { type Args, reportUnrecognizedFlags } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
 import { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
+import { CliUsageError } from "./cli/usage-error";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
@@ -83,6 +85,7 @@ import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
+import type { AgentDefinition } from "./task/types";
 import { createTelemetryExportConfig, initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking";
 import type { LspStartupServerInfo } from "./tools";
@@ -1500,6 +1503,24 @@ export async function runRootCommand(
 		clearPluginRootsCache: clearPluginRootsAndCaches,
 	});
 
+	// --agent <name>: fold the agent's model/thinking/tools into the parsed flags
+	// (explicit flags win), then apply body/spawns/read-summarize to the options.
+	// Resolved against the final cwd so a resumed session sees its own project
+	// agents. Unknown name → usage error, exit 2, before any session is created.
+	let cliAgent: AgentDefinition | undefined;
+	if (parsedArgs.agent) {
+		try {
+			cliAgent = await resolveCliAgent(parsedArgs.agent, cwd);
+		} catch (error) {
+			if (error instanceof CliUsageError) {
+				process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
+				process.exit(2);
+			}
+			throw error;
+		}
+		applyAgentToArgs(parsedArgs, cliAgent);
+	}
+
 	const sessionOptions = await logger.time(
 		"buildSessionOptions",
 		buildSessionOptions,
@@ -1509,6 +1530,9 @@ export async function runRootCommand(
 		modelRegistry,
 		settingsInstance,
 	);
+	if (cliAgent) {
+		applyAgentToSessionOptions(sessionOptions, cliAgent, settingsInstance);
+	}
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
@@ -1649,6 +1673,20 @@ export async function runRootCommand(
 		);
 		if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
 			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
+		}
+
+		// Agent skills ride hidden custom messages (same mechanic as the task
+		// executor). Fresh sessions only: a resumed transcript already carries them.
+		if (cliAgent && !(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork)) {
+			const missing = await autoloadAgentSkills(session, cliAgent);
+			for (const name of missing) {
+				const message = `Agent "${cliAgent.name}" autoloads skill "${name}", which was not found.`;
+				if (isInteractive) {
+					notifs.push({ kind: "warn", message });
+				} else {
+					process.stderr.write(`${chalk.yellow(`${message}\n`)}`);
+				}
+			}
 		}
 
 		if (modelFallbackMessage) {

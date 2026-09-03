@@ -476,18 +476,31 @@ export type ControlResponse =
 // ============================================================================
 
 /**
+ * One agent the router may pick for a `run`.
+ *
+ * `name` is what `omp --agent <name>` takes; `description` is the agent's own
+ * frontmatter description, offered WHOLE (they run long) because it is what the
+ * router matches a task shape against. Built by `agent-defs.ts` from the repo's
+ * `.omp/agents` and the home agent dir.
+ */
+export interface AgentOption {
+	name: string;
+	description: string;
+}
+
+/**
  * One command the router resolved a free-form Slack message into.
  *
  * Mirrors the top-level command surface one-for-one: the router picks the
  * command and its arguments, the bridge executes it. `dir` is a REPOS alias or
  * an absolute path under $HOME — the bridge re-validates it via `#resolveDir`
- * and never trusts the model's choice. `model` is a **role name or exact spec
- * from the offered map** and is re-validated the same way (`#resolveModel`):
- * anything else is dropped, leaving omp's own default.
+ * and never trusts the model's choice. `agent` is a **name from the offered
+ * inventory** and is re-validated the same way (`#resolveAgent`): anything else
+ * is dropped, leaving the default worker. There is no `orchestrate` command —
+ * an orchestration request is a `run` with `agent: "orchestrate"`.
  */
 export type RouterDecision = (
-	| { command: "run"; dir?: string; prompt: string; model?: string }
-	| { command: "orchestrate"; dir?: string; prompt: string; model?: string }
+	| { command: "run"; dir?: string; prompt: string; agent?: string }
 	| { command: "sessions"; alias?: string }
 	| { command: "resume"; target: string }
 	| { command: "status" }
@@ -518,11 +531,12 @@ export interface RouterContext {
 	repos: Record<string, string>;
 	defaultRepo?: string;
 	/**
-	 * role → model spec, from omp's own `modelRoles` setting (`omp config get
-	 * modelRoles`). The only models the router may pick from, so a task lands on
-	 * a model the user already configured rather than an invented id.
+	 * The agents the router may pick from, from `agent-defs.ts`. Offered as
+	 * `name: description` lines so a task lands on an agent that actually exists
+	 * on this box rather than an invented one. Absent or empty → the router is
+	 * never told about agents and never passes one.
 	 */
-	models?: Record<string, string>;
+	agents?: AgentOption[];
 	/**
 	 * Where the routing run persists its own transcript: the **omp** session dir
 	 * for the repo, so a gemma routing run lands beside the agent sessions it
@@ -589,12 +603,6 @@ export interface BridgeConfig {
 	routerTimeoutMs: number;
 	/** Absolute path to `router/route.sh`. */
 	routerScript: string;
-	/**
-	 * Model the `orchestrate` command spawns omp with. Empty means "resolve
-	 * from the `orchestrate` agent definition at spawn time" (see
-	 * `resolveAgentModel`), which is the normal path.
-	 */
-	orchestrateModel: string;
 	/** State/registry directory (default ~/.omp/slack-bridge). */
 	stateDir: string;
 }

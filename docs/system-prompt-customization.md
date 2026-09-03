@@ -22,6 +22,7 @@ Four user-controllable inputs feed prompt assembly. All four resolve a value as 
 | `SYSTEM.md` | `<cwd>/.omp/SYSTEM.md`, then `~/.omp/agent/SYSTEM.md` (and equivalent paths under `.claude`, `.codex`, `.gemini`) | Same effect as `--system-prompt`; used when the flag is absent. |
 | `--append-system-prompt <text-or-file>` | CLI flag | Adds a prompt block. Without a custom system prompt it goes after all default blocks; with one it goes after the custom block and before the preserved project/environment footer. |
 | `APPEND_SYSTEM.md` | Same discovery as `SYSTEM.md` | Same effect as `--append-system-prompt`; used when the flag is absent. |
+| `--agent <name>` | CLI flag | Appends the named task agent's prompt body (from `<cwd>/.omp/agents`, `~/.omp/agent/agents`, or the bundled set) as a block ahead of `--append-system-prompt`, and applies the agent's model, thinking level, tools, spawn policy, and autoloaded skills. Explicit `--model`/`--thinking`/`--tools` win. |
 
 Discovery for `SYSTEM.md` / `APPEND_SYSTEM.md` uses `findConfigFile` (`packages/coding-agent/src/config.ts`): the first existing file across the ordered bases (`.omp`, `.claude`, `.codex`, `.gemini` — project-level at `<cwd>` first, then user-level at `~`) wins. **No ancestor walk-up.** Running `omp` from `<repo>/subdir` does not pick up `<repo>/.omp/SYSTEM.md`; the file must live directly under the cwd's config base or in the user-level location. See [`docs/config-usage.md`](./config-usage.md) for the full discovery contract.
 

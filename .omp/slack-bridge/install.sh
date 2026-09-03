@@ -20,9 +20,9 @@ DEST="${DEST:-$HOME/.omp/slack-bridge}"
 
 FILES=(
 	types.ts omp-rpc.ts slack.ts blocks.ts registry.ts bridge.ts smoke.ts
-	router.ts agent-model.ts
+	router.ts agent-defs.ts
 	omp-rpc.test.ts slack.test.ts bridge.test.ts blocks.test.ts
-	router.test.ts agent-model.test.ts
+	router.test.ts agent-defs.test.ts
 	slack-notify.extension.ts slack-notify.test.ts
 	control.ts control.test.ts
 	manifest.json .env.example README.md DESIGN.md TEAM-SETUP.md

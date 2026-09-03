@@ -28,10 +28,10 @@ All paths relative to `.omp/slack-bridge/`.
 | `registry.ts` | Thread↔session registry, persisted to `state.json`. |
 | `control.ts` | Unix-socket control plane (`bridge.sock`) + single-instance lock. |
 | `router.ts` | `createRouter` — spawns `route.sh`, enforces the timeout, parses one JSON line, fails open. |
-| `agent-model.ts` | `resolveAgentModel` — pinned `model:` from an agent definition. |
+| `agent-defs.ts` | `listAgentDefinitions` — `name:` + `description:` of every agent definition (`<repo>/.omp/agents/*.md`, then `~/.omp/agent/agents/*.md`; project shadows home), the inventory the router picks from. |
 | `router/route.sh` | omp harness invocation: message on stdin → one decision line on stdout. |
 | `router/prompts/entry.md` | System prompt for the routing model. |
-| `router/tools/commands.ts` | omp extension registering the six commands as tools (plain JSON-Schema params, zero deps). |
+| `router/tools/commands.ts` | omp extension registering the five commands as tools (plain JSON-Schema params, zero deps). |
 | `prompts/slack-reply.md`, `prompts/slack-repos.md` | Text appended to every spawned agent's system prompt: how to answer into Slack, and the `REPOS` inventory. |
 | `install.sh`, `manifest.json`, `.env.example` | Deploy script, Slack app manifest, config template. |
 
@@ -87,13 +87,14 @@ driven through the `omp` CLI by `router/route.sh`. Enabled by `ROUTER_MODEL` in
   local model can never swallow a message.
 - The model's `dir` is re-validated through the alias/`$HOME` check — a
   hallucinated path is rejected or falls back to `DEFAULT_REPO`.
-- **It may also pick the model**, only from omp's own `modelRoles` (`omp config
-  get modelRoles`, cached 5 min in `#modelRoles`), offered as `--models
-  "role=spec,…"`. `#resolveModel` re-validates the answer — role name
-  (case-insensitive) or an exact configured spec — before it becomes `omp
-  --model`; anything else is dropped to omp's default, and a routed model
-  outranks the `orchestrate` pin. Adding a role to omp's config is all it takes
-  to make it pickable from Slack.
+- **It also picks the agent**, only from the definitions on disk (`agent-defs.ts`,
+  cached 5 min per cwd in `#agents`), offered as `--agents "name: description\n…"`.
+  `#resolveAgent` re-validates the answer — a listed name, case-insensitively —
+  before it becomes `omp --agent <name>`; anything else is dropped to omp's default
+  worker, because an invented name makes omp exit 2 and the task never start. The
+  bridge passes no `--model`: the agent file pins the model, thinking level and
+  tools. Dropping a new `<name>.md` with `name:` + `description:` into either scan
+  root is all it takes to make it pickable from Slack.
 - **The worker is `omp`, and every routing run is an audited session.** Not pi:
   the `shuttle` provider is registered in `~/.omp/agent/models.yml`, plugin
   discovery stays on so cc-callbacks loads, and the transcript is persisted into
@@ -102,7 +103,7 @@ driven through the `omp` CLI by `router/route.sh`. Enabled by `ROUTER_MODEL` in
   repo, so the audit's `project_root` is the repo and `omp sessions --dir <repo>`
   never lists routing transcripts. `OMP_SLACK_BRIDGE=1` keeps `slack-notify`
   quiet. The surface is pinned with **`--no-tools`**, not `--tools <names>`: omp
-  validates `--tools` against builtin names at parse time (naming the six
+  validates `--tools` against builtin names at parse time (naming the five
   commands is a hard error) and extension tools are active regardless of that
   filter. cc-callbacks records the run flat, never nested under the task it
   starts — nesting needs `parentSession` **and** `agentId` in the header, and the
@@ -114,7 +115,7 @@ driven through the `omp` CLI by `router/route.sh`. Enabled by `ROUTER_MODEL` in
   disables the `codex` provider so its MCP servers (`node_repl`) neither appear as
   tools nor inject instructions. Check it with an RPC probe — `get_state` →
   `systemPrompt` must be a single segment equal to entry.md, `dumpTools` exactly
-  the six commands. Unchecked it was 58k chars and 11 tools.
+  the five commands. Unchecked it was 58k chars and 11 tools.
 - **Attachments are described, never shown** — `--attachments "shot.png
   (image/png)"`, names and types only. Shuttle models have no vision. Without it
   "what's wrong here?" plus a screenshot routes to `help`; with it, to `run`.
@@ -123,7 +124,7 @@ Exercise it without Slack (prints exactly one JSON line, exit 0):
 
 ```sh
 echo "start a task in omp to fix the flaky test" \
-  | ~/.omp/slack-bridge/router/route.sh --model shuttle/gemma-4-26b --repos "omp=$HOME/oh-my-pi-src" --models "plan=openai-codex/gpt-5.6-sol:xhigh"
+  | ~/.omp/slack-bridge/router/route.sh --model shuttle/gemma-4-26b --repos "omp=$HOME/oh-my-pi-src" --agents "planner: plan and scope a change before any code is written"
 ```
 
 No decision printed, in order:
@@ -200,13 +201,14 @@ it, so free-form phrasing falls through to help.
   delivered and never retried. The catch-up sweep re-reads DM history and
   covers **top-level DMs only** — a steer typed into a task thread during an
   outage is gone; retype it.
-- **omp has no `--agent` flag.** Agent selection is `--model <spec>` plus the
-  identity skill. `orchestrate` therefore prefixes the prompt with
-  `orchestrate: ` (triggering `orchestrator-identity`) and passes the model
-  resolved from `<repo>/.omp/agents/orchestrate.md`, then
-  `~/.omp/agent/agents/orchestrate.md` — note the `agent` segment;
-  `~/.omp/agents` is not an omp scan root. `ORCHESTRATE_MODEL` overrides it;
-  `anthropic/claude-fable-5` is the last-resort fallback.
+- **`omp --agent <name>` is the whole agent selection.** omp resolves the name
+  against `<repo>/.omp/agents/`, then `~/.omp/agent/agents/` — note the `agent`
+  segment; `~/.omp/agents` is not an omp scan root — and applies that file's model,
+  thinking level, tools and system-prompt body. Unknown name → omp exits 2, so the
+  bridge only ever passes a name it read off disk itself. `orchestrate` additionally
+  prefixes the prompt with `orchestrate: `, because the identity comes from the
+  `orchestrator-identity` skill, not the agent file: with no `orchestrate.md` the
+  prefix still goes out and the default worker reads the skill.
 - **Steers bypass the router entirely** — never debug a mis-routed thread reply
   as a router problem; check whether the thread has a bound session instead.
 - **The task header is edited, not posted complete.** `#startTask` posts it
@@ -215,12 +217,13 @@ it, so free-form phrasing falls through to help.
   `<timestamp>_<id>.jsonl` (`sessionIdOf`) — the id `omp --resume <id>` accepts —
   never `get_state.sessionId`, which is the *provider* session id and can
   diverge. A header stuck without an id means `get_state` never answered.
-- **The model is chosen at spawn, never mid-session.** Literal `run` takes omp's
-  default and literal `orchestrate` the resolved pin; only a *routed* message can
-  pick another, from `modelRoles`. RPC does expose `set_model` / `cycle_model` /
-  `get_available_models` (`docs/rpc.md`), but `omp-rpc.ts` implements none of
-  them — switching a live session's model would need those methods plus an
-  in-thread command. Today the answer to "run this on X" is a new task.
+- **The agent is chosen at spawn, never mid-session.** Literal `run` takes omp's
+  default worker and literal `orchestrate` the `orchestrate` agent; only a *routed*
+  message can pick another, from the inventory on disk. RPC does expose `set_model`
+  / `cycle_model` / `get_available_models` (`docs/rpc.md`), but `omp-rpc.ts`
+  implements none of them — switching a live session's model would need those
+  methods plus an in-thread command. Today the answer to "run this as X" is a new
+  task.
 - **Project memory is omp's, not the bridge's.** Every spawn gets
   `~/.omp/agent/memories/<encoded cwd>/memory_summary.md` + `learned.md` injected
   by omp's own system-prompt build, keyed on the task's cwd — so each `REPOS`

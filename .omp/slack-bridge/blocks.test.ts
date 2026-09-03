@@ -72,22 +72,27 @@ describe("routedBlocks", () => {
 	// has always been, so a silent worker costs nothing.
 	test("a traceless decision renders as the bare breadcrumb line", () => {
 		expect(routedBlocks({ command: "run" })).toEqual({ text: "_routed → `run`_" });
-		expect(routedBlocks({ command: "run", model: "plan" })).toEqual({ text: "_routed → `run` on `plan`_" });
+	});
+
+	// The agent is the whole point of the breadcrumb now: it is the only place the
+	// user learns which agent took their message.
+	test("the routed agent shows in the breadcrumb", () => {
+		expect(routedBlocks({ command: "run", agent: "planner" })).toEqual({ text: "_routed → `run` as `planner`_" });
 	});
 
 	test("a trace becomes a context sub-line: turn count, then one italic line per step", () => {
 		const { text, blocks } = routedBlocks({
 			command: "run",
-			model: "plan",
-			trace: { turns: 2, summary: "read it as a fix request\ncalled run in omp" },
+			agent: "planner",
+			trace: { turns: 2, summary: "read it as a planning request\ncalled run in omp as planner" },
 		});
 
-		expect(text).toBe("_routed → `run` on `plan`_");
+		expect(text).toBe("_routed → `run` as `planner`_");
 		expect(blocks).toEqual([
-			{ type: "section", text: { type: "mrkdwn", text: "_routed → `run` on `plan`_" } },
+			{ type: "section", text: { type: "mrkdwn", text: "_routed → `run` as `planner`_" } },
 			{
 				type: "context",
-				elements: [{ type: "mrkdwn", text: "🧭 2 turns\n_read it as a fix request_\n_called run in omp_" }],
+				elements: [{ type: "mrkdwn", text: "🧭 2 turns\n_read it as a planning request_\n_called run in omp as planner_" }],
 			},
 		]);
 	});

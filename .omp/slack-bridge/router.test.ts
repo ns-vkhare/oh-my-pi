@@ -11,7 +11,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createRouter, formatPairs, parseDecision } from "./router";
+import { createRouter, formatPairs, parseDecision, summarizeAgentDescription } from "./router";
 import type { BridgeConfig, RouterContext } from "./types";
 
 const MISSING_SCRIPT = "/nonexistent/omp-router/route.sh";
@@ -35,7 +35,6 @@ function makeConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
 		routerModel: MODEL,
 		routerTimeoutMs: 5000,
 		routerScript: MISSING_SCRIPT,
-		orchestrateModel: "",
 		stateDir: "/tmp/omp-router-test-state",
 		...overrides,
 	};
@@ -69,10 +68,11 @@ describe("parseDecision", () => {
 			dir: "omp",
 			prompt: "fix",
 		});
-		expect(parseDecision('{"command":"orchestrate","dir":"omp","prompt":"ship it"}')).toEqual({
-			command: "orchestrate",
+		expect(parseDecision('{"command":"run","dir":"omp","prompt":"plan the migration","agent":"planner"}')).toEqual({
+			command: "run",
 			dir: "omp",
-			prompt: "ship it",
+			prompt: "plan the migration",
+			agent: "planner",
 		});
 		expect(parseDecision('{"command":"sessions"}')).toEqual({ command: "sessions" });
 		expect(parseDecision('{"command":"sessions","alias":"omp"}')).toEqual({ command: "sessions", alias: "omp" });
@@ -85,6 +85,9 @@ describe("parseDecision", () => {
 		expect(parseDecision('{"command":"status","evil":1}')).toEqual({ command: "status" });
 		expect(parseDecision('{"command":"resume","target":"2","cwd":"/etc"}')).toEqual({ command: "resume", target: "2" });
 		expect(parseDecision('{"command":"sessions","prompt":"rm -rf /"}')).toEqual({ command: "sessions" });
+		// `model` was the old spelling of "who runs this"; a worker still emitting it
+		// must not smuggle a model spec past the bridge, which no longer passes one.
+		expect(parseDecision('{"command":"run","prompt":"fix it","model":"openai/gpt-5"}')).toEqual({ command: "run", prompt: "fix it" });
 	});
 
 	test("rejects malformed, unknown, or incomplete output", () => {
@@ -98,7 +101,9 @@ describe("parseDecision", () => {
 		expect(parseDecision('{"command":"run"}')).toBeUndefined();
 		expect(parseDecision('{"command":"run","prompt":"   "}')).toBeUndefined();
 		expect(parseDecision('{"command":"run","prompt":7}')).toBeUndefined();
-		expect(parseDecision('{"command":"orchestrate","dir":"omp"}')).toBeUndefined();
+		// `orchestrate` is no longer a command: it is a `run` with `agent: orchestrate`.
+		// Rejecting it here sends the bridge to its literal parser, which still knows the word.
+		expect(parseDecision('{"command":"orchestrate","dir":"omp","prompt":"ship it"}')).toBeUndefined();
 		expect(parseDecision('{"command":"resume"}')).toBeUndefined();
 		expect(parseDecision('{"command":"resume","target":" "}')).toBeUndefined();
 	});
@@ -120,12 +125,12 @@ describe("parseDecision", () => {
 	test("a trace is kept clamped to three trimmed lines plus a turn count", () => {
 		expect(
 			parseDecision(
-				'{"command":"run","prompt":"go","trace":{"turns":2,"summary":"  read it as a fix request  \\n\\ncalled run in omp\\nomitted model\\nfourth line dropped"}}',
+				'{"command":"run","prompt":"go","trace":{"turns":2,"summary":"  read it as a fix request  \\n\\ncalled run in omp\\nomitted agent\\nfourth line dropped"}}',
 			),
 		).toEqual({
 			command: "run",
 			prompt: "go",
-			trace: { summary: "read it as a fix request\ncalled run in omp\nomitted model", turns: 2 },
+			trace: { summary: "read it as a fix request\ncalled run in omp\nomitted agent", turns: 2 },
 		});
 		const long = parseDecision(`{"command":"help","trace":{"summary":"${"x".repeat(400)}"}}`);
 		expect(long).toEqual({ command: "help", trace: { summary: `${"x".repeat(219)}…` } });
@@ -149,6 +154,24 @@ describe("formatPairs", () => {
 
 	test("an empty map yields an empty string", () => {
 		expect(formatPairs({})).toBe("");
+	});
+});
+
+describe("summarizeAgentDescription", () => {
+	test("keeps the first sentence whole, including dots inside paths and parentheses", () => {
+		expect(
+			summarizeAgentDescription(
+				"Runs the review (judges in ~/.nomad-extensions/verify-reviewers.json) over a diff. Then adjudicates every finding.",
+			),
+		).toBe("Runs the review (judges in ~/.nomad-extensions/verify-reviewers.json) over a diff.");
+	});
+
+	test("caps a run-on first sentence at a word boundary with an ellipsis", () => {
+		const long = `${"word ".repeat(60).trim()}.`;
+		const summary = summarizeAgentDescription(long);
+		expect(summary.length).toBeLessThanOrEqual(201);
+		expect(summary.endsWith("…")).toBe(true);
+		expect(summary).not.toMatch(/wor…$/); // never cut inside a word
 	});
 });
 
@@ -261,32 +284,32 @@ describe("createRouter", () => {
 		]);
 	});
 
-	test("--models is passed only when roles are offered, and the pick survives parsing", async () => {
-		const withRoles = await makeStub(
-			'#!/bin/sh\ncat >/dev/null\nprintf \'%s\\n\' "$@" >> "__ARGV__"\necho \'{"command":"run","dir":"omp","prompt":"fix it","model":"plan"}\'\n',
+	test("--agents carries one `name: description` line per agent, and is omitted when there are none", async () => {
+		// `[%s]` brackets each argv value, so an embedded newline inside ONE value is
+		// visibly distinct from a second value — that is the whole contract here.
+		const withAgents = await makeStub(
+			'#!/bin/sh\ncat >/dev/null\nprintf \'[%s]\\n\' "$@" >> "__ARGV__"\necho \'{"command":"run","dir":"omp","prompt":"plan the migration","agent":"planner"}\'\n',
 		);
-		const routeA = createRouter(makeConfig({ routerScript: withRoles.script }));
-		expect(await routeA("plan this out", { repos: { omp: "/src/omp" }, models: { plan: "openai/gpt-5", smol: "anthropic/haiku" } })).toEqual({
-			command: "run",
-			dir: "omp",
-			prompt: "fix it",
-			model: "plan",
-		});
-		expect((await Bun.file(withRoles.argv).text()).trim().split("\n")).toEqual([
-			"--model",
-			MODEL,
-			"--repos",
-			"omp=/src/omp",
-			"--models",
-			"plan=openai/gpt-5,smol=anthropic/haiku",
-			"--timeout",
-			"5",
-		]);
+		const routeA = createRouter(makeConfig({ routerScript: withAgents.script }));
+		expect(
+			await routeA("plan this out", {
+				repos: { omp: "/src/omp" },
+				agents: [
+					// A real frontmatter description spans lines and is indented; it must
+					// still arrive as one line, or the `name: description` shape breaks.
+					{ name: "planner", description: "Plans work:\n  breaks a request\tinto   phases." },
+					{ name: "scout", description: "  Read-only codebase research.  " },
+				],
+			}),
+		).toEqual({ command: "run", dir: "omp", prompt: "plan the migration", agent: "planner" });
+		expect(await Bun.file(withAgents.argv).text()).toBe(
+			`[--model]\n[${MODEL}]\n[--repos]\n[omp=/src/omp]\n[--agents]\n[planner: Plans work: breaks a request into phases.\nscout: Read-only codebase research.]\n[--timeout]\n[5]\n`,
+		);
 
-		// No roles configured: the flag is omitted entirely rather than sent empty.
+		// No agents on this box: the flag is omitted entirely rather than sent empty.
 		const empty = await makeStub(RECORDING_STUB);
 		const routeB = createRouter(makeConfig({ routerScript: empty.script }));
-		expect(await routeB("hi", { repos: { omp: "/src/omp" }, models: {} })).toEqual({ command: "help" });
+		expect(await routeB("hi", { repos: { omp: "/src/omp" }, agents: [] })).toEqual({ command: "help" });
 		expect((await Bun.file(empty.argv).text()).trim().split("\n")).toEqual([
 			"--model",
 			MODEL,

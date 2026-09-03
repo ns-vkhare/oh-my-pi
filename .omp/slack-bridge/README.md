@@ -79,7 +79,7 @@ happens in that thread.
 | Command | What it does |
 |---|---|
 | `run <alias\|path> <prompt…>` | Start a new omp task in the repo mapped to `<alias>` (see `REPOS` in `.env`) or an absolute path under `$HOME`. The bot threads its reply under your message — everything about the task happens in that thread. With `DEFAULT_REPO` set, `run <prompt>` alone targets it. |
-| `orchestrate <alias\|path> <prompt…>` | Like `run`, but the agent takes omp's **orchestrator** identity (decompose the work, fan out subagents) and runs on the orchestrator's pinned model instead of omp's default. Same dir rules as `run`. |
+| `orchestrate <alias\|path> <prompt…>` | Like `run`, but the child runs as omp's **orchestrate** agent (decompose the work, fan out subagents) — the agent file pins its model and thinking level — and the prompt is prefixed so the `orchestrator-identity` skill triggers. Same dir rules as `run`. |
 | `sessions [alias]` | Browse **every** omp session on disk — newest 8 per configured repo (or just `<alias>`), numbered. Badges: ⚡ `live·slack` (running under the bridge), 🔗 (already has a thread). |
 | `resume <n>` | Attach session `n` from the last `sessions` listing to a new thread, with full context. |
 | `resume <sessionPath>` | Same, by explicit `.jsonl` path. Already-attached sessions link back to their existing thread instead of double-attaching. |
@@ -234,16 +234,18 @@ Talk to the bridge in plain English instead of remembering the command list:
 `run omp fix the flaky watcher test` by a **local** model — the message never
 leaves your machine.
 
-It can also pick the **model** for the task, but only from the roles you already
-configured in omp (`omp config get modelRoles`): "plan this out on the planning
-model" starts the task on your `plan` role, "keep it cheap" on `smol`/`tiny`. Say
-nothing about models and the task runs on your default. A model the router
-invents is discarded, never passed to `omp --model`.
+It also picks the **agent** for the task, from the agent definitions you already
+have on disk (`<repo>/.omp/agents/*.md`, then `~/.omp/agent/agents/*.md`): "plan
+this out" starts the task as `planner`, "review this branch" as `reviewer`, "where
+is X handled" as `scout`, "fan this out" as `orchestrate`. Say nothing that names
+one and the task runs on the default worker. The agent file pins the model, so the
+bridge never passes `--model`; an agent the router invents is discarded, never
+passed to `omp --agent`.
 
 Every routing decision is **explained**. Under the `_routed → …_` breadcrumb the
 bridge shows how many turns the worker took and its own account of the routing,
 at most three lines: what it read the message as asking, the call it made *by
-value* (`Called run in omp on the plan model.` — the repo alias and model role it
+value* (`Called run in omp as planner.` — the repo alias and agent it
 actually passed, never a paraphrase), and what it left out so you know which
 defaults you are getting. That is the post-tool reply the model already wrote
 (see the last section of `router/prompts/entry.md`), harvested from the same
@@ -258,7 +260,7 @@ gemma turn just like the agent turns it starts (`usage.model=gemma-4-26b`,
 them out of `sessions`, so they cannot crowd out resumable work.
 
 The router model is handed **only** `router/prompts/entry.md` — no repo `AGENTS.md`,
-no environment footer, no memory or MCP guidance, and no tools beyond the six
+no environment footer, no memory or MCP guidance, and no tools beyond the five
 commands (`--bare-system-prompt` plus the `router/omp-config.yml` overlay). A
 classifier that reads your coding conventions is slower and easier to distract.
 

@@ -11,7 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import SLACK_REPLY_GUIDANCE from "./prompts/slack-reply.md" with { type: "text" };
 import SLACK_REPOS_GUIDANCE from "./prompts/slack-repos.md" with { type: "text" };
-import { ORCHESTRATE_FALLBACK_MODEL, resolveAgentModel } from "./agent-model";
+import { listAgentDefinitions } from "./agent-defs";
 import {
 	answeredBlocks,
 	askAnsweredBlocks,
@@ -31,6 +31,7 @@ import { createSlackTransport, LruSet } from "./slack";
 import { TaskRegistry } from "./registry";
 import { createRouter } from "./router";
 import type {
+	AgentOption,
 	AskToolArgs,
 	BridgeConfig,
 	ImageContent,
@@ -241,7 +242,6 @@ export function loadConfig(env: Record<string, string | undefined>, home: string
 		routerModel: env.ROUTER_MODEL?.trim() ?? "",
 		routerTimeoutMs: Number.isFinite(routerTimeoutRaw) && routerTimeoutRaw > 0 ? routerTimeoutRaw : 60_000,
 		routerScript: routerScript ? expandHome(routerScript, home) : DEFAULT_ROUTER_SCRIPT,
-		orchestrateModel: env.ORCHESTRATE_MODEL?.trim() ?? "",
 		stateDir: `${home}/.omp/slack-bridge`,
 	};
 }
@@ -253,8 +253,8 @@ export function loadConfig(env: Record<string, string | undefined>, home: string
 /** Newest sessions listed per repo. */
 const SESSIONS_PER_REPO = 8;
 const SESSIONS_LIST_TIMEOUT_MS = 10_000;
-/** How long `modelRoles` is trusted before another `omp config` spawn. */
-const MODEL_ROLES_TTL_MS = 5 * MINUTE_MS;
+/** How long an agent inventory is trusted before another disk scan. */
+const AGENTS_TTL_MS = 5 * MINUTE_MS;
 
 /** One `omp sessions --json` row, narrowed to the fields the bridge renders. */
 export interface StoreSession {
@@ -298,35 +298,13 @@ export function spawnSessionLister(ompBin: string): ListSessions {
 }
 
 /**
- * Model-role lister seam — tests inject a fake, production shells out.
+ * Agent-inventory seam — tests inject a fake, production reads the agent files.
  *
- * The map is omp's own `modelRoles` setting (role → model spec), i.e. the models
- * the user already configured. It is the *only* set the router may pick from, so
- * a routed task can never land on an invented model id.
+ * The list is the agent definitions visible from the task's cwd (`name` +
+ * `description`). It is the *only* set the router may pick from, so a routed
+ * task can never land on an agent that does not exist.
  */
-export type ListModelRoles = () => Promise<Record<string, string>>;
-
-/** Production `ListModelRoles`: `omp config get modelRoles`, killed after 10s. */
-export function spawnModelRoleLister(ompBin: string): ListModelRoles {
-	return async () => {
-		const proc = Bun.spawn([ompBin, "config", "get", "modelRoles"], { stdout: "pipe", stderr: "ignore" });
-		const timer = setTimeout(() => proc.kill(), SESSIONS_LIST_TIMEOUT_MS);
-		try {
-			const stdout = await new Response(proc.stdout).text();
-			const code = await proc.exited;
-			if (code !== 0) throw new Error(`omp config get modelRoles exited ${code}`);
-			const parsed: unknown = JSON.parse(stdout);
-			if (!isRecord(parsed)) throw new Error("omp config get modelRoles did not return an object");
-			const roles: Record<string, string> = {};
-			for (const [role, spec] of Object.entries(parsed)) {
-				if (typeof spec === "string" && spec.trim().length > 0) roles[role] = spec.trim();
-			}
-			return roles;
-		} finally {
-			clearTimeout(timer);
-		}
-	};
-}
+export type ListAgents = (cwd: string) => Promise<AgentOption[]>;
 
 // ============================================================================
 // Bridge
@@ -339,8 +317,8 @@ export interface BridgeDeps {
 	createRpc: (opts: OmpRpcOptions) => OmpRpc;
 	/** Session-store lister; defaults to shelling out to `omp sessions --json`. */
 	listSessions?: ListSessions;
-	/** Model-role lister; defaults to shelling out to `omp config get modelRoles`. */
-	listModelRoles?: ListModelRoles;
+	/** Agent-inventory lister; defaults to scanning omp's agent-definition roots. */
+	listAgents?: ListAgents;
 	/** Front-door intent router; defaults to the local-model router (fails open). */
 	route?: RouteMessage;
 }
@@ -349,6 +327,7 @@ const HELP_TEXT = [
 	"*omp slack bridge*",
 	"• `run <alias|path> <prompt…>` — start a new task",
 	"• `orchestrate <alias|path> <prompt…>` — new task on the orchestrator agent (parallel subagents)",
+	"• say it in plain words — the router picks the agent (planner, scout, reviewer, librarian, implementer, sonic, orchestrate)",
 	"• `sessions [alias]` — browse omp sessions (⚡ live·slack, 🔗 attached)",
 	"• `resume <n|sessionPath>` — attach a listed or on-disk session",
 	"• `status` — bridge status",
@@ -465,7 +444,7 @@ export class Bridge {
 	readonly #createRpc: (opts: OmpRpcOptions) => OmpRpc;
 	readonly #listSessions: ListSessions;
 	readonly #route: RouteMessage;
-	readonly #listModelRoles: ListModelRoles;
+	readonly #listAgents: ListAgents;
 	readonly #live = new Map<string, LiveTask>();
 	readonly #startedAt = Date.now();
 	#reaperTimer: ReturnType<typeof setInterval> | undefined;
@@ -480,8 +459,8 @@ export class Bridge {
 	#dmChannel: string | undefined;
 	/** channel → (index → session) from that channel's last `sessions` listing, consumed by `resume <n>`. */
 	#lastListing = new Map<string, Map<number, { path: string; cwd: string }>>();
-	/** `modelRoles` from omp's config, re-read at most every MODEL_ROLES_TTL_MS. */
-	#modelRolesCache: { roles: Record<string, string>; at: number } | undefined;
+	/** cwd → agent inventory, re-scanned at most every AGENTS_TTL_MS. */
+	readonly #agentsCache = new Map<string, { agents: AgentOption[]; at: number }>();
 
 	constructor(deps: BridgeDeps) {
 		this.#config = deps.config;
@@ -489,7 +468,7 @@ export class Bridge {
 		this.#registry = deps.registry;
 		this.#createRpc = deps.createRpc;
 		this.#listSessions = deps.listSessions ?? spawnSessionLister(deps.config.ompBin);
-		this.#listModelRoles = deps.listModelRoles ?? spawnModelRoleLister(deps.config.ompBin);
+		this.#listAgents = deps.listAgents ?? ((cwd) => listAgentDefinitions(cwd, this.#home()));
 		this.#route = deps.route ?? createRouter(deps.config);
 	}
 
@@ -845,11 +824,12 @@ export class Bridge {
 		// Free-form: let the router say what was meant. It fails open — disabled,
 		// unreachable, slow or unparseable all resolve undefined, and a dead local
 		// model must never swallow a Slack message.
+		const location = this.#routerLocation();
 		const decision = await this.#route(text, {
 			repos: this.#config.repos,
 			defaultRepo: this.#config.defaultRepo,
-			models: await this.#modelRoles(),
-			...this.#routerLocation(),
+			agents: await this.#agents(location.cwd),
+			...location,
 			attachments,
 		});
 		if (decision) {
@@ -866,28 +846,25 @@ export class Bridge {
 	 * Execute one router decision by handing it to the very command method the
 	 * literal parser would have called. Nothing here trusts the model: `#cmdRun`
 	 * re-resolves `dir` and falls back to DEFAULT_REPO when it names neither an
-	 * alias nor a path, and `#resolveModel` drops a `model` that is not one of
-	 * omp's configured roles, so a hallucinated field degrades instead of escaping.
+	 * alias nor a path, and `#resolveAgent` drops an `agent` that is not one of
+	 * the definitions on disk, so a hallucinated field degrades instead of escaping.
 	 */
 	async #dispatchDecision(msg: SlackInboundMessage, decision: RouterDecision): Promise<void> {
 		// Breadcrumb first: the routing decision is visible before its effects, with
 		// the worker's own account of it as a sub-line — the only explanation the
 		// user ever gets for why their message went where it did.
-		const picked = "model" in decision ? decision.model : undefined;
+		const picked = "agent" in decision ? decision.agent : undefined;
 		await this.#slack
 			.postMessage({
 				channel: msg.channel,
 				threadTs: this.#replyThread(msg),
-				...routedBlocks({ command: decision.command, model: picked, trace: decision.trace }),
+				...routedBlocks({ command: decision.command, agent: picked, trace: decision.trace }),
 			})
 			.catch(() => {});
 
 		switch (decision.command) {
 			case "run":
-				await this.#cmdRun(msg, [decision.dir, decision.prompt].filter(Boolean).join(" "), decision.model);
-				return;
-			case "orchestrate":
-				await this.#cmdOrchestrate(msg, [decision.dir, decision.prompt].filter(Boolean).join(" "), decision.model);
+				await this.#startTask(msg, [decision.dir, decision.prompt].filter(Boolean).join(" "), { agent: decision.agent });
 				return;
 			case "sessions":
 				await this.#cmdSessions(msg, decision.alias);
@@ -904,37 +881,35 @@ export class Bridge {
 		}
 	}
 
-	/** omp's configured role → spec map, cached: one `omp config` spawn per TTL. */
-	async #modelRoles(): Promise<Record<string, string>> {
-		const cached = this.#modelRolesCache;
-		if (cached && Date.now() - cached.at < MODEL_ROLES_TTL_MS) return cached.roles;
+	/** Agent definitions visible from `cwd`, cached: one disk scan per cwd per TTL. */
+	async #agents(cwd: string): Promise<AgentOption[]> {
+		const cached = this.#agentsCache.get(cwd);
+		if (cached && Date.now() - cached.at < AGENTS_TTL_MS) return cached.agents;
 		try {
-			const roles = await this.#listModelRoles();
-			this.#modelRolesCache = { roles, at: Date.now() };
-			return roles;
+			const agents = await this.#listAgents(cwd);
+			this.#agentsCache.set(cwd, { agents, at: Date.now() });
+			return agents;
 		} catch (err) {
-			// Cache the failure too: a broken `omp config` must not cost a spawn per
-			// DM. An empty map simply drops `model` from what the router is offered.
-			console.error(`bridge: model roles unavailable: ${String(err)}`);
-			this.#modelRolesCache = { roles: {}, at: Date.now() };
-			return {};
+			// Cache the failure too: an unreadable agent root must not cost a scan per
+			// DM. An empty list simply drops `agent` from what the router is offered.
+			console.error(`bridge: agent definitions unavailable: ${String(err)}`);
+			this.#agentsCache.set(cwd, { agents: [], at: Date.now() });
+			return [];
 		}
 	}
 
 	/**
-	 * A router-chosen model token → a spec the user actually configured, else
-	 * undefined (omp's own default). Accepts a `modelRoles` role name
-	 * (case-insensitive) or a spec already in that map; an invented id is dropped
-	 * rather than handed to `omp --model`.
+	 * A router-chosen agent token → the canonical name of an agent that exists,
+	 * else undefined (omp's default worker). Matching is case-insensitive against
+	 * the very list the router was offered, so an invented name is dropped rather
+	 * than handed to `omp --agent`, where it would abort the spawn.
 	 */
-	async #resolveModel(token: string | undefined): Promise<string | undefined> {
+	async #resolveAgent(token: string | undefined, cwd: string): Promise<string | undefined> {
 		const wanted = token?.trim();
 		if (!wanted) return undefined;
-		const roles = await this.#modelRoles();
-		const byRole = Object.entries(roles).find(([role]) => role.toLowerCase() === wanted.toLowerCase());
-		if (byRole) return byRole[1];
-		if (Object.values(roles).includes(wanted)) return wanted;
-		console.error(`bridge: router asked for unknown model ${wanted} — using omp's default`);
+		const match = (await this.#agents(cwd)).find((agent) => agent.name.toLowerCase() === wanted.toLowerCase());
+		if (match) return match.name;
+		console.error(`bridge: unknown agent ${wanted} — using the default worker`);
 		return undefined;
 	}
 
@@ -955,21 +930,25 @@ export class Bridge {
 		return { cwd: target, sessionDir: `${ompSessionDir(home, target)}/router` };
 	}
 
-	async #cmdRun(msg: SlackInboundMessage, rest: string, model?: string): Promise<void> {
-		await this.#startTask(msg, rest, { orchestrate: false, model });
+	async #cmdRun(msg: SlackInboundMessage, rest: string): Promise<void> {
+		await this.#startTask(msg, rest, {});
 	}
 
 	/**
-	 * `run` on the orchestrator agent. Two deltas, both applied in `#startTask`:
-	 * the prompt is prefixed so omp's `orchestrator-identity` skill triggers, and
-	 * the child is pinned to the orchestrator's model instead of omp's default.
+	 * `run` on the orchestrator agent. Both deltas are applied in `#startTask`:
+	 * the child runs as omp's `orchestrate` agent (which pins its own model and
+	 * thinking level), and the prompt is prefixed so the `orchestrator-identity`
+	 * skill triggers.
 	 */
-	async #cmdOrchestrate(msg: SlackInboundMessage, rest: string, model?: string): Promise<void> {
-		await this.#startTask(msg, rest, { orchestrate: true, model });
+	async #cmdOrchestrate(msg: SlackInboundMessage, rest: string): Promise<void> {
+		await this.#startTask(msg, rest, { agent: "orchestrate" });
 	}
 
-	async #startTask(msg: SlackInboundMessage, rest: string, opts: { orchestrate: boolean; model?: string }): Promise<void> {
-		const verb = opts.orchestrate ? "orchestrate" : "run";
+	async #startTask(msg: SlackInboundMessage, rest: string, opts: { agent?: string }): Promise<void> {
+		// Orchestration is keyed off what was *asked for*, not what resolved: a
+		// missing `orchestrate.md` must still produce an orchestration prompt.
+		const orchestrating = (opts.agent ?? "").trim().toLowerCase() === "orchestrate";
+		const verb = orchestrating ? "orchestrate" : "run";
 		const sp = rest.indexOf(" ");
 		let dirToken = (sp === -1 ? rest : rest.slice(0, sp)).trim();
 		let prompt = (sp === -1 ? "" : rest.slice(sp + 1)).trim();
@@ -1028,16 +1007,13 @@ export class Bridge {
 			lastActivityAt: Date.now(),
 		};
 		this.#registry.upsert(record);
-		// An explicitly routed model wins; otherwise `orchestrate` falls back to its
-		// own pin (config override, else the agent definition on disk, else the pin
-		// the orchestrator agent ships with) and `run` to omp's default.
-		const model =
-			(await this.#resolveModel(opts.model)) ??
-			(opts.orchestrate
-				? this.#config.orchestrateModel || (await resolveAgentModel("orchestrate", record.cwd, this.#home())) || ORCHESTRATE_FALLBACK_MODEL
-				: undefined);
-		// The skill keys on the word "orchestrate", so the prompt must carry it.
-		const message = opts.orchestrate ? `orchestrate: ${prompt}` : prompt;
+		// Only an agent the router was actually offered reaches argv; anything else
+		// degrades to omp's default worker rather than aborting the spawn.
+		const agent = await this.#resolveAgent(opts.agent, cwd);
+		// The skill keys on the word "orchestrate", so the prompt must carry it —
+		// including when no `orchestrate` definition exists and the default worker
+		// takes the task, since the skill is what supplies the identity.
+		const message = orchestrating ? `orchestrate: ${prompt}` : prompt;
 		const attached = await this.#attachmentNote(msg);
 		await this.#spawn({
 			record,
@@ -1045,7 +1021,7 @@ export class Bridge {
 			prompt: message + attached.note,
 			images: attached.images,
 			sessionName: name,
-			model,
+			agent,
 			headerTs,
 		});
 	}
@@ -1361,8 +1337,8 @@ export class Bridge {
 		images?: ImageContent[];
 		resumeSessionPath?: string;
 		sessionName?: string;
-		/** Pin the child to a model spec (`omp --model <spec>`); omp's default when absent. */
-		model?: string;
+		/** Run the child as this omp agent (`omp --agent <name>`); the default worker when absent. */
+		agent?: string;
 		/** Task header message to edit once the session identity is known. */
 		headerTs?: string;
 	}): Promise<void> {
@@ -1382,7 +1358,7 @@ export class Bridge {
 			// first user message: it applies to later steers too, and never lands in
 			// the transcript as something the user appears to have said.
 			extraArgs: [
-				...(args.model ? ["--model", args.model] : []),
+				...(args.agent ? ["--agent", args.agent] : []),
 				"--append-system-prompt",
 				guidance,
 			],
