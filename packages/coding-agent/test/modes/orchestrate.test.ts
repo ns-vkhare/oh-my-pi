@@ -1,12 +1,13 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import {
+	buildOrchestrateNotice,
 	containsOrchestrate,
 	highlightOrchestrate,
-	ORCHESTRATE_NOTICE,
 } from "@oh-my-pi/pi-coding-agent/modes/orchestrate";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { containsUltrathink, highlightUltrathink } from "@oh-my-pi/pi-coding-agent/modes/ultrathink";
 import { clearBundledCommandsCache, loadBundledCommands } from "@oh-my-pi/pi-coding-agent/task/commands";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 
 beforeAll(() => {
 	// highlightOrchestrate/highlightUltrathink read the global theme's color mode.
@@ -84,12 +85,27 @@ describe("orchestrate keyword highlighting", () => {
 });
 
 describe("orchestrate notice", () => {
-	it("is a self-contained system notice carrying the orchestration contract", () => {
-		expect(ORCHESTRATE_NOTICE.startsWith("<system-notice>")).toBe(true);
-		expect(ORCHESTRATE_NOTICE.endsWith("</system-notice>")).toBe(true);
-		expect(ORCHESTRATE_NOTICE).toContain("orchestrator");
-		// The contract must not retain the slash-command input placeholder.
-		expect(ORCHESTRATE_NOTICE).not.toContain("$@");
+	it("wraps the resolved orchestrate agent body in a system notice", () => {
+		const agent: AgentDefinition = {
+			name: "orchestrate",
+			description: "Orchestrator identity for test",
+			systemPrompt: "BODY-MARKER-7f3a\n\n<critical>keep</critical>",
+			source: "user",
+			filePath: "/tmp/agents/orchestrate.md",
+		};
+
+		const notice = buildOrchestrateNotice(agent);
+
+		expect(notice.startsWith("<system-notice>")).toBe(true);
+		expect(notice.endsWith("</system-notice>")).toBe(true);
+		expect(notice).toContain("BODY-MARKER-7f3a");
+		// The body is inserted raw: the template engine must not escape its markup.
+		expect(notice).toContain("<critical>keep</critical>");
+		// Provenance of the resolved definition is named in the notice.
+		expect(notice).toContain("user agent, /tmp/agents/orchestrate.md");
+		// No slash-command placeholder, and no unrendered template holes.
+		expect(notice).not.toContain("$@");
+		expect(notice).not.toContain("{{");
 	});
 });
 

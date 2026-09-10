@@ -7,7 +7,7 @@ Magic keywords are standalone words in a user prompt that add a hidden instructi
 | Keyword | Effect |
 |---|---|
 | `ultrathink` | Asks the agent to reason carefully through a multi-step task. When automatic thinking is active, it also selects the highest reasoning effort supported by the current model for that turn. |
-| `orchestrate` | Switches the agent to the multi-agent orchestration contract: scope the full task, delegate substantial independent work in parallel, verify each phase, and continue until the request is complete. |
+| `orchestrate` | Loads the `orchestrate` agent definition and asks the agent to assume that identity for the turn and the rest of the session. The definition is resolved like any task agent: project `.omp/agents/orchestrate.md`, then user `~/.omp/agent/agents/orchestrate.md`, then the bundled default. A session started with `omp --agent orchestrate` already carries the body, so the keyword adds nothing there. |
 | `workflowz` | Asks the agent to build and run a deterministic multi-subagent workflow with the `task` tool. It is intended for broad research, reviews, migrations, or other work that benefits from parallel coverage. The keyword only adds its instruction when `task` is available in the active tool set. |
 
 Use the keyword anywhere in the prose of the prompt:

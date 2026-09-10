@@ -144,7 +144,7 @@ import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-ur
 import type { IrcMessage } from "../irc/bus";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
-import { containsOrchestrate, ORCHESTRATE_NOTICE } from "../modes/orchestrate";
+import { buildOrchestrateNotice, containsOrchestrate, orchestrateAgentBody } from "../modes/orchestrate";
 import { theme } from "../modes/theme/theme";
 import { parseTurnBudget } from "../modes/turn-budget";
 import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
@@ -172,6 +172,7 @@ import {
 	obfuscateProviderContext,
 	type SecretObfuscator,
 } from "../secrets/obfuscator";
+import { discoverAgents, getAgent } from "../task/discovery";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -4656,7 +4657,7 @@ export class AgentSession {
 		return this.settings.get("magicKeywords.enabled") && this.settings.get(`magicKeywords.${keyword}`);
 	}
 
-	#createMagicKeywordNotices(text: string): CustomMessage[] {
+	async #createMagicKeywordNotices(text: string): Promise<CustomMessage[]> {
 		const timestamp = Date.now();
 		const turnBudget = parseTurnBudget(text);
 		this.sessionManager.beginTurnBudget(turnBudget?.total ?? null, turnBudget?.hard ?? false);
@@ -4672,14 +4673,23 @@ export class AgentSession {
 			});
 		}
 		if (this.#magicKeywordEnabled("orchestrate") && containsOrchestrate(text)) {
-			keywordNotices.push({
-				role: "custom",
-				customType: "orchestrate-notice",
-				content: ORCHESTRATE_NOTICE,
-				display: false,
-				attribution: "user",
-				timestamp,
-			});
+			// The notice carries the body of the resolved `orchestrate` agent
+			// definition (project `.omp/agents` > user `~/.omp/agent/agents` >
+			// bundled), so the keyword and the spawnable agent state one contract.
+			// A session already running that body (`omp --agent orchestrate`) has it
+			// in the system prompt, so the notice would only repeat it — skip.
+			const { agents } = await discoverAgents(this.sessionManager.getCwd());
+			const agent = getAgent(agents, "orchestrate");
+			if (agent && !this.systemPrompt.join("\n\n").includes(orchestrateAgentBody(agent))) {
+				keywordNotices.push({
+					role: "custom",
+					customType: "orchestrate-notice",
+					content: buildOrchestrateNotice(agent),
+					display: false,
+					attribution: "user",
+					timestamp,
+				});
+			}
 		}
 		if (this.#magicKeywordEnabled("workflow") && containsWorkflow(text)) {
 			const activeToolNames = this.getActiveToolNames();
@@ -4745,7 +4755,7 @@ export class AgentSession {
 		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
 		// agent-initiated turns never trigger them.
-		const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
+		const keywordNotices = options?.synthetic ? [] : await this.#createMagicKeywordNotices(expandedText);
 
 		// A user-initiated prompt (typed message or the `.`/`c` continue shortcut)
 		// re-enables advisor auto-resume that a prior user interrupt suppressed.
@@ -4852,7 +4862,7 @@ export class AgentSession {
 			if (details && typeof details === "object" && "args" in details && typeof details.args === "string") {
 				skillArgs = details.args;
 			}
-			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
+			keywordNotices = await this.#createMagicKeywordNotices(skillArgs);
 		}
 
 		if (options?.queueOnly) {

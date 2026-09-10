@@ -24,6 +24,16 @@ describe("bundled agent parsing", () => {
 		expect(task?.thinkingLevel).toBe(AUTO_THINKING);
 	});
 
+	it("bundles the orchestrate agent at the default role with unrestricted spawns", () => {
+		const orchestrate = getBundledAgent("orchestrate");
+
+		expect(orchestrate).toBeDefined();
+		expect(orchestrate?.source).toBe("bundled");
+		expect(orchestrate?.spawns).toBe("*");
+		expect(orchestrate?.model).toEqual(["@default"]);
+		expect(orchestrate?.systemPrompt).toContain("orchestrator and architect");
+	});
+
 	// Issue #4761: with `modelRoles.slow: ...:xhigh`, the role's explicit effort
 	// suffix must survive agent-pattern expansion and model resolution for the
 	// bundled agents routed at that role. The executor prefers an explicit
