@@ -19,6 +19,7 @@ Primary implementation:
 | `SYSTEM.md`                             | Discovered config file | Same template switch as the flag; used when the flag is absent.                                          |
 | `--append-system-prompt <text-or-file>` | CLI                    | Adds text to the rendered prompt. Highest append precedence.                                             |
 | `APPEND_SYSTEM.md`                      | Discovered config file | Same effect as the append flag; used when the flag is absent.                                            |
+| `--agent <name>`                        | CLI                    | Appends the named task agent's prompt body (from `<cwd>/.omp/agents`, `~/.omp/agent/agents`, or the bundled set) as a block ahead of `--append-system-prompt`, and applies the agent's model, thinking level, tools, spawn policy, and autoloaded skills. Explicit `--model`/`--thinking`/`--tools` win. |
 
 `SYSTEM.md` and `APPEND_SYSTEM.md` are searched project-first, then user-level. At each scope the config bases are ordered `.omp`, `.claude`, `.codex`, `.gemini`:
 

@@ -1,12 +1,13 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import {
+	buildOrchestrateNotice,
 	containsOrchestrate,
 	highlightOrchestrate,
-	renderOrchestrateNotice,
 } from "@oh-my-pi/pi-coding-agent/modes/orchestrate";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { containsUltrathink, highlightUltrathink } from "@oh-my-pi/pi-coding-agent/modes/ultrathink";
 import { clearBundledCommandsCache, loadBundledCommands } from "@oh-my-pi/pi-coding-agent/task/commands";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 
 beforeAll(() => {
 	// highlightOrchestrate/highlightUltrathink read the global theme's color mode.
@@ -84,38 +85,27 @@ describe("orchestrate keyword highlighting", () => {
 });
 
 describe("orchestrate notice", () => {
-	it("is a self-contained system notice carrying the orchestration contract", () => {
-		const notice = renderOrchestrateNotice({
-			tools: ["read", "task", "edit", "write", "lsp", "bash", "todo"],
-		});
+	it("wraps the resolved orchestrate agent body in a system notice", () => {
+		const agent: AgentDefinition = {
+			name: "orchestrate",
+			description: "Orchestrator identity for test",
+			systemPrompt: "BODY-MARKER-7f3a\n\n<critical>keep</critical>",
+			source: "user",
+			filePath: "/tmp/agents/orchestrate.md",
+		};
+
+		const notice = buildOrchestrateNotice(agent);
+
 		expect(notice.startsWith("<system-notice>")).toBe(true);
 		expect(notice.endsWith("</system-notice>")).toBe(true);
-		expect(notice).toContain("orchestrator");
-		// The contract must not retain the slash-command input placeholder.
+		expect(notice).toContain("BODY-MARKER-7f3a");
+		// The body is inserted raw: the template engine must not escape its markup.
+		expect(notice).toContain("<critical>keep</critical>");
+		// Provenance of the resolved definition is named in the notice.
+		expect(notice).toContain("user agent, /tmp/agents/orchestrate.md");
+		// No slash-command placeholder, and no unrendered template holes.
 		expect(notice).not.toContain("$@");
-	});
-
-	it("omits tool-budget mentions for tools absent from the session", () => {
-		const notice = renderOrchestrateNotice({ tools: ["read"] });
-		expect(notice).not.toContain("`task` for dispatch");
-		expect(notice).not.toContain("`edit`");
-		expect(notice).not.toContain("`write`");
-		expect(notice).not.toContain("`lsp diagnostics`");
-		expect(notice).not.toContain("via `bash`");
-		expect(notice).not.toContain("`todo` for tracking");
-	});
-
-	it("does not name edit when only write is available", () => {
-		const writeOnly = renderOrchestrateNotice({ tools: ["read", "write"] });
-		expect(writeOnly).toContain("with `write`");
-		expect(writeOnly).not.toContain("`edit`/`write`");
-		expect(writeOnly).not.toContain("with `edit`");
-	});
-
-	it("does not name write when only edit is available", () => {
-		const editOnly = renderOrchestrateNotice({ tools: ["read", "edit"] });
-		expect(editOnly).toContain("with `edit`");
-		expect(editOnly).not.toContain("`edit`/`write`");
+		expect(notice).not.toContain("{{");
 	});
 });
 

@@ -158,7 +158,7 @@ import type { IrcMessage } from "../irc/bus";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
-import { containsOrchestrate, renderOrchestrateNotice } from "../modes/orchestrate";
+import { buildOrchestrateNotice, containsOrchestrate, orchestrateAgentBody } from "../modes/orchestrate";
 import { theme } from "../modes/theme/theme";
 import { parseTurnBudget } from "../modes/turn-budget";
 import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
@@ -190,6 +190,7 @@ import {
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { releaseSharpshooterSession } from "../sharpshooter/backend";
 import { flushSharpshooterExtraction } from "../sharpshooter/extract";
+import { discoverAgents, getAgent } from "../task/discovery";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -6040,7 +6041,7 @@ export class AgentSession {
 		return this.settings.get("magicKeywords.enabled") && this.settings.get(`magicKeywords.${keyword}`);
 	}
 
-	#createMagicKeywordNotices(text: string): CustomMessage[] {
+	async #createMagicKeywordNotices(text: string): Promise<CustomMessage[]> {
 		const timestamp = Date.now();
 		const turnBudget = parseTurnBudget(text);
 		this.sessionManager.beginTurnBudget(turnBudget?.total ?? null, turnBudget?.hard ?? false);
@@ -6056,14 +6057,21 @@ export class AgentSession {
 			});
 		}
 		if (this.#magicKeywordEnabled("orchestrate") && containsOrchestrate(text)) {
-			const enabledToolNames = this.getEnabledToolNames();
 			// The contract is entirely about `task` subagent dispatch; without the
-			// task tool the notice would demand an unavailable capability.
-			if (enabledToolNames.includes("task")) {
+			// task tool the notice would demand an unavailable capability. The notice
+			// carries the body of the resolved `orchestrate` agent definition (project
+			// `.omp/agents` > user `~/.omp/agent/agents` > bundled), so the keyword and
+			// the spawnable agent state one contract. A session already running that
+			// body (`omp --agent orchestrate`) has it in the system prompt, so the
+			// notice would only repeat it — skip.
+			const agent = this.getEnabledToolNames().includes("task")
+				? getAgent((await discoverAgents(this.sessionManager.getCwd())).agents, "orchestrate")
+				: undefined;
+			if (agent && !this.systemPrompt.join("\n\n").includes(orchestrateAgentBody(agent))) {
 				keywordNotices.push({
 					role: "custom",
 					customType: "orchestrate-notice",
-					content: renderOrchestrateNotice({ tools: enabledToolNames }),
+					content: buildOrchestrateNotice(agent),
 					display: false,
 					attribution: "user",
 					timestamp,
@@ -6151,7 +6159,7 @@ export class AgentSession {
 		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
 		// agent-initiated turns never trigger them.
-		const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
+		const keywordNotices = options?.synthetic ? [] : await this.#createMagicKeywordNotices(expandedText);
 
 		// A user-initiated prompt (typed message or the `.`/`c` continue shortcut)
 		// re-enables advisor auto-resume that a prior user interrupt suppressed.
@@ -6324,7 +6332,7 @@ export class AgentSession {
 				if ("name" in details && typeof details.name === "string") skillName = details.name;
 				if ("args" in details && typeof details.args === "string") skillArgs = details.args;
 			}
-			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
+			keywordNotices = await this.#createMagicKeywordNotices(skillArgs);
 			this.maybeStartTitleGeneration(
 				skillPromptTitleInput({
 					name: skillName,

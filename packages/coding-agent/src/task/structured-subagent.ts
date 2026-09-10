@@ -435,6 +435,7 @@ function buildExecutorOptions(
 					outputSchemaMode: policy.schema.mode,
 				}),
 		sessionFile: lease.sessionFile,
+		parentSessionFile: lease.sessionFile ?? undefined,
 		persistArtifacts: !lease.temporary,
 		artifactsDir: lease.artifactsDir,
 		enableLsp: policy.enableLsp,

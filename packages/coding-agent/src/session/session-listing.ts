@@ -668,7 +668,7 @@ function sessionIdFromSessionPath(file: string): string | undefined {
  */
 export async function getRecentSessions(
 	sessionDir: string,
-	limit = 4,
+	limit = 8,
 	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<RecentSessionInfo[]> {
 	let files: string[];

@@ -284,6 +284,105 @@ describe("SelectList", () => {
 		expect(list.render(40).join("\n")).not.toContain("█");
 	});
 
+	it("keeps the active filter and the selected value across setItems", () => {
+		const items = [
+			{ value: "ollama", label: "Ollama" },
+			{ value: "kagi", label: "Kagi" },
+			{ value: "opencode-go", label: "OpenCode Go" },
+			{ value: "tavily", label: "Tavily" },
+		];
+		const list = new SelectList(items, 3, testTheme);
+		list.handleInput("o");
+		list.handleInput("g");
+
+		list.setItems(items.map(item => ({ ...item, description: "refreshed" })));
+
+		const rendered = list.render(80).join("\n");
+		expect(rendered).toContain("Search: og");
+		expect(rendered).toContain("OpenCode Go");
+		expect(rendered).toContain("refreshed");
+		expect(rendered).not.toContain("Ollama");
+		expect(list.getSelectedItem()?.value).toBe("opencode-go");
+	});
+
+	it("clamps the selection into range when setItems drops the selected value", () => {
+		const items = [
+			{ value: "alpha", label: "Alpha" },
+			{ value: "beta", label: "Beta" },
+			{ value: "gamma", label: "Gamma" },
+			{ value: "delta", label: "Delta" },
+		];
+		const list = new SelectList(items, 3, testTheme);
+		list.setSelectedIndex(3);
+		expect(list.getSelectedItem()?.value).toBe("delta");
+
+		list.setItems(items.slice(0, 2));
+
+		expect(list.getSelectedItem()?.value).toBe("beta");
+		expect(list.render(80).join("\n")).not.toContain("Delta");
+	});
+
+	it("falls back to the no-match state when setItems removes every filter hit", () => {
+		const items = [
+			{ value: "ollama", label: "Ollama" },
+			{ value: "kagi", label: "Kagi" },
+			{ value: "opencode-go", label: "OpenCode Go" },
+			{ value: "tavily", label: "Tavily" },
+		];
+		const list = new SelectList(items, 3, testTheme);
+		list.handleInput("o");
+		list.handleInput("g");
+
+		list.setItems([
+			{ value: "kagi", label: "Kagi" },
+			{ value: "tavily", label: "Tavily" },
+		]);
+
+		const rendered = list.render(80).join("\n");
+		expect(rendered).toContain("No matching items");
+		expect(rendered).not.toContain("OpenCode Go");
+		expect(list.getSelectedItem()).toBeNull();
+	});
+
+	it("keeps an active filter editable after setItems shrinks the list below maxVisible", () => {
+		const items = [
+			{ value: "ollama", label: "Ollama" },
+			{ value: "kagi", label: "Kagi" },
+			{ value: "opencode-go", label: "OpenCode Go" },
+			{ value: "tavily", label: "Tavily" },
+		];
+		const list = new SelectList(items, 3, testTheme);
+		list.handleInput("o");
+		list.handleInput("g");
+
+		list.setItems([
+			{ value: "opencode-go", label: "OpenCode Go" },
+			{ value: "ollama", label: "Ollama" },
+		]);
+
+		const shrunk = list.render(80).join("\n");
+		expect(shrunk).toContain("Search: og");
+		expect(shrunk).not.toContain("Ollama");
+
+		list.handleInput("\x7f");
+
+		const widened = list.render(80).join("\n");
+		expect(widened).toContain("Search: o");
+		expect(widened).not.toContain("Search: og");
+		expect(widened).toContain("OpenCode Go");
+		expect(widened).toContain("Ollama");
+
+		list.handleInput("\x7f");
+
+		const cleared = list.render(80).join("\n");
+		expect(cleared).not.toContain("Search:");
+		expect(cleared).toContain("Ollama");
+
+		list.handleInput("k");
+
+		expect(list.render(80).join("\n")).not.toContain("Search:");
+	});
+
 	describe("wrapDescription", () => {
 		const longDescription =
 			"Plan and execute non-trivial architectural improvements to the codebase. Use this skill when you need to refactor existing systems, restructure modules, or change interfaces across multiple files.";
@@ -381,7 +480,7 @@ describe("SelectList", () => {
 			});
 
 			const rendered = list.render(80);
-			// Status status line is gated on overflow (#shouldRenderSearchStatus),
+			// Status status line is gated on overflow (#searchActive),
 			// so the picker proper occupies up to `maxVisible` rows.
 			expect(rendered.length).toBeLessThanOrEqual(maxVisible);
 			// Scrollbar must appear since visual rows exceed the budget.

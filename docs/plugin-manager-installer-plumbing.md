@@ -276,6 +276,7 @@ Operationally, `doctor --fix` can repair some drift (`bun install`, orphaned con
 - `--json`: output formatting only, no behavior change.
 - Project overrides always take precedence over global lockfile for feature/settings view.
 - Effective enablement is `runtimeEnabled && !projectDisabled`.
+- Enabled-plugin discovery reads three sources, highest first: the user plugins root, the project plugins root, then packages `pi` installed under `~/.pi/agent` (`extensions/<name>` and `settings.json#packages`). A pi package surfaces only when neither omp root provides that name, and the same `runtimeEnabled && !projectDisabled` rule applies to it; `omp plugin` commands never write into `~/.pi`, so the fallback is read-only and invisible to `omp plugin list`.
 
 ## Implementation files
 

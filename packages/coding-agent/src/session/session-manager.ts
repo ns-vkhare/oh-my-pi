@@ -1124,6 +1124,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.#cwd,
 			parentSession: options?.parentSession,
+			agentId: options?.agentId,
 			providerPromptCacheKey: options?.providerPromptCacheKey,
 		};
 		const workspace = normalizeSessionWorkspace({
@@ -1403,12 +1404,25 @@ export class SessionManager {
 			await this.#rewriteAtomically();
 		}
 	}
-	/** Switch to a different session file (resume / branch). */
-	async setSessionFile(sessionFile: string): Promise<void> {
-		await this.#setSessionFile(sessionFile);
+	/**
+	 * Switch to a different session file (resume / branch). `parentSession` /
+	 * `agentId` are recorded on the synthesized header only when the file is
+	 * empty/new (a spawned sub-agent's own transcript), so a spawned child can
+	 * advertise its parent + spawn identity through the standard session surface
+	 * (`getHeader().parentSession` → `SessionInfo.parentSessionPath`;
+	 * `getHeader().agentId` marks it a spawned sub-agent vs a fork); resuming a
+	 * non-empty file keeps its recorded header untouched.
+	 */
+	async setSessionFile(sessionFile: string, parentSession?: string, agentId?: string): Promise<void> {
+		await this.#setSessionFile(sessionFile, undefined, parentSession, agentId);
 	}
 
-	async #setSessionFile(sessionFile: string, loadedSession?: SessionLoadResult): Promise<void> {
+	async #setSessionFile(
+		sessionFile: string,
+		loadedSession?: SessionLoadResult,
+		parentSession?: string,
+		agentId?: string,
+	): Promise<void> {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
@@ -1428,7 +1442,10 @@ export class SessionManager {
 		if (fileEntries.length === 0) {
 			// Explicit but empty/missing path (e.g. --session flag): start fresh but
 			// keep the requested path and materialize the header immediately.
-			this.#resetToNewSession(undefined, resolvedSessionFile);
+			this.#resetToNewSession(
+				parentSession || agentId ? { parentSession, agentId } : undefined,
+				resolvedSessionFile,
+			);
 			this.#forceFileCreation = true;
 			await this.#rewriteAtomically();
 			this.#fileIsCurrent = true;
@@ -2926,7 +2943,7 @@ export class SessionManager {
 		filePath: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { initialCwd?: string; suppressBreadcrumb?: boolean },
+		options?: { initialCwd?: string; suppressBreadcrumb?: boolean; parentSession?: string; agentId?: string },
 	): Promise<SessionManager> {
 		const loaded = await loadSessionFile(filePath, storage);
 		const header = loaded.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -2946,7 +2963,7 @@ export class SessionManager {
 				: path.dirname(path.resolve(filePath)));
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
-		await manager.#setSessionFile(filePath, loaded);
+		await manager.#setSessionFile(filePath, loaded, options?.parentSession, options?.agentId);
 		return manager;
 	}
 

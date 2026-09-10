@@ -112,6 +112,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.grievancesHelp,
 	},
 	{
+		name: "hub",
+		load: () => import("./commands/hub").then(m => m.default),
+		help: commandHelp.hubHelp,
+	},
+	{
 		name: "images",
 		load: () => import("./commands/images").then(m => m.default),
 		aliases: ["img"],
@@ -151,6 +156,11 @@ export const commands: CommandEntry[] = [
 		name: "say",
 		load: () => import("./commands/say").then(m => m.default),
 		help: commandHelp.sayHelp,
+	},
+	{
+		name: "sessions",
+		load: () => import("./commands/sessions").then(m => m.default),
+		help: commandHelp.sessionsHelp,
 	},
 	{
 		name: "share",

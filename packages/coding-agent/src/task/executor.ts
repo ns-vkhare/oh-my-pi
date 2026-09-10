@@ -478,6 +478,15 @@ export interface ExecutorOptions {
 	invokedAt?: number;
 	acquiredAt?: number;
 	sessionFile?: string | null;
+	/**
+	 * Parent session's transcript path, recorded on the spawned subagent's own
+	 * session header (`parentSession`) so the child can advertise its parent
+	 * through the standard session surface (`getHeader().parentSession` →
+	 * `SessionInfo.parentSessionPath`). Enables audit/telemetry consumers to nest
+	 * a subagent under its parent instead of treating it as a top-level session.
+	 * Undefined for a non-persisted parent (the child stays flat).
+	 */
+	parentSessionFile?: string;
 	persistArtifacts?: boolean;
 	artifactsDir?: string;
 	eventBus?: EventBus;
@@ -3335,6 +3344,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? SessionManager.open(sessionFile, undefined, undefined, {
 						initialCwd: effectiveCwd,
 						suppressBreadcrumb: true,
+						parentSession: options.parentSessionFile,
+						agentId: id,
 					})
 				: Promise.resolve(SessionManager.inMemory(effectiveCwd));
 			// Setup below can fail before this promise's consumption boundary.
@@ -3564,6 +3575,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				reviveSession = async expectedAgentRef => {
 					const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 						suppressBreadcrumb: true,
+						parentSession: options.parentSessionFile,
+						agentId: id,
 					});
 					if (options.parentArtifactManager) {
 						reopened.adoptArtifactManager(options.parentArtifactManager);

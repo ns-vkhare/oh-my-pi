@@ -35,6 +35,10 @@ export const launchHelp = {
 		"api-key": Flags.string({ description: "API key (defaults to env vars)" }),
 		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 		"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
+		agent: Flags.string({
+			description:
+				"Run the session as a discovered task agent (e.g. planner, scout): applies its model, thinking level, tools, spawns, skills, and prompt body",
+		}),
 		"allow-home": Flags.boolean({ description: "Allow starting in ~ without auto-switching to a temp dir" }),
 		profile: Flags.string({ description: "Use an isolated profile for auth, sessions, settings, and caches" }),
 		alias: Flags.string({ description: "Create a shell shortcut for the selected profile and exit" }),
@@ -54,6 +58,9 @@ export const launchHelp = {
 		print: Flags.boolean({ char: "p", description: "Non-interactive mode: process prompt and exit" }),
 		continue: Flags.boolean({ char: "c", description: "Continue previous session" }),
 		resume: Flags.string({ char: "r", description: "Resume a session (by ID prefix, path, or picker if omitted)" }),
+		watch: Flags.string({
+			description: "Spectate a session another process owns (read-only tail + proxy input)",
+		}),
 		"from-claude": Flags.boolean({ description: "Import a Claude Code session into OMP" }),
 		"from-codex": Flags.boolean({ description: "Import a Codex session into OMP" }),
 		"session-dir": Flags.string({ description: "Directory for session storage and lookup" }),
@@ -91,6 +98,9 @@ export const launchHelp = {
 			description: "Disable extension discovery (explicit -e paths still work)",
 		}),
 		"no-skills": Flags.boolean({ description: "Disable skills discovery and loading" }),
+		"bare-system-prompt": Flags.boolean({
+			description: "Send only --system-prompt: no AGENTS.md context files, no project/environment footer",
+		}),
 		skills: Flags.string({ description: "Comma-separated glob patterns to filter skills (e.g., git-*,docker)" }),
 		"no-rules": Flags.boolean({ description: "Disable rules discovery and loading" }),
 		export: Flags.string({ description: "Export session file to HTML and exit" }),

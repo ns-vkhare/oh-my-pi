@@ -64,6 +64,10 @@ export const grievancesHelp = {
 	description: "View, clean, or push reported tool issues (auto-QA grievances)",
 } satisfies CommandMetadata;
 
+export const hubHelp = {
+	description: "Open the tmux-supervised session hub (background/foreground across sessions)",
+} satisfies CommandMetadata;
+
 export const imagesHelp = {
 	description: "Inspect, diagnose, probe, and purge image publication backends",
 } satisfies CommandMetadata;
@@ -94,6 +98,8 @@ export const sayHelp = {
 } satisfies CommandMetadata;
 
 export const searchHelp = { description: "Test web search providers" } satisfies CommandMetadata;
+
+export const sessionsHelp = { description: "List sessions for a project directory" } satisfies CommandMetadata;
 
 export const shareHelp = {
 	description: "Share a saved session via an encrypted link (same as /share)",

@@ -95,6 +95,7 @@ type SelectItemLayout =
 	  };
 
 export class SelectList implements Component, MouseRoutable {
+	#items: ReadonlyArray<SelectItem>;
 	#maxVisible: number;
 	#filteredItems: ReadonlyArray<SelectItem>;
 	#filterQuery = "";
@@ -108,11 +109,12 @@ export class SelectList implements Component, MouseRoutable {
 	onSelectionChange?: (item: SelectItem) => void;
 
 	constructor(
-		private readonly items: ReadonlyArray<SelectItem>,
+		items: ReadonlyArray<SelectItem>,
 		maxVisible: number,
 		private readonly theme: SelectListTheme,
 		private readonly layout: SelectListLayoutOptions = {},
 	) {
+		this.#items = items;
 		this.#maxVisible = Math.max(1, Math.trunc(maxVisible));
 		this.#filteredItems = items;
 	}
@@ -120,7 +122,7 @@ export class SelectList implements Component, MouseRoutable {
 	debugState(): Record<string, unknown> {
 		const selected = this.#filteredItems[this.#selectedIndex];
 		return {
-			itemCount: this.items.length,
+			itemCount: this.#items.length,
 			filteredItemCount: this.#filteredItems.length,
 			selectedIndex: this.#filteredItems.length > 0 ? this.#selectedIndex : -1,
 			selectedItemId: selected?.value ?? null,
@@ -139,8 +141,26 @@ export class SelectList implements Component, MouseRoutable {
 		this.#setFilter(filter, true);
 	}
 
+	setItems(items: ReadonlyArray<SelectItem>): void {
+		const previousValue = this.#filteredItems[this.#selectedIndex]?.value;
+		const previousIndex = this.#selectedIndex;
+		this.#items = items;
+		this.#hoveredIndex = null;
+		this.#setFilter(this.#filterQuery, false);
+		if (previousValue === undefined || !this.setSelectedValue(previousValue)) {
+			this.setSelectedIndex(previousIndex);
+		}
+	}
+
 	setSelectedIndex(index: number): void {
 		this.#selectedIndex = Math.max(0, Math.min(index, this.#filteredItems.length - 1));
+	}
+
+	setSelectedValue(value: string): boolean {
+		const index = this.#filteredItems.findIndex(item => item.value === value);
+		if (index < 0) return false;
+		this.#selectedIndex = index;
+		return true;
 	}
 
 	/** Resolve a 0-based rendered-line index to a filtered-item index. */
@@ -184,7 +204,7 @@ export class SelectList implements Component, MouseRoutable {
 	render(width: number): readonly string[] {
 		const lines: string[] = [];
 		this.#hitRows = [];
-		const showSearchStatus = this.#shouldRenderSearchStatus();
+		const showSearchStatus = this.#searchActive();
 
 		// If no items match filter, show message
 		if (this.#filteredItems.length === 0) {
@@ -530,18 +550,14 @@ export class SelectList implements Component, MouseRoutable {
 		return this.theme.scrollInfo(truncateToWidth(statusText, Math.max(1, width - 2), Ellipsis.Omit));
 	}
 
-	#shouldRenderSearchStatus(): boolean {
+	#searchActive(): boolean {
 		return (
-			this.layout.overflowSearch !== false && (this.items.length > this.#maxVisible || this.#filterQuery.length > 0)
+			this.layout.overflowSearch !== false && (this.#items.length > this.#maxVisible || this.#filterQuery.length > 0)
 		);
 	}
 
-	#canEditSearch(): boolean {
-		return this.layout.overflowSearch !== false && this.items.length > this.#maxVisible;
-	}
-
 	#handleSearchInput(keyData: string): boolean {
-		if (!this.#canEditSearch()) return false;
+		if (!this.#searchActive()) return false;
 
 		const kb = getKeybindings();
 		if (kb.matches(keyData, "tui.editor.deleteCharBackward")) {
@@ -567,12 +583,12 @@ export class SelectList implements Component, MouseRoutable {
 			// large-list filter stall instead of logging it as "unknown".
 			pushLoopPhase("ui.select-filter");
 			try {
-				this.#filteredItems = fuzzyFilter([...this.items], filter, item => this.#getFilterText(item));
+				this.#filteredItems = fuzzyFilter([...this.#items], filter, item => this.#getFilterText(item));
 			} finally {
 				popLoopPhase();
 			}
 		} else {
-			this.#filteredItems = this.items;
+			this.#filteredItems = this.#items;
 		}
 		this.#selectedIndex = 0;
 		if (notify) {

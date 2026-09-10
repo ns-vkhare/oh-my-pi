@@ -85,7 +85,7 @@ Provider ordering is priority-first (higher wins), then registration order for t
 Current registered skill providers:
 
 1. `native` (priority 100) — `.omp` user/project skills via `src/discovery/builtin.ts`
-2. `omp-plugins` (priority 90) — `skills/` bundled next to extension packages loaded through `extensions:`, `--extension`/`-e`, or installed plugins under `~/.omp/plugins/node_modules`
+2. `omp-plugins` (priority 90) — `skills/` bundled next to extension packages loaded through `extensions:`, `--extension`/`-e`, installed plugins under `~/.omp/plugins/node_modules`, or the `~/.pi/agent` fallback packages (names omp does not itself provide)
 3. `claude` (priority 80)
 4. priority 70 group (in registration order):
    - `claude-plugins`

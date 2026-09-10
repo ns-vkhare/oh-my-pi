@@ -162,6 +162,38 @@ function makeViewer(file: string, remote?: AgentHubRemote, ui?: TUI) {
 	});
 }
 
+const SPECTATE_HEADER = JSON.stringify({
+	type: "session",
+	version: CURRENT_SESSION_VERSION,
+	id: "adv",
+	timestamp: TS,
+	cwd: "/tmp",
+});
+
+function writeSpectateTranscript(file: string, id: string, mark: string): void {
+	fs.writeFileSync(file, `${SPECTATE_HEADER}\n${messageLine(id, mark)}\n`);
+}
+
+function makeSpectateViewer(sessionFile: () => string): AgentTranscriptViewer {
+	return new AgentTranscriptViewer({
+		agentId: "Main",
+		registry: new AgentRegistry(),
+		ui: { requestRender: () => {}, requestComponentRender: () => {} } as never,
+		cwd: "/tmp",
+		expandKeys: ["ctrl+o"],
+		hubKeys: [],
+		requestRender: () => {},
+		onClose: () => {},
+		onHubClose: () => {},
+		spectate: {
+			sessionFile,
+			header: () => ["SPECTATING"],
+			hint: "",
+			onSubmit: () => {},
+		},
+	});
+}
+
 /** Leading-space count of a stripped line (its content gutter). */
 function gutter(line: string): number {
 	const stripped = Bun.stripANSI(line);
@@ -205,6 +237,7 @@ describe("AgentTranscriptViewer", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		vi.useRealTimers();
 		if (rowsDesc) {
 			Object.defineProperty(process.stdout, "rows", rowsDesc);
@@ -662,6 +695,95 @@ describe("AgentTranscriptViewer", () => {
 			vi.useRealTimers();
 			viewer.dispose();
 			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("drops the previous agent's transcript on a failed spectate retarget and names the cause", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-retarget-"));
+		const fileA = path.join(dir, "a.jsonl");
+		const fileB = path.join(dir, "b.jsonl");
+		writeSpectateTranscript(fileA, "a", "AGENTAMARK");
+		writeSpectateTranscript(fileB, "b", "AGENTBMARK");
+		let target = fileA;
+		let readableB = false;
+		const realReadFileSync = fs.readFileSync.bind(fs);
+		let created: AgentTranscriptViewer | undefined;
+		vi.useFakeTimers();
+		try {
+			// First #refresh runs in the constructor with real fs and loads file A.
+			const viewer = makeSpectateViewer(() => target);
+			created = viewer;
+			const body = () =>
+				viewer
+					.render(80)
+					.map(l => Bun.stripANSI(l))
+					.join("\n");
+			expect(body()).toContain("AGENTAMARK");
+
+			vi.spyOn(fs, "readFileSync").mockImplementation(((p: fs.PathOrFileDescriptor, opts?: unknown) => {
+				if (!readableB && String(p) === fileB) throw new Error("EACCES: permission denied, open");
+				return realReadFileSync(p, opts as Parameters<typeof fs.readFileSync>[1]);
+			}) as typeof fs.readFileSync);
+			target = fileB;
+			vi.advanceTimersByTime(250);
+
+			// The header already names file B, so file A's messages must be gone.
+			const afterFailedRetarget = body();
+			expect(afterFailedRetarget).not.toContain("AGENTAMARK");
+			expect(afterFailedRetarget).not.toContain("AGENTBMARK");
+			expect(afterFailedRetarget).toContain("Session file is unavailable.");
+
+			readableB = true;
+			vi.advanceTimersByTime(250);
+			const afterRecovery = body();
+			expect(afterRecovery).toContain("AGENTBMARK");
+			expect(afterRecovery).not.toContain("AGENTAMARK");
+
+			const fileC = path.join(dir, "c.jsonl");
+			writeSpectateTranscript(fileC, "c", "AGENTCMARK");
+			fs.rmSync(fileC);
+			target = fileC;
+			vi.advanceTimersByTime(250);
+			const afterDeleted = body();
+			expect(afterDeleted).not.toContain("AGENTBMARK");
+			expect(afterDeleted).toContain("Session file is gone.");
+		} finally {
+			vi.restoreAllMocks();
+			vi.useRealTimers();
+			created?.dispose();
+			removeSyncWithRetries(dir);
+		}
+	});
+
+	it("repaints the retargeted transcript in the frame the spectate target changes", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-refresh-now-"));
+		const fileA = path.join(dir, "a.jsonl");
+		const fileB = path.join(dir, "b.jsonl");
+		writeSpectateTranscript(fileA, "a", "AGENTAMARK");
+		writeSpectateTranscript(fileB, "b", "AGENTBMARK");
+		let target = fileA;
+		let created: AgentTranscriptViewer | undefined;
+		vi.useFakeTimers();
+		try {
+			const viewer = makeSpectateViewer(() => target);
+			created = viewer;
+			const body = () =>
+				viewer
+					.render(80)
+					.map(l => Bun.stripANSI(l))
+					.join("\n");
+			expect(body()).toContain("AGENTAMARK");
+
+			target = fileB;
+			viewer.refreshNow();
+
+			const afterRetarget = body();
+			expect(afterRetarget).toContain("AGENTBMARK");
+			expect(afterRetarget).not.toContain("AGENTAMARK");
+		} finally {
+			vi.useRealTimers();
+			created?.dispose();
+			removeSyncWithRetries(dir);
 		}
 	});
 });

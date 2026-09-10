@@ -2,8 +2,9 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type AutocompleteProvider, matchesKey, type PasteOptions, type SlashCommand } from "@oh-my-pi/pi-tui";
-import { isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { $env, isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { isSettingsInitialized, settings } from "../../config/settings";
+import { switchViewersHome } from "../../hub/tmux";
 import { resolveLocalRoot } from "../../internal-urls";
 import { AskDialogComponent } from "../../modes/components/ask-dialog";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
@@ -193,6 +194,7 @@ export class InputController {
 	#enhancedPaste?: EnhancedPasteController;
 	#draftText: string | undefined;
 	#focusedLeftTapListenerInstalled = false;
+	#hubBackgroundListenerInstalled = false;
 	#focusedPasteListenerInstalled = false;
 	#btwBranchListenerInstalled = false;
 	#btwCopyListenerInstalled = false;
@@ -331,6 +333,24 @@ export class InputController {
 					return { consume: true };
 				}
 				this.toggleToolOutputExpansion();
+				return { consume: true };
+			});
+		}
+		if (!this.#hubBackgroundListenerInstalled) {
+			this.#hubBackgroundListenerInstalled = true;
+			// Under the tmux session hub (OMP_HUB set), ← on an empty editor
+			// backgrounds this session and returns each viewing client to its own
+			// hub view window — the session keeps running in its tmux window (the
+			// Claude-Code "agent view" gesture). Runs after the focused-subagent
+			// left-tap above, so a focused subagent still unfocuses first; only the
+			// top-level editor reaches here.
+			this.ctx.ui.addInputListener(data => {
+				if (!$env.OMP_HUB) return undefined;
+				if (this.ctx.focusedAgentId) return undefined;
+				if (!matchesKey(data, "left")) return undefined;
+				if (this.ctx.ui.getFocused() !== this.ctx.editor) return undefined;
+				if (this.ctx.editor.getText().trim()) return undefined;
+				switchViewersHome();
 				return { consume: true };
 			});
 		}

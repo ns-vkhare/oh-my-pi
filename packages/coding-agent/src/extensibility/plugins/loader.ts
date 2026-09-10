@@ -5,11 +5,13 @@
  * tools/hooks/extensions/commands based on manifest entries and enabled features.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { getPluginsDir, getPluginsLockfile, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { getConfigDirPaths } from "../../config";
 import { registerPluginCacheInvalidator, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import { installLegacyPiSpecifierShim } from "./legacy-pi-compat";
+import { collectPiFallbackPlugins } from "./pi-fallback";
 import { normalizePluginRuntimeConfig } from "./runtime-config";
 import type { InstalledPlugin, PluginManifest, PluginRuntimeConfig, ProjectPluginOverrides } from "./types";
 
@@ -182,13 +184,15 @@ async function collectPluginsAtRoot(
 /**
  * Get list of enabled plugins with their resolved configurations.
  *
- * Enumerates two plugin roots in order: the user root
- * (`getPluginsDir(home)`) and, when a project anchor (`.omp/` or `.git/`)
- * exists at or above `cwd`, the project root
- * (`<projectAnchor>/.omp/plugins`). Each root contributes the union of its
- * `package.json#dependencies` and `omp-plugins.lock.json#plugins`. Project
- * entries shadow user entries with the same package name, matching the
- * shadow semantics of `MarketplaceManager.listInstalledPlugins`.
+ * Enumerates three plugin sources, highest precedence first: the user root
+ * (`getPluginsDir(home)`); the project root (`<projectAnchor>/.omp/plugins`)
+ * when a project anchor (`.omp/` or `.git/`) exists at or above `cwd`; and
+ * finally the packages `pi` installed under `<home>/.pi/agent`. Each omp root
+ * contributes the union of its `package.json#dependencies` and
+ * `omp-plugins.lock.json#plugins`. Project entries shadow user entries with the
+ * same package name, matching the shadow semantics of
+ * `MarketplaceManager.listInstalledPlugins`; pi entries surface only for names
+ * neither omp root provides (see {@link collectPiFallbackPlugins}).
  *
  * The optional `home` parameter pins the user plugins root for callers that
  * need to enumerate plugins relative to a non-default home (tests with a
@@ -227,14 +231,22 @@ async function loadEnabledPlugins(cwd: string, home?: string): Promise<ScopedIns
 		}
 	}
 
-	if (projectPlugins.length === 0) return userPlugins;
-	if (userPlugins.length === 0) return projectPlugins;
-
 	// Project entries shadow user entries with the same package name.
 	const merged = new Map<string, ScopedInstalledPlugin>();
 	for (const plugin of userPlugins) merged.set(plugin.name, plugin);
 	for (const plugin of projectPlugins) merged.set(plugin.name, plugin);
-	return Array.from(merged.values());
+
+	// Lowest precedence: what `pi` installed. Read-only, name-shadowed by both
+	// omp roots, and fail-soft — an absent or unreadable `~/.pi` contributes
+	// nothing and never affects omp's own plugins.
+	const piFallback = await collectPiFallbackPlugins({
+		home: home ?? os.homedir(),
+		ownedNames: new Set(merged.keys()),
+		runtimeConfig: await loadRuntimeConfig(home),
+		projectOverrides,
+	});
+	if (piFallback.length === 0) return Array.from(merged.values());
+	return [...merged.values(), ...piFallback];
 }
 
 // =============================================================================

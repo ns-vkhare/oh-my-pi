@@ -83,6 +83,7 @@ omp loads extension modules from these sources:
    - legacy extension paths listed in `.omp/settings.json#extensions` or `~/.omp/agent/settings.json#extensions`
 2. Enabled installed plugins under `~/.omp/plugins/node_modules` or a project plugin root — including npm, marketplace, and `omp plugin link` installs — via their `omp.extensions`/`pi.extensions` manifests.
 3. Explicit configured paths passed by the CLI (`omp --extension ./my-ext.ts`, also `-e`; `--hook` is treated as an alias) and by the `extensions:` setting in config.
+4. Packages `pi` installed under `~/.pi/agent`, as a fallback: each `~/.pi/agent/extensions/<name>` (a package directory or a bare `<name>.ts`) and every entry of `~/.pi/agent/settings.json#packages` (a `git:` source resolves to `~/.pi/agent/git/<host>/<owner>/<repo>`). These load **only** for plugin names no omp root provides, so an `omp plugin install`/`link` of the same name always wins, and an omp disable (`omp-plugins.lock.json`, `plugin-overrides.json`) suppresses the pi copy too. Read-only: `omp plugin` commands never write into `~/.pi`.
 
 The runtime de-duplicates by resolved absolute path — first seen wins.
 

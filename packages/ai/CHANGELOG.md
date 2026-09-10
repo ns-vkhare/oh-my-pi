@@ -660,6 +660,9 @@
 - Fixed the streamed `pi_*_tool_call` announcements that modern builds send alongside each exec frame being unrecognized. The exec channel already synthesizes those blocks when it runs the tool; the duplicate was avoided only because the decoder recognized none of the variants, which would have started double-rendering as soon as any one was added.
 - Fixed `pi_bash` results reaching Cursor clipped with no truncation notice. Two truncation records exist locally: `read`/`grep` set `details.truncation`, which carries an explicit `truncated` flag, while `bash` sets `details.meta.truncation`, whose record has no such flag — its presence is the signal. `piTruncation` read only the first shape and required the flag, so every real Bash truncation was dropped and the server was told the clipped output was complete. Both shapes now translate, and an explicit `truncated: false` still suppresses the field.
 
+### Added
+
+- Added silent AWS SSO token refresh for the Bedrock provider: an expired `~/.aws/sso/cache` token is now automatically renewed via the SSO-OIDC CreateToken API using the cached refresh token and client registration (and written back to the cache for other AWS tools), matching the AWS SDK/CLI, instead of failing with "Run 'aws sso login' to refresh." The error is only surfaced when the refresh token or client registration is missing/expired.
 ## [17.1.8] - 2026-07-28
 
 ### Fixed

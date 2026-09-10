@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
@@ -19,6 +20,7 @@ import { adjustHsv, formatNumber, getProjectDir, hexToRgb, rgbToHex } from "@oh-
 import { settings } from "../../../config/settings";
 import type { AgentSession } from "../../../session/agent-session";
 import type { OAuthAccountIdentity } from "../../../session/auth-storage";
+import { resolveSessionWorktree } from "../../../session/session-worktree";
 import { limitMatchesActiveAccount } from "../../../slash-commands/helpers/active-oauth-account";
 import { type ActiveRepoContext, resolveActiveRepoContextSync } from "../../../utils/active-repo-context";
 import { withTimeoutSignal } from "../../../utils/fetch-timeout";
@@ -234,14 +236,15 @@ interface ContextUsageMemo {
 	toolsRef: readonly any[] | undefined;
 	skillsRef: readonly any[] | undefined;
 }
-
 interface ActiveRepoCache {
 	projectDir: string;
+	/** Session's own worktree cwd folded into the key so it rebuilds when resolution lands. */
+	sessionWorktree: string | null;
 	activeRepo: ActiveRepoContext | null;
 	effectiveGitCwd: string;
 	repository: VcsRepo | null;
 	repositoryCheckedAt: number;
-	/** Project + worktree dir name when `projectDir` is a linked worktree, else null. */
+	/** Project + worktree dir name when `effectiveGitCwd` is a linked worktree, else null. */
 	worktree: WorktreeContext | null;
 }
 
@@ -445,6 +448,18 @@ export class StatusLineComponent implements Component {
 	#focusedAgentId: string | undefined;
 	#activeRepoCache: ActiveRepoCache | undefined;
 
+	// Session-worktree resolution: a hub session's omp process stays in the
+	// project root while the agent works in a *sibling* worktree, so the path/git
+	// segments must resolve the session's worktree (see resolveSessionWorktree)
+	// rather than the process cwd. Async (reads the session file + queries git),
+	// so it resolves in the background and caches per session file. Re-probed only
+	// when the session file's mtime advances (the agent's `git worktree add` lands
+	// as a written turn); once a worktree is found the result is stable.
+	#sessionWorktree: string | null | undefined = undefined;
+	#sessionWorktreeFile: string | undefined = undefined;
+	#sessionWorktreeProbedMtime = -1;
+	#sessionWorktreeInFlight = false;
+
 	// Git status caching (1s TTL)
 	#cachedGitStatus: { staged: number; unstaged: number; untracked: number } | null = null;
 	#cachedGitStatusCwd: string | undefined = undefined;
@@ -526,19 +541,27 @@ export class StatusLineComponent implements Component {
 
 	#resolveActiveRepoCache(): ActiveRepoCache {
 		const projectDir = getProjectDir();
-		if (this.#activeRepoCache?.projectDir === projectDir) {
+		// A hub session's worktree (resolved from its session file) overrides the
+		// process cwd for the git-backed segments; null when none applies.
+		const sessionWorktree = this.#sessionWorktreeCwd();
+		if (
+			this.#activeRepoCache?.projectDir === projectDir &&
+			this.#activeRepoCache.sessionWorktree === sessionWorktree
+		) {
 			return this.#activeRepoCache;
 		}
 
 		const projectRepository = vcs.repo(projectDir);
 		const activeRepo = projectRepository ? null : resolveActiveRepoContextSync(projectDir);
-		const effectiveGitCwd = activeRepo?.repoRoot ?? projectDir;
-		const repository = projectRepository ?? (activeRepo ? vcs.repo(effectiveGitCwd) : null);
+		// Prefer a nested active repo, else the session's own worktree, else the project dir.
+		const effectiveGitCwd = activeRepo?.repoRoot ?? sessionWorktree ?? projectDir;
+		const repository = effectiveGitCwd === projectDir ? projectRepository : vcs.repo(effectiveGitCwd);
 		// Only collapse the bare-cwd case: a single-direct-child-repo context
 		// (activeRepo set) renders `<parent> ↳ <child>`, which we leave intact.
 		const worktree = activeRepo ? null : resolveWorktreeContext(effectiveGitCwd);
 		this.#activeRepoCache = {
 			projectDir,
+			sessionWorktree,
 			activeRepo,
 			effectiveGitCwd,
 			repository,
@@ -555,6 +578,54 @@ export class StatusLineComponent implements Component {
 		cache.repository = vcs.repo(cache.effectiveGitCwd);
 		cache.repositoryCheckedAt = now;
 		return cache.repository;
+	}
+
+	/**
+	 * Absolute path to the live session's git worktree, or null when it has none
+	 * / isn't yet known. Only hub session windows (which start at the project root
+	 * while the agent works in a sibling worktree) are probed; every other session
+	 * already runs with its cwd inside the relevant tree. Resolution is async and
+	 * cached per session file, re-probed only when the file's mtime advances.
+	 */
+	#sessionWorktreeCwd(): string | null {
+		// `OMP_HUB` is set on hub-managed session windows (see hub/tmux HUB_ENV).
+		if (!process.env.OMP_HUB) return null;
+		const sessionFile = this.session.sessionManager?.getSessionFile();
+		if (!sessionFile) return null;
+
+		if (sessionFile !== this.#sessionWorktreeFile) {
+			this.#sessionWorktree = undefined;
+			this.#sessionWorktreeFile = sessionFile;
+			this.#sessionWorktreeProbedMtime = -1;
+		}
+
+		// Re-probe until a worktree is found; once found the answer is stable.
+		if (this.#sessionWorktree == null && !this.#sessionWorktreeInFlight) {
+			let mtimeMs = 0;
+			try {
+				mtimeMs = fs.statSync(sessionFile).mtimeMs;
+			} catch {
+				return this.#sessionWorktree ?? null;
+			}
+			if (mtimeMs !== this.#sessionWorktreeProbedMtime) {
+				this.#sessionWorktreeProbedMtime = mtimeMs;
+				this.#sessionWorktreeInFlight = true;
+				void resolveSessionWorktree(sessionFile)
+					.then(result => {
+						if (this.#disposed || this.#sessionWorktreeFile !== sessionFile) return;
+						if (result !== this.#sessionWorktree) {
+							this.#sessionWorktree = result;
+							this.#activeRepoCache = undefined;
+							this.invalidateGitCaches();
+							this.#onBranchChange?.();
+						}
+					})
+					.finally(() => {
+						this.#sessionWorktreeInFlight = false;
+					});
+			}
+		}
+		return this.#sessionWorktree ?? null;
 	}
 
 	/**
@@ -1834,6 +1905,7 @@ export class StatusLineComponent implements Component {
 			? this.#resolveActiveRepoCache()
 			: {
 					projectDir,
+					sessionWorktree: null,
 					activeRepo: null,
 					effectiveGitCwd: projectDir,
 					repository: null,

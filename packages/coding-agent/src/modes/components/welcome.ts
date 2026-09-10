@@ -9,6 +9,7 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { APP_NAME } from "@oh-my-pi/pi-utils";
 import { theme } from "../../modes/theme/theme";
+import { assembleTwoColumnBox, centerText, computeTwoColumnLayout } from "./box-layout";
 import tipsText from "./tips.txt" with { type: "text" };
 
 /** Tips embedded at build time, one per line; blanks dropped. */
@@ -264,32 +265,18 @@ export class WelcomeComponent implements Component {
 	}
 
 	#renderLines(termWidth: number): string[] {
-		// Box dimensions - responsive with max width and small-terminal support
-		const maxWidth = 100;
-		const boxWidth = Math.min(maxWidth, Math.max(0, termWidth - 2));
-		if (boxWidth < 4) {
-			return [];
-		}
-		const dualContentWidth = boxWidth - 3; // 3 = │ + │ + │
-		const preferredLeftCol = 26;
-		const minLeftCol = 12; // logo width
-		const minRightCol = 20;
 		// Dynamic model/provider labels are truncated inside the fixed column.
 		// Letting them influence the responsive breakpoint changes the box height
 		// when authoritative session data replaces the empty prepaint labels.
-		const leftMinContentWidth = Math.max(minLeftCol, visibleWidth("Welcome back!"));
-		const desiredLeftCol = Math.max(
-			Math.min(preferredLeftCol, Math.max(minLeftCol, Math.floor(dualContentWidth * 0.35))),
-			leftMinContentWidth,
+		const leftMinContentWidth = Math.max(
+			12, // logo width
+			visibleWidth("Welcome back!"),
 		);
-		const dualLeftCol =
-			dualContentWidth >= minRightCol + 1
-				? Math.min(desiredLeftCol, dualContentWidth - minRightCol)
-				: Math.max(1, dualContentWidth - 1);
-		const dualRightCol = Math.max(1, dualContentWidth - dualLeftCol);
-		const showRightColumn = dualLeftCol >= leftMinContentWidth && dualRightCol >= minRightCol;
-		const leftCol = showRightColumn ? dualLeftCol : boxWidth - 2;
-		const rightCol = showRightColumn ? dualRightCol : 0;
+		const layout = computeTwoColumnLayout(termWidth, leftMinContentWidth);
+		if (layout.boxWidth < 4) {
+			return [];
+		}
+		const { leftCol, rightCol } = layout;
 
 		// Logo: pick a frame from the intro animation if active, else the resting frame.
 		const logoColored = this.#currentLogoFrame();
@@ -297,12 +284,12 @@ export class WelcomeComponent implements Component {
 		// Left column - centered content
 		const leftLines = [
 			"",
-			this.#centerText(theme.bold("Welcome back!"), leftCol),
+			centerText(theme.bold("Welcome back!"), leftCol),
 			"",
-			...logoColored.map(l => this.#centerText(l, leftCol)),
+			...logoColored.map(l => centerText(l, leftCol)),
 			"",
-			this.#centerText(theme.fg("muted", this.modelName), leftCol),
-			this.#centerText(theme.fg("borderMuted", this.providerName), leftCol),
+			centerText(theme.fg("muted", this.modelName), leftCol),
+			centerText(theme.fg("borderMuted", this.providerName), leftCol),
 		];
 
 		// Right column separator
@@ -374,50 +361,10 @@ export class WelcomeComponent implements Component {
 			"",
 		];
 
-		// Border characters (dim)
-		const hChar = theme.boxRound.horizontal;
-		const h = theme.fg("dim", hChar);
-		const v = theme.fg("dim", theme.boxRound.vertical);
-		const tl = theme.fg("dim", theme.boxRound.topLeft);
-		const tr = theme.fg("dim", theme.boxRound.topRight);
-		const bl = theme.fg("dim", theme.boxRound.bottomLeft);
-		const br = theme.fg("dim", theme.boxRound.bottomRight);
-
-		const lines: string[] = [];
-
-		// Top border with embedded title
-		const title = ` ${APP_NAME} v${this.version} `;
-		const titlePrefixRaw = hChar.repeat(3);
-		const titleStyled = theme.fg("dim", titlePrefixRaw) + theme.fg("muted", title);
-		const titleVisLen = visibleWidth(titlePrefixRaw) + visibleWidth(title);
-		const titleSpace = boxWidth - 2;
-		if (titleVisLen >= titleSpace) {
-			lines.push(tl + truncateToWidth(titleStyled, titleSpace) + tr);
-		} else {
-			const afterTitle = titleSpace - titleVisLen;
-			lines.push(tl + titleStyled + theme.fg("dim", hChar.repeat(afterTitle)) + tr);
-		}
-
-		// Content rows
-		const maxRows = showRightColumn ? Math.max(leftLines.length, rightLines.length) : leftLines.length;
-		for (let i = 0; i < maxRows; i++) {
-			const left = this.#fitToWidth(leftLines[i] ?? "", leftCol);
-			if (showRightColumn) {
-				const right = this.#fitToWidth(rightLines[i] ?? "", rightCol);
-				lines.push(v + left + v + right + v);
-			} else {
-				lines.push(v + left + v);
-			}
-		}
-		// Bottom border
-		if (showRightColumn) {
-			lines.push(bl + h.repeat(leftCol) + theme.fg("dim", theme.boxRound.teeUp) + h.repeat(rightCol) + br);
-		} else {
-			lines.push(bl + h.repeat(leftCol) + br);
-		}
+		const lines = assembleTwoColumnBox(layout, `${APP_NAME} v${this.version}`, leftLines, rightLines);
 
 		// Randomly picked tip, rendered directly beneath the box.
-		lines.push(...this.#renderTip(boxWidth));
+		lines.push(...this.#renderTip(layout.boxWidth));
 
 		return lines;
 	}
@@ -436,42 +383,6 @@ export class WelcomeComponent implements Component {
 		// caches its resting frame. Non-"[NEW]" tips ignore the phase entirely.
 		const phase = NEW_TIP_MARKER.test(tip) ? performance.now() / NEW_GLOW_PERIOD_MS : 0;
 		return renderWelcomeTip(tip, boxWidth, phase);
-	}
-
-	/** Center text within a given width */
-	#centerText(text: string, width: number): string {
-		const visLen = visibleWidth(text);
-		if (visLen >= width) {
-			return truncateToWidth(text, width);
-		}
-		const leftPad = Math.floor((width - visLen) / 2);
-		const rightPad = width - visLen - leftPad;
-		return padding(leftPad) + text + padding(rightPad);
-	}
-
-	/** Fit string to exact width with ANSI-aware truncation/padding */
-	#fitToWidth(str: string, width: number): string {
-		const visLen = visibleWidth(str);
-		if (visLen > width) {
-			const ellipsis = "…";
-			const ellipsisWidth = visibleWidth(ellipsis);
-			const maxWidth = Math.max(0, width - ellipsisWidth);
-			let truncated = "";
-			let currentWidth = 0;
-			let inEscape = false;
-			for (const char of str) {
-				if (char === "\x1b") inEscape = true;
-				if (inEscape) {
-					truncated += char;
-					if (char === "m") inEscape = false;
-				} else if (currentWidth < maxWidth) {
-					truncated += char;
-					currentWidth++;
-				}
-			}
-			return `${truncated}${ellipsis}`;
-		}
-		return str + padding(width - visLen);
 	}
 
 	/** Pick the logo frame for the current intro phase, or the resting frame. */
@@ -608,4 +519,4 @@ function introLogoFrame(progress: number): string[] {
 }
 
 /** Resting gradient frame, cached for re-renders outside of the intro. */
-const REST_FRAME = gradientLogo(PI_LOGO, 0);
+export const REST_FRAME = gradientLogo(PI_LOGO, 0);

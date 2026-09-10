@@ -1,0 +1,19 @@
+# Settings overlay for the routing worker only (`omp --config`).
+#
+# The router is a classifier, not an agent: the only text it should ever see is
+# prompts/entry.md plus the Slack message. Everything the harness would normally
+# contribute — project memory, auto-learn guidance, MCP server instructions, the
+# workspace tree — is noise that costs tokens and can only distract a 26B local
+# model into answering instead of routing. `--no-context-files` covers AGENTS.md;
+# these keys cover the rest.
+memory:
+  backend: "off" # no memory_summary/learned.md guidance block
+autolearn:
+  enabled: false # drops the Auto-Learn section AND the learn/manage_skill tools
+includeWorkspaceTree: false
+includeModelInPrompt: false
+personality: none
+# Codex config discovery is what pulls in MCP servers (node_repl) — their tools
+# would be callable by the router and their instructions injected into its prompt.
+disabledProviders:
+  - codex

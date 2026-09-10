@@ -8,6 +8,7 @@ import { parseFrontmatter, prompt } from "@oh-my-pi/pi-utils";
 import { parseAgentFields } from "../discovery/helpers";
 // Embed agent markdown files at build time
 import agentFrontmatterTemplate from "../prompts/agents/frontmatter.md" with { type: "text" };
+import orchestrateMd from "../prompts/agents/orchestrate.md" with { type: "text" };
 import reviewerMd from "../prompts/agents/reviewer.md" with { type: "text" };
 import scoutMd from "../prompts/agents/scout.md" with { type: "text" };
 import securityReviewerMd from "../prompts/agents/security-reviewer.md" with { type: "text" };
@@ -68,6 +69,18 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 			thinkingLevel: Effort.Medium,
 		},
 		template: taskMd,
+	},
+	{
+		fileName: "orchestrate.md",
+		frontmatter: {
+			name: "orchestrate",
+			description:
+				"Spawnable orchestrator for wholesale delegation of an ENTIRE self-contained multi-story workstream as one sub-tree — it decomposes, freezes contracts, writes briefs with a testing strategy, fans out its own subagents, and owns every gate. This file is the single source of truth for the orchestrator identity; the `orchestrator-identity` skill only points here. For orchestrating the current request yourself, read this body inline instead of spawning — spawning this agent for work you already hold context on is a pure hand-off hop.",
+			spawns: "*",
+			model: "@default",
+			thinkingLevel: Effort.High,
+		},
+		template: orchestrateMd,
 	},
 ];
 

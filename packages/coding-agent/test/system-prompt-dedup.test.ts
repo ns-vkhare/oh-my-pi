@@ -173,6 +173,57 @@ describe("SYSTEM.md prompt assembly", () => {
 		expect(promptText).not.toContain("Discovered project SYSTEM prompt");
 	});
 
+	// `--bare-system-prompt` exists so a worker whose prompt IS its whole contract
+	// — the Slack bridge's routing classifier, an evaluator — gets exactly the file
+	// it was handed. The contract is byte equality, not "roughly the same".
+	it("sends the custom prompt alone — no project footer, no context files", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: tempDir,
+			resolvedCustomPrompt: "You are a router. Classify and stop.",
+			bareSystemPrompt: true,
+			contextFiles: [{ path: path.join(tempDir, "AGENTS.md"), content: "# Repo rules\nAlways use tabs." }],
+			skills: [],
+			rules: [],
+			toolNames: ["read"],
+			tools: READ_TOOL,
+			workspaceTree: {
+				rootPath: tempDir,
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+		});
+
+		expect(systemPrompt).toEqual(["You are a router. Classify and stop."]);
+	});
+
+	it("without the flag the same call carries the repo rules and the project footer", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: tempDir,
+			resolvedCustomPrompt: "You are a router. Classify and stop.",
+			contextFiles: [{ path: path.join(tempDir, "AGENTS.md"), content: "# Repo rules\nAlways use tabs." }],
+			skills: [],
+			rules: [],
+			toolNames: ["read"],
+			tools: READ_TOOL,
+			workspaceTree: {
+				rootPath: tempDir,
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+		});
+
+		const whole = systemPrompt.join("\n");
+		expect(whole).toContain("You are a router. Classify and stop.");
+		// Both halves the flag removes: the workspace's own instructions…
+		expect(whole).toContain("Always use tabs.");
+		// …and the project/environment footer, which alone renders <workstation>.
+		expect(whole).toContain("<workstation>");
+	});
+
 	it("renders active child repo context in the main system prompt", async () => {
 		const parentDir = path.join(tempDir, "parent-cwd");
 		fs.mkdirSync(path.join(parentDir, "active-project", ".git"), { recursive: true });

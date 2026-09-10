@@ -1001,6 +1001,25 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		};
 	}
 
+	/**
+	 * Overlay the invoking session's identity onto the model-supplied env so every
+	 * bash child can locate the session that spawned it (pi parity: see pi's
+	 * `resolveSpawnContext` in `dist/core/tools/bash.js`). Child tooling that
+	 * starts its own agent sessions — e.g. verify-review's pi judges — reads
+	 * `PI_SESSION_FILE` to nest under this session in cc-callbacks audits.
+	 *
+	 * Model-supplied keys win, and an in-memory session (no session file on disk)
+	 * injects nothing. Built once per `execute` call and shared by every backend.
+	 */
+	#withSessionEnv(modelEnv: Record<string, string> | undefined): Record<string, string> | undefined {
+		const sessionFile = this.session.getSessionFile();
+		if (!sessionFile) return modelEnv;
+		const merged: Record<string, string> = { PI_SESSION_FILE: sessionFile };
+		const sessionId = this.session.getSessionId?.();
+		if (sessionId) merged.PI_SESSION_ID = sessionId;
+		return modelEnv ? Object.assign(merged, modelEnv) : merged;
+	}
+
 	async execute(
 		_toolCallId: string,
 		{
@@ -1068,7 +1087,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			},
 		};
 		command = await expandInternalUrls(command, { ...internalUrlOptions, ensureLocalParentDirs: true });
-		const resolvedEnv = env
+		const modelEnv: Record<string, string> | undefined = env
 			? Object.fromEntries(
 					await Promise.all(
 						Object.entries(env).map(async ([key, value]) => [
@@ -1082,6 +1101,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					),
 				)
 			: undefined;
+		// Session identity for child processes; every backend below (foreground
+		// `executeBash`, the ACP client terminal, the PTY, and background jobs)
+		// receives this one object. The tool-call preview renders the RAW model
+		// args, so nothing injected here reaches the transcript.
+		const resolvedEnv = this.#withSessionEnv(modelEnv);
 
 		// Resolve protocol URLs (skill://, agent://, etc.) in extracted cwd.
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {

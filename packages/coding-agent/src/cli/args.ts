@@ -44,6 +44,8 @@ export interface Args {
 	apiKey?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
+	/** `--agent <name>`: run the top-level session as a discovered task agent (model, thinking, tools, spawns, skills, prompt body). */
+	agent?: string;
 	thinking?: ConfiguredThinkingLevel;
 	serviceTier?: ServiceTierOpenAISettingValue;
 	hideThinking?: boolean;
@@ -61,6 +63,8 @@ export interface Args {
 	providerSessionId?: string;
 	providerPromptCacheKey?: string;
 	fork?: string;
+	/** `--watch <sessionPath>`: read-only spectator on a session another process owns. */
+	watch?: string;
 	/** Collab link to join at startup (set by the `join` subcommand; no CLI flag). */
 	join?: string;
 	models?: string[];
@@ -79,6 +83,7 @@ export interface Args {
 	noSkills?: boolean;
 	skills?: string[];
 	noRules?: boolean;
+	bareSystemPrompt?: boolean;
 	noTitle?: boolean;
 	autoApprove?: boolean;
 	approvalMode?: "always-ask" | "write" | "yolo";
@@ -274,6 +279,8 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.noSkills = true;
 		} else if (arg === "--no-rules") {
 			result.noRules = true;
+		} else if (arg === "--bare-system-prompt") {
+			result.bareSystemPrompt = true;
 		} else if (arg === "--no-title") {
 			result.noTitle = true;
 		} else if (arg === "--auto-approve" || arg === "--yolo") {

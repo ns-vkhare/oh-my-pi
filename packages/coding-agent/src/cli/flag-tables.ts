@@ -128,6 +128,9 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--fork": (result, value) => {
 		result.fork = value;
 	},
+	"--watch": (result, value) => {
+		result.watch = value;
+	},
 	"--provider": (result, value) => {
 		result.provider = value;
 	},
@@ -168,6 +171,9 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	},
 	"--append-system-prompt": (result, value) => {
 		result.appendSystemPrompt = value;
+	},
+	"--agent": (result, value) => {
+		result.agent = value;
 	},
 	"--provider-session-id": (result, value) => {
 		result.providerSessionId = value;
@@ -312,6 +318,7 @@ export const VALUELESS_FLAGS: ReadonlySet<string> = new Set([
 	"--no-extensions",
 	"--no-skills",
 	"--no-rules",
+	"--bare-system-prompt",
 	"--no-title",
 	"--auto-approve",
 	"--yolo",

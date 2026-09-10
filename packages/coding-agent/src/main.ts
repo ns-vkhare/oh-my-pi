@@ -6,6 +6,7 @@
  */
 import * as fsSync from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { EventLoopKeepalive, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
@@ -24,6 +25,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { reset as resetCapabilities } from "./capability";
+import { applyAgentToArgs, applyAgentToSessionOptions, autoloadAgentSkills, resolveCliAgent } from "./cli/agent-flag";
 import { type Args, reportUnrecognizedFlags, validateToolNames } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
 import { processFileArguments } from "./cli/file-processor";
@@ -31,6 +33,7 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
 import { getLatestRelease } from "./cli/update-cli";
+import { CliUsageError } from "./cli/usage-error";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
@@ -59,6 +62,7 @@ import { loadExtensions } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
+import { parkBridgeSession } from "./hub/bridge-client";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import { discoverStartupLspServers } from "./lsp/servers";
 import type { MCPManager } from "./mcp";
@@ -78,6 +82,7 @@ import {
 import { ensureTheme, initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import { createWarpEventBridgeExtension } from "./modes/warp-events";
+import { runWatchMode } from "./modes/watch-mode";
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
 import {
 	type CreateAgentSessionOptions,
@@ -103,6 +108,7 @@ import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
+import type { AgentDefinition } from "./task/types";
 import { createTelemetryExportConfig, initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking";
 import type { LspStartupServerInfo } from "./tools";
@@ -707,6 +713,53 @@ function isForeignSessionImport(parsed: Pick<Args, "fromClaude" | "fromCodex">):
 	return parsed.fromClaude === true || parsed.fromCodex === true;
 }
 
+/** Print a {@link SessionResolutionError} cleanly and exit — no stack trace. */
+function exitWithSessionResolutionError(error: SessionResolutionError): never {
+	process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
+	if (error.hint) {
+		process.stderr.write(`${chalk.dim(error.hint)}\n`);
+	}
+	process.exit(1);
+}
+
+/**
+ * Slack bridge handshake, run before a terminal attaches to an existing session.
+ *
+ * The bridge daemon may already be driving `sessionPath` headlessly from Slack.
+ * Ask it to park that task (stop its RPC child; the Slack thread survives) so
+ * this terminal can take over. Returns the failure to raise, or undefined to
+ * proceed.
+ *
+ * Three answers clear the way: no daemon at all, a task it parked for us, and a
+ * session it does not drive. A busy task refuses with a reason. An
+ * `indeterminate` answer — timeout, early close, garbage — fails CLOSED: the
+ * daemon may be alive and midway through parking, and guessing "free" there is
+ * how two agents end up appending to one session file.
+ *
+ * Skipped inside the bridge's own RPC children (`OMP_SLACK_BRIDGE`) and for
+ * `--fork`, which copies the source session instead of attaching to it.
+ */
+async function checkSlackBridgeConflict(sessionPath: string | undefined): Promise<SessionResolutionError | undefined> {
+	if (!sessionPath || $env.OMP_SLACK_BRIDGE) return undefined;
+	const outcome = await parkBridgeSession(path.resolve(sessionPath));
+	switch (outcome.kind) {
+		case "absent":
+		case "parked":
+		case "not-owned":
+			return undefined;
+		case "busy":
+			return new SessionResolutionError(
+				`Session is active on Slack (${outcome.reason}).`,
+				"Reply 'kill' or wait for it to finish, then retry.",
+			);
+		case "indeterminate":
+			return new SessionResolutionError(
+				"Slack bridge is unresponsive — cannot tell whether it still owns this session.",
+				"Retry in a moment, or stop the bridge daemon and try again.",
+			);
+	}
+}
+
 type MissingCwdMoveResult =
 	| { status: "not-needed" }
 	| { status: "declined" }
@@ -983,6 +1036,8 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
+			const conflict = await checkSlackBridgeConflict(sessionArg);
+			if (conflict) throw conflict;
 			return await SessionManager.open(sessionArg, parsed.sessionDir);
 		}
 		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
@@ -1022,10 +1077,17 @@ export async function createSessionManager(
 				return undefined;
 			}
 		}
+		const conflict = await checkSlackBridgeConflict(match.session.path);
+		if (conflict) throw conflict;
 		return await SessionManager.open(match.session.path, parsed.sessionDir);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		// continueRecent picks the target internally, so the handshake runs after
+		// it resolves — loading an existing session file appends nothing.
+		const conflict = await checkSlackBridgeConflict(manager.getSessionFile());
+		if (conflict) throw conflict;
+		return manager;
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
@@ -1038,6 +1100,15 @@ export async function createSessionManager(
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
 		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		// Same handshake as `--continue` (loading an existing file appends
+		// nothing, so it runs once continueRecent has picked the target). Unlike
+		// every other path this one must NOT hard-fail: a bare `omp` is not a
+		// request for that particular session, so a Slack-owned or unverifiable
+		// candidate just means "start fresh instead".
+		if (await checkSlackBridgeConflict(manager.getSessionFile())) {
+			writeStartupNotice(parsed, `${chalk.dim("Most recent session is busy on Slack — starting a new one.")}\n`);
+			return SessionManager.create(cwd, parsed.sessionDir);
+		}
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
 		}
@@ -1364,6 +1435,15 @@ export async function buildSessionOptions(
 		options.rules = [];
 	}
 
+	// A bare system prompt is the whole contract: no AGENTS.md context files (an
+	// explicit empty list short-circuits discovery in the SDK) and no PROJECT
+	// footer. For workers — classifiers, routers, evaluators — whose prompt must
+	// be exactly the file they were handed.
+	if (parsed.bareSystemPrompt) {
+		options.contextFiles = [];
+		options.bareSystemPrompt = true;
+	}
+
 	// Trusted extension paths are an exact allowlist for extension modules.
 	if (parsed.trustedExtensions && parsed.trustedExtensions.length > 0) {
 		const trustedPaths = parsed.trustedExtensions.map(trustedPath => {
@@ -1619,6 +1699,33 @@ export async function runRootCommand(
 		});
 		setStartupComposerLspServers(discoverStartupLspServers(cwd, "connecting"));
 
+		// `--watch` is a spectator on a session ANOTHER process owns, so it forks off
+		// here: everything below builds ownership (session manager, tools, agent,
+		// writer) and `SessionManager.open` would rewrite a file the owner is
+		// appending to. Only the theme and settings above are needed.
+		if (parsedArgs.watch !== undefined) {
+			// Every other mode flag asks this process to OWN a session — the one thing
+			// a spectator must never do. Refuse the combination instead of silently
+			// winning the race for the file.
+			const ownershipFlags: Record<string, boolean> = {
+				"--resume": Boolean(parsedArgs.resume),
+				"--continue": Boolean(parsedArgs.continue),
+				"--fork": parsedArgs.fork !== undefined,
+				"--print": Boolean(parsedArgs.print),
+				"--mode": parsedArgs.mode !== undefined,
+			};
+			const conflicting = Object.keys(ownershipFlags).filter(flag => ownershipFlags[flag]);
+			if (conflicting.length > 0) {
+				process.stderr.write(`${chalk.red(`Error: --watch cannot be combined with ${conflicting.join(", ")}.`)}\n`);
+				process.stderr.write(`${chalk.dim("--watch only tails a session; use --resume to own one.")}\n`);
+				process.exit(1);
+			}
+			stopStartupWatchdog();
+			logger.endTiming();
+			await runWatchMode(parsedArgs.watch);
+			process.exit(0);
+		}
+
 		let scopedModels = await logger.time(
 			"resolveModelScope",
 			resolveScopedModels,
@@ -1710,11 +1817,7 @@ export async function runRootCommand(
 			}
 		} catch (error: unknown) {
 			if (error instanceof SessionResolutionError) {
-				process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
-				if (error.hint) {
-					process.stderr.write(`${chalk.dim(error.hint)}\n`);
-				}
-				process.exit(1);
+				exitWithSessionResolutionError(error);
 			}
 			throw error;
 		}
@@ -1788,6 +1891,8 @@ export async function runRootCommand(
 				stopStartupWatchdog();
 				process.exit(0);
 			}
+			const bridgeConflict = await checkSlackBridgeConflict(selected.path);
+			if (bridgeConflict) exitWithSessionResolutionError(bridgeConflict);
 			sessionManager = await SessionManager.open(selected.path);
 			const previousCwd = cwd;
 			const recordedCwd = selected.cwd || sessionManager.getRecordedCwd() || sessionManager.getCwd();
@@ -1830,6 +1935,24 @@ export async function runRootCommand(
 			clearPluginRootsCache: clearPluginRootsAndCaches,
 		});
 
+		// --agent <name>: fold the agent's model/thinking/tools into the parsed flags
+		// (explicit flags win), then apply body/spawns/read-summarize to the options.
+		// Resolved against the final cwd so a resumed session sees its own project
+		// agents. Unknown name → usage error, exit 2, before any session is created.
+		let cliAgent: AgentDefinition | undefined;
+		if (parsedArgs.agent) {
+			try {
+				cliAgent = await resolveCliAgent(parsedArgs.agent, cwd);
+			} catch (error) {
+				if (error instanceof CliUsageError) {
+					process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
+					process.exit(2);
+				}
+				throw error;
+			}
+			applyAgentToArgs(parsedArgs, cliAgent);
+		}
+
 		const sessionOptions = await logger.time(
 			"buildSessionOptions",
 			buildSessionOptions,
@@ -1839,6 +1962,9 @@ export async function runRootCommand(
 			modelRegistry,
 			settingsInstance,
 		);
+		if (cliAgent) {
+			applyAgentToSessionOptions(sessionOptions, cliAgent, settingsInstance);
+		}
 		sessionOptions.authStorage = authStorage;
 		sessionOptions.modelRegistry = modelRegistry;
 		sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
@@ -2016,6 +2142,20 @@ export async function runRootCommand(
 			);
 			if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
 				authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
+			}
+
+			// Agent skills ride hidden custom messages (same mechanic as the task
+			// executor). Fresh sessions only: a resumed transcript already carries them.
+			if (cliAgent && !(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork)) {
+				const missing = await autoloadAgentSkills(session, cliAgent);
+				for (const name of missing) {
+					const message = `Agent "${cliAgent.name}" autoloads skill "${name}", which was not found.`;
+					if (isInteractive) {
+						notifs.push({ kind: "warn", message });
+					} else {
+						process.stderr.write(`${chalk.yellow(`${message}\n`)}`);
+					}
+				}
 			}
 
 			// Runtime provider discovery (opencode-go, models.yml `discovery:`, proxies)
